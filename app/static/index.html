@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="shopify-api-key" content="__SHOPIFY_CLIENT_ID__" />
+    <title>Inventory Sync</title>
+    <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+    <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <s-app-nav>
+      <s-link href="/app" rel="home">Home</s-link>
+      <s-link href="/app/product-sync">Single Sync</s-link>
+      <s-link href="/app/bulk-sync">Bulk Sync</s-link>
+      <s-link href="/app/settings">Settings</s-link>
+    </s-app-nav>
+
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">IS</span>
+          <div>
+            <p class="eyebrow">Shopify Inventory Sync</p>
+            <h1>Simple control panel</h1>
+          </div>
+        </div>
+        <nav class="tabs" aria-label="Navigation">
+          <a href="/app" data-route>Home</a>
+          <a href="/app/product-sync" data-route>Single Sync</a>
+          <a href="/app/bulk-sync" data-route>Bulk Sync</a>
+          <a href="/app/settings" data-route>Settings</a>
+        </nav>
+      </header>
+
+      <main id="app" class="workspace" aria-live="polite"></main>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="assertive" aria-atomic="true"></div>
+  </body>
+</html>
