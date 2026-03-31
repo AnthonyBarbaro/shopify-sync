@@ -1,3 +1,4 @@
+import base64
 import csv
 import html
 import json
@@ -99,10 +100,25 @@ def render_ui_shell() -> HTMLResponse:
     return HTMLResponse(content=html_content)
 
 
-def render_install_page(*, initial_shop: str = "", error: str | None = None) -> HTMLResponse:
+def render_install_page(
+    *,
+    initial_shop: str = "",
+    error: str | None = None,
+    host: str | None = None,
+    embedded: str | None = None,
+    return_to: str | None = None,
+) -> HTMLResponse:
     error_html = (
         f'<div class="pill danger" style="margin-top:16px;">{html.escape(error)}</div>' if error else ""
     )
+    hidden_fields = []
+    if host:
+        hidden_fields.append(f'<input type="hidden" name="host" value="{html.escape(host)}" />')
+    if embedded:
+        hidden_fields.append(f'<input type="hidden" name="embedded" value="{html.escape(embedded)}" />')
+    if return_to:
+        hidden_fields.append(f'<input type="hidden" name="return_to" value="{html.escape(return_to)}" />')
+    hidden_html = "\n".join(hidden_fields)
     page = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -126,6 +142,7 @@ def render_install_page(*, initial_shop: str = "", error: str | None = None) -> 
                   <p>Enter the shop this app should sync for.</p>
                 </div>
               </div>
+              {hidden_html}
               <div class="form-grid">
                 <div class="field">
                   <label for="shop">Shop Domain</label>
@@ -139,6 +156,52 @@ def render_install_page(*, initial_shop: str = "", error: str | None = None) -> 
             </form>
           </main>
         </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=page)
+
+
+def render_top_level_redirect_page(target_url: str) -> HTMLResponse:
+    safe_target = html.escape(target_url, quote=True)
+    page = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Opening Shopify</title>
+        <meta name="shopify-api-key" content="{html.escape(settings.shopify_client_id)}" />
+        <link rel="stylesheet" href="/assets/styles.css" />
+      </head>
+      <body>
+        <div class="shell" style="min-height:100vh;display:grid;place-items:center;">
+          <main class="page" style="width:min(520px,100%);">
+            <section class="hero">
+              <h2>Opening Shopify</h2>
+              <p>We’re switching to the top window so Shopify can finish installation.</p>
+            </section>
+            <section class="card">
+              <div class="button-row">
+                <a class="button" href="{safe_target}" target="_top" rel="noreferrer">Continue</a>
+              </div>
+            </section>
+          </main>
+        </div>
+        <script>
+          (function () {{
+            var target = {json.dumps(target_url)};
+            try {{
+              if (window.top === window.self) {{
+                window.location.replace(target);
+                return;
+              }}
+              window.top.location.href = target;
+            }} catch (_error) {{
+              window.open(target, "_top");
+            }}
+          }})();
+        </script>
       </body>
     </html>
     """
@@ -159,6 +222,56 @@ def _safe_requested_shop(value: str | None) -> str | None:
         return validate_shop_domain(value)
     except AuthorizationError:
         return None
+
+
+def _is_embedded_request(request: Request) -> bool:
+    if request.query_params.get("embedded") == "1":
+        return True
+    if request.headers.get("sec-fetch-dest") == "iframe" and request.query_params.get("host"):
+        return True
+    return False
+
+
+def _build_top_level_auth_url(request: Request, *, shop: str, host: str | None, return_to: str | None) -> str:
+    params = [("shop", shop)]
+    if host:
+        params.append(("host", host))
+    if return_to:
+        params.append(("return_to", return_to))
+    return f"{resolve_base_url(request)}/auth/start?{urlencode(params)}"
+
+
+def _decode_shopify_host(host: str | None) -> str | None:
+    if not host:
+        return None
+    normalized = host.strip()
+    if not normalized:
+        return None
+
+    padding = "=" * (-len(normalized) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((normalized + padding).encode("utf-8")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    decoded = decoded.strip().replace("https://", "").replace("http://", "").strip("/")
+    return decoded or None
+
+
+def _build_embedded_app_redirect_url(
+    request: Request,
+    *,
+    host: str | None,
+    redirect_path: str,
+    params: list[tuple[str, str]],
+) -> str:
+    decoded_host = _decode_shopify_host(host)
+    if not decoded_host:
+        return f"{redirect_path}?{urlencode(params)}"
+    embedded_path = redirect_path
+    if embedded_path.startswith("/app"):
+        embedded_path = embedded_path[4:] or "/"
+    return f"https://{decoded_host}/apps/{settings.shopify_client_id}{embedded_path}?{urlencode(params)}"
 
 
 def _get_session_context(request: Request) -> Tuple[ShopRecord, dict]:
@@ -638,7 +751,7 @@ async def root() -> RedirectResponse:
 
 
 @app.get("/auth/start", include_in_schema=False)
-async def auth_start(request: Request) -> RedirectResponse:
+async def auth_start(request: Request) -> Response:
     shop = validate_shop_domain(request.query_params.get("shop", ""))
     if request.query_params.get("hmac") and not verify_shopify_query_hmac(
         request.url.query,
@@ -648,6 +761,15 @@ async def auth_start(request: Request) -> RedirectResponse:
 
     host = request.query_params.get("host")
     return_to = request.query_params.get("return_to") or "/app"
+    if _is_embedded_request(request):
+        target_url = _build_top_level_auth_url(
+            request,
+            shop=shop,
+            host=host,
+            return_to=return_to,
+        )
+        return render_top_level_redirect_page(target_url)
+
     state = secrets.token_urlsafe(24)
     redirect = RedirectResponse(
         url=build_authorize_url(settings, shop=shop, state=state),
@@ -704,7 +826,14 @@ async def auth_callback(request: Request) -> RedirectResponse:
     params = [("shop", saved_shop.shop_domain)]
     if host:
         params.append(("host", host))
-    redirect = RedirectResponse(url=f"{redirect_path}?{urlencode(params)}", status_code=303)
+    params.append(("embedded", "1"))
+    redirect_url = _build_embedded_app_redirect_url(
+        request,
+        host=host,
+        redirect_path=redirect_path,
+        params=params,
+    )
+    redirect = RedirectResponse(url=redirect_url, status_code=303)
     session_manager.set_app_session(redirect, shop=saved_shop.shop_domain, host=host)
     session_manager.clear_oauth_state(redirect)
     if raw_secret:
@@ -726,13 +855,22 @@ async def app_shell(request: Request) -> Response:
         params = list(request.query_params.multi_items())
         if not any(key == "return_to" for key, _value in params):
             params.append(("return_to", request.url.path))
+        if _is_embedded_request(request):
+            target_url = f"{resolve_base_url(request)}/auth/start?{urlencode(params)}"
+            return render_top_level_redirect_page(target_url)
         return RedirectResponse(url=f"/auth/start?{urlencode(params)}", status_code=307)
 
     if session_shop is not None:
         return render_ui_shell()
 
     message = request.query_params.get("error_description") or request.query_params.get("error")
-    return render_install_page(initial_shop=requested_shop or "", error=message)
+    return render_install_page(
+        initial_shop=requested_shop or "",
+        error=message,
+        host=request.query_params.get("host"),
+        embedded=request.query_params.get("embedded"),
+        return_to=request.url.path,
+    )
 
 
 @app.get("/health", response_model=HealthResponse)
