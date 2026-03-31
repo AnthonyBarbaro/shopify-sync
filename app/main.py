@@ -746,8 +746,8 @@ async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:
 
 
 @app.get("/", include_in_schema=False)
-async def root() -> RedirectResponse:
-    return RedirectResponse(url="/app", status_code=307)
+async def root(request: Request) -> Response:
+    return await app_shell(request)
 
 
 @app.get("/auth/start", include_in_schema=False)
@@ -856,7 +856,12 @@ async def app_shell(request: Request) -> Response:
         if not any(key == "return_to" for key, _value in params):
             params.append(("return_to", request.url.path))
         if _is_embedded_request(request):
-            target_url = f"{resolve_base_url(request)}/auth/start?{urlencode(params)}"
+            target_url = _build_top_level_auth_url(
+                request,
+                shop=requested_shop,
+                host=request.query_params.get("host"),
+                return_to=request.url.path,
+            )
             return render_top_level_redirect_page(target_url)
         return RedirectResponse(url=f"/auth/start?{urlencode(params)}", status_code=307)
 
