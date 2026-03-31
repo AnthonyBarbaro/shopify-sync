@@ -41,13 +41,42 @@ class ShopifyClient:
               id
               title
               handle
+              status
+              vendor
+              productType
+              updatedAt
+              media(first: 10) {
+                nodes {
+                  alt
+                  mediaContentType
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
               variants(first: 100) {
                 nodes {
                   id
                   sku
+                  barcode
                   price
                   inventoryItem {
                     id
+                    inventoryLevels(first: 10) {
+                      nodes {
+                        location {
+                          id
+                          name
+                        }
+                        quantities(names: ["available"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -63,7 +92,7 @@ class ShopifyClient:
                 shop_domain,
                 access_token,
                 query,
-                {"first": 50, "after": cursor},
+                {"first": 25, "after": cursor},
                 operation_name="GetProducts",
             )
             products_data = payload["data"]["products"]
@@ -139,6 +168,75 @@ class ShopifyClient:
         self._set_cached_variant(shop_domain, mapping)
         return mapping
 
+    def get_product_by_handle(
+        self,
+        shop_domain: str,
+        access_token: str,
+        handle: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_handle = handle.strip()
+        if not normalized_handle:
+            return None
+
+        query = """
+        query ProductByHandle($query: String!) {
+          products(first: 1, query: $query) {
+            nodes {
+              id
+              title
+              handle
+              status
+              vendor
+              productType
+              media(first: 10) {
+                nodes {
+                  alt
+                  mediaContentType
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+              variants(first: 100) {
+                nodes {
+                  id
+                  sku
+                  barcode
+                  price
+                  inventoryItem {
+                    id
+                    inventoryLevels(first: 10) {
+                      nodes {
+                        location {
+                          id
+                          name
+                        }
+                        quantities(names: ["available"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"query": f"handle:{normalized_handle}"},
+            operation_name="ProductByHandle",
+        )
+        nodes = payload["data"]["products"]["nodes"]
+        return nodes[0] if nodes else None
+
     def get_primary_location_id(self, shop_domain: str, access_token: str) -> str:
         if self.settings.shopify_location_id:
             return normalize_gid("Location", self.settings.shopify_location_id)
@@ -183,6 +281,206 @@ class ShopifyClient:
         """
         payload = self.graphql(shop_domain, access_token, query, operation_name="ShopInfo")
         return payload["data"]["shop"] or {}
+
+    def product_set(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        input_data: Dict[str, Any],
+        identifier: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation ProductSetSync($input: ProductSetInput!, $synchronous: Boolean!, $identifier: ProductSetIdentifiers) {
+          productSet(input: $input, synchronous: $synchronous, identifier: $identifier) {
+            product {
+              id
+              title
+              handle
+              status
+              vendor
+              productType
+              media(first: 10) {
+                nodes {
+                  alt
+                  mediaContentType
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+              variants(first: 100) {
+                nodes {
+                  id
+                  title
+                  sku
+                  barcode
+                  price
+                  compareAtPrice
+                  inventoryItem {
+                    id
+                    inventoryLevels(first: 25) {
+                      nodes {
+                        location {
+                          id
+                          name
+                        }
+                        quantities(names: ["available"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "input": input_data,
+                "synchronous": True,
+                "identifier": identifier,
+            },
+            operation_name="ProductSetSync",
+        )
+        result = payload["data"]["productSet"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the product sync request.",
+                {
+                    "identifier": identifier,
+                    "user_errors": user_errors,
+                },
+            )
+        product = result.get("product")
+        if not product:
+            raise ShopifyAPIError(
+                "Shopify did not return a product after sync.",
+                {"identifier": identifier},
+            )
+        return product
+
+    def update_product(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        product: Dict[str, Any],
+        media: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation UpdateProduct($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+          productUpdate(product: $product, media: $media) {
+            product {
+              id
+              title
+              handle
+              status
+              vendor
+              productType
+              media(first: 10) {
+                nodes {
+                  alt
+                  mediaContentType
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {"product": product, "media": media or []},
+            operation_name="UpdateProduct",
+        )
+        result = payload["data"]["productUpdate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the product update.",
+                {"product_id": product.get("id"), "user_errors": user_errors},
+            )
+        updated_product = result.get("product")
+        if not updated_product:
+            raise ShopifyAPIError(
+                "Shopify did not return a product after update.",
+                {"product_id": product.get("id")},
+            )
+        return updated_product
+
+    def update_variant_fields(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        product_id: str,
+        variant: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation UpdateVariantFields($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+            productVariants {
+              id
+              sku
+              barcode
+              price
+              compareAtPrice
+              inventoryItem {
+                id
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "productId": normalize_gid("Product", product_id),
+                "variants": [variant],
+            },
+            operation_name="UpdateVariantFields",
+        )
+        result = payload["data"]["productVariantsBulkUpdate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the variant update.",
+                {"product_id": product_id, "variant": variant, "user_errors": user_errors},
+            )
+        updated_variants = result.get("productVariants") or []
+        return updated_variants[0] if updated_variants else {}
 
     def update_variant_price(
         self,
@@ -356,6 +654,48 @@ class ShopifyClient:
                     "inventory_item_id": normalized_inventory_item_id,
                     "location_id": normalized_location_id,
                     "sku": sku,
+                    "user_errors": user_errors,
+                },
+            )
+
+    def activate_inventory(
+        self,
+        shop_domain: str,
+        access_token: str,
+        inventory_item_id: str,
+        location_id: str,
+    ) -> None:
+        mutation = """
+        mutation ActivateInventory($inventoryItemId: ID!, $locationId: ID!) {
+          inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+            inventoryLevel {
+              id
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "inventoryItemId": normalize_gid("InventoryItem", inventory_item_id),
+                "locationId": normalize_gid("Location", location_id),
+            },
+            operation_name="ActivateInventory",
+        )
+        result = payload["data"]["inventoryActivate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify could not activate inventory at the target location.",
+                {
+                    "inventory_item_id": normalize_gid("InventoryItem", inventory_item_id),
+                    "location_id": normalize_gid("Location", location_id),
                     "user_errors": user_errors,
                 },
             )

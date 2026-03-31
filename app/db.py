@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import secrets
 import sqlite3
@@ -5,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Tuple
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.utils import AuthorizationError, setup_logging, utc_now_iso
 
@@ -34,12 +37,40 @@ class PosCredentialRecord:
     last_used_at: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class PosAuthRecord:
+    shop_domain: str
+    api_key: str
+    secret_salt: str
+    secret_hash: str
+    secret_ciphertext: Optional[str]
+
+
+@dataclass(frozen=True)
+class FeedEventRow:
+    id: int
+    shop_domain: str
+    source: str
+    endpoint: str
+    method: str
+    sku: Optional[str]
+    title: Optional[str]
+    success: bool
+    message: str
+    product_id: Optional[str]
+    variant_id: Optional[str]
+    request_payload: str
+    normalized_payload: Optional[str]
+    received_at: str
+
+
 class DatabaseStore:
-    def __init__(self, database_path: str) -> None:
+    def __init__(self, database_path: str, encryption_secret: str) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = setup_logging().getChild("db")
         self._lock = Lock()
+        self._fernet = _build_fernet(encryption_secret)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -75,6 +106,7 @@ class DatabaseStore:
                     secret_salt TEXT NOT NULL,
                     secret_hash TEXT NOT NULL,
                     secret_preview TEXT NOT NULL,
+                    secret_ciphertext TEXT,
                     created_at TEXT NOT NULL,
                     rotated_at TEXT,
                     last_used_at TEXT,
@@ -83,9 +115,51 @@ class DatabaseStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feed_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    sku TEXT,
+                    title TEXT,
+                    success INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    product_id TEXT,
+                    variant_id TEXT,
+                    request_payload TEXT NOT NULL,
+                    normalized_payload TEXT,
+                    received_at TEXT NOT NULL,
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            self._ensure_column(connection, "pos_credentials", "secret_ciphertext", "TEXT")
+            connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_credentials_api_key ON pos_credentials(api_key)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feed_events_shop_created ON feed_events(shop_domain, received_at DESC)"
+            )
             connection.commit()
+
+    def _ensure_column(
+        self,
+        connection: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_definition: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in columns:
+            return
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )
 
     def upsert_shop(
         self,
@@ -183,6 +257,7 @@ class DatabaseStore:
         api_key = f"pos_{secrets.token_hex(16)}"
         salt, secret_hash = _hash_secret(raw_secret)
         preview = _mask_secret(raw_secret)
+        ciphertext = self._fernet.encrypt(raw_secret.encode("utf-8")).decode("utf-8")
         now = utc_now_iso()
 
         with self._lock:
@@ -195,16 +270,18 @@ class DatabaseStore:
                         secret_salt,
                         secret_hash,
                         secret_preview,
+                        secret_ciphertext,
                         created_at,
                         rotated_at,
                         last_used_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     ON CONFLICT(shop_domain) DO UPDATE SET
                         api_key=excluded.api_key,
                         secret_salt=excluded.secret_salt,
                         secret_hash=excluded.secret_hash,
                         secret_preview=excluded.secret_preview,
+                        secret_ciphertext=excluded.secret_ciphertext,
                         rotated_at=excluded.rotated_at
                     """,
                     (
@@ -213,6 +290,7 @@ class DatabaseStore:
                         salt,
                         secret_hash,
                         preview,
+                        ciphertext,
                         now,
                         None if is_first_issue else now,
                     ),
@@ -245,15 +323,16 @@ class DatabaseStore:
             last_used_at=row["last_used_at"],
         )
 
-    def verify_pos_credentials(self, api_key: str, api_secret: str) -> ShopRecord:
+    def get_pos_auth_record(self, api_key: str) -> Optional[PosAuthRecord]:
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT
-                    shops.*,
-                    pos_credentials.api_key,
-                    pos_credentials.secret_salt,
-                    pos_credentials.secret_hash
+                    shops.shop_domain AS shop_domain,
+                    pos_credentials.api_key AS api_key,
+                    pos_credentials.secret_salt AS secret_salt,
+                    pos_credentials.secret_hash AS secret_hash,
+                    pos_credentials.secret_ciphertext AS secret_ciphertext
                 FROM pos_credentials
                 JOIN shops ON shops.shop_domain = pos_credentials.shop_domain
                 WHERE pos_credentials.api_key = ?
@@ -261,20 +340,38 @@ class DatabaseStore:
                 """,
                 (api_key,),
             ).fetchone()
+        if row is None:
+            return None
+        return PosAuthRecord(
+            shop_domain=row["shop_domain"],
+            api_key=row["api_key"],
+            secret_salt=row["secret_salt"],
+            secret_hash=row["secret_hash"],
+            secret_ciphertext=row["secret_ciphertext"],
+        )
 
-            if row is None or not _verify_secret(
-                api_secret,
-                salt_hex=row["secret_salt"],
-                secret_hash=row["secret_hash"],
-            ):
-                raise AuthorizationError(
-                    "Invalid POS API credentials.",
-                    {
-                        "accepted_auth": ["basic", "x-api-key/x-api-secret"],
-                        "header_names": ["X-API-Key", "X-API-Secret"],
-                    },
-                )
+    def verify_pos_credentials(self, api_key: str, api_secret: str) -> ShopRecord:
+        auth_record = self.get_pos_auth_record(api_key)
+        if auth_record is None or not _verify_secret(
+            api_secret,
+            salt_hex=auth_record.secret_salt,
+            secret_hash=auth_record.secret_hash,
+        ):
+            raise AuthorizationError(
+                "Invalid POS API credentials.",
+                {
+                    "accepted_auth": [
+                        "basic",
+                        "x-api-key/x-api-secret",
+                        "woo_query_string",
+                        "woo_oauth_signature",
+                    ],
+                    "header_names": ["X-API-Key", "X-API-Secret"],
+                    "query_names": ["consumer_key", "consumer_secret", "oauth_*"],
+                },
+            )
 
+        with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE pos_credentials
@@ -285,10 +382,132 @@ class DatabaseStore:
             )
             connection.commit()
 
-        shop = self.get_shop(row["shop_domain"])
+        shop = self.get_shop(auth_record.shop_domain)
         if shop is None:
             raise AuthorizationError("This shop is not installed or has been disconnected.")
         return shop
+
+    def verify_query_string_credentials(self, api_key: str, api_secret: str) -> ShopRecord:
+        return self.verify_pos_credentials(api_key, api_secret)
+
+    def get_query_auth_secret(self, api_key: str) -> Tuple[ShopRecord, str]:
+        auth_record = self.get_pos_auth_record(api_key)
+        if auth_record is None:
+            raise AuthorizationError("Invalid POS API credentials.")
+
+        if not auth_record.secret_ciphertext:
+            raise AuthorizationError(
+                "Rotate the POS credentials once before using Woo-style signed requests.",
+                {
+                    "required_action": "rotate_credentials",
+                    "shop": auth_record.shop_domain,
+                },
+            )
+
+        try:
+            raw_secret = self._fernet.decrypt(auth_record.secret_ciphertext.encode("utf-8")).decode("utf-8")
+        except (InvalidToken, ValueError) as exc:
+            raise AuthorizationError(
+                "Stored POS credentials could not be decrypted. Rotate the credentials and try again.",
+                {
+                    "required_action": "rotate_credentials",
+                    "shop": auth_record.shop_domain,
+                },
+            ) from exc
+
+        shop = self.get_shop(auth_record.shop_domain)
+        if shop is None:
+            raise AuthorizationError("This shop is not installed or has been disconnected.")
+        return shop, raw_secret
+
+    def mark_pos_credentials_used(self, api_key: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pos_credentials
+                SET last_used_at = ?
+                WHERE api_key = ?
+                """,
+                (utc_now_iso(), api_key),
+            )
+            connection.commit()
+
+    def record_feed_event(
+        self,
+        *,
+        shop_domain: str,
+        source: str,
+        endpoint: str,
+        method: str,
+        sku: Optional[str],
+        title: Optional[str],
+        success: bool,
+        message: str,
+        product_id: Optional[str],
+        variant_id: Optional[str],
+        request_payload: str,
+        normalized_payload: Optional[str],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO feed_events (
+                    shop_domain,
+                    source,
+                    endpoint,
+                    method,
+                    sku,
+                    title,
+                    success,
+                    message,
+                    product_id,
+                    variant_id,
+                    request_payload,
+                    normalized_payload,
+                    received_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    shop_domain,
+                    source,
+                    endpoint,
+                    method.upper(),
+                    sku,
+                    title,
+                    1 if success else 0,
+                    message,
+                    product_id,
+                    variant_id,
+                    request_payload,
+                    normalized_payload,
+                    utc_now_iso(),
+                ),
+            )
+            connection.commit()
+
+    def list_feed_events(self, shop_domain: str, *, limit: int = 50) -> list[FeedEventRow]:
+        safe_limit = max(1, min(limit, 500))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM feed_events
+                WHERE shop_domain = ?
+                ORDER BY received_at DESC, id DESC
+                LIMIT ?
+                """,
+                (shop_domain, safe_limit),
+            ).fetchall()
+        return [self._row_to_feed_event(row) for row in rows]
+
+    def feed_event_count(self, shop_domain: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM feed_events WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        return int(row["count"]) if row else 0
 
     def mark_shop_uninstalled(self, shop_domain: str) -> None:
         with self._connect() as connection:
@@ -325,6 +544,25 @@ class DatabaseStore:
             uninstalled_at=row["uninstalled_at"],
         )
 
+    @staticmethod
+    def _row_to_feed_event(row: sqlite3.Row) -> FeedEventRow:
+        return FeedEventRow(
+            id=int(row["id"]),
+            shop_domain=row["shop_domain"],
+            source=row["source"],
+            endpoint=row["endpoint"],
+            method=row["method"],
+            sku=row["sku"],
+            title=row["title"],
+            success=bool(row["success"]),
+            message=row["message"],
+            product_id=row["product_id"],
+            variant_id=row["variant_id"],
+            request_payload=row["request_payload"],
+            normalized_payload=row["normalized_payload"],
+            received_at=row["received_at"],
+        )
+
 
 def _hash_secret(secret: str) -> Tuple[str, str]:
     salt = secrets.token_bytes(16)
@@ -345,3 +583,9 @@ def _verify_secret(secret: str, *, salt_hex: str, secret_hash: str) -> bool:
 
 def _mask_secret(secret: str) -> str:
     return f"{secret[:6]}...{secret[-4:]}"
+
+
+def _build_fernet(secret: str) -> Fernet:
+    digest = hashlib.sha256(secret.encode("utf-8")).digest()
+    key = base64.urlsafe_b64encode(digest)
+    return Fernet(key)

@@ -1,24 +1,31 @@
+import csv
 import html
+import json
 import secrets
 from datetime import timedelta
+from io import StringIO
 from pathlib import Path
-from typing import Callable, List, Tuple, TypeVar
+from typing import Any, Callable, List, Tuple, TypeVar
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasicCredentials
 
 from app.auth import (
     AppSessionManager,
+    WooNonceStore,
     build_authorize_url,
+    extract_woo_query_credentials,
     exchange_authorization_code,
     extract_pos_credentials,
+    has_woo_oauth_signature,
     pos_basic_security,
     refresh_access_token,
     validate_shop_domain,
+    verify_woo_oauth_request,
     verify_shopify_query_hmac,
     verify_shopify_webhook_hmac,
 )
@@ -27,8 +34,10 @@ from app.db import DatabaseStore, PosCredentialRecord, ShopRecord
 from app.inventory import InventorySyncService
 from app.models import (
     BulkSyncResponse,
+    CatalogResponse,
     ConnectionSettingsResponse,
     ErrorResponse,
+    FeedEventsResponse,
     HealthResponse,
     ProductSyncRequest,
     ShopifyConnectionResponse,
@@ -41,6 +50,7 @@ from app.state import SyncActivityStore
 from app.utils import (
     AppError,
     AuthorizationError,
+    SyncProcessingError,
     error_payload,
     parse_iso_datetime,
     safe_json_dumps,
@@ -56,11 +66,12 @@ INDEX_FILE = STATIC_DIR / "index.html"
 
 settings = get_settings()
 logger = setup_logging()
-db = DatabaseStore(settings.database_path)
+db = DatabaseStore(settings.database_path, settings.credential_encryption_secret)
 session_manager = AppSessionManager(settings)
 shopify_client = ShopifyClient(settings)
 activity_store = SyncActivityStore(limit=400)
 inventory_service = InventorySyncService(shopify_client, settings, activity_store)
+woo_nonce_store = WooNonceStore()
 
 app = FastAPI(
     title="Shopify Inventory Sync",
@@ -70,6 +81,16 @@ app = FastAPI(
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 T = TypeVar("T")
+POS_AUTH_QUERY_KEYS = {
+    "consumer_key",
+    "consumer_secret",
+    "oauth_consumer_key",
+    "oauth_signature",
+    "oauth_signature_method",
+    "oauth_timestamp",
+    "oauth_nonce",
+    "oauth_version",
+}
 
 
 def render_ui_shell() -> HTMLResponse:
@@ -210,20 +231,44 @@ def run_with_shop_retry(shop: ShopRecord, operation: Callable[[ShopRecord], T]) 
 
 
 def require_pos_shop(
+    request: Request,
     credentials: HTTPBasicCredentials | None = Depends(pos_basic_security),
     x_api_key: str | None = Header(default=None),
     x_api_secret: str | None = Header(default=None),
 ) -> ShopRecord:
     api_key, api_secret = extract_pos_credentials(credentials, x_api_key, x_api_secret)
-    if not api_key or not api_secret:
-        raise AuthorizationError(
-            "POS API credentials are required.",
-            {
-                "accepted_auth": ["basic", "x-api-key/x-api-secret"],
-                "header_names": ["X-API-Key", "X-API-Secret"],
-            },
+    if api_key and api_secret:
+        return db.verify_pos_credentials(api_key, api_secret)
+
+    query_key, query_secret = extract_woo_query_credentials(request)
+    if query_key and query_secret:
+        return db.verify_query_string_credentials(query_key, query_secret)
+
+    oauth_key = query_key
+    if oauth_key and has_woo_oauth_signature(request):
+        shop, raw_secret = db.get_query_auth_secret(oauth_key)
+        verify_woo_oauth_request(
+            request,
+            api_key=oauth_key,
+            api_secret=raw_secret,
+            nonce_store=woo_nonce_store,
         )
-    return db.verify_pos_credentials(api_key, api_secret)
+        db.mark_pos_credentials_used(oauth_key)
+        return shop
+
+    raise AuthorizationError(
+        "POS API credentials are required.",
+        {
+            "accepted_auth": [
+                "basic",
+                "x-api-key/x-api-secret",
+                "woo_query_string",
+                "woo_oauth_signature",
+            ],
+            "header_names": ["X-API-Key", "X-API-Secret"],
+            "query_names": ["consumer_key", "consumer_secret", "oauth_*"],
+        },
+    )
 
 
 def build_connection_settings_response(
@@ -239,30 +284,291 @@ def build_connection_settings_response(
     return ConnectionSettingsResponse(
         shop=shop.shop_domain,
         base_url=base_url,
-        product_sync_path="/sync/product",
-        product_sync_url=f"{base_url}/sync/product",
-        bulk_sync_path="/sync/bulk",
-        bulk_sync_url=f"{base_url}/sync/bulk",
+        product_sync_path="/wc-api/v3/products",
+        product_sync_url=f"{base_url}/wc-api/v3/products",
+        bulk_sync_path="/wc-api/v3/products/batch",
+        bulk_sync_url=f"{base_url}/wc-api/v3/products/batch",
         api_key=credentials.api_key,
         api_secret=flash_secret,
         api_secret_masked=credentials.api_secret_masked,
         secret_is_temporary=bool(flash_secret),
-        auth_modes=["basic", "x-api-key/x-api-secret"],
+        auth_modes=["woo_query_string", "woo_oauth_signature", "basic", "x-api-key/x-api-secret"],
         auth_header_key="X-API-Key",
         auth_header_secret="X-API-Secret",
-        method="POST",
-        content_type="application/json",
+        method="GET or POST",
+        content_type="application/json or query/form",
         update_price_and_quantities=True,
-        product_payload_example={"sku": "ABC123", "price": 19.99, "quantity": 10},
+        product_payload_example={
+            "name": "Classic Tee",
+            "sku": "ABC123",
+            "barcode": "012345678905",
+            "regular_price": "19.99",
+            "stock_quantity": 10,
+            "status": "draft",
+            "description": "<p>Imported from POS</p>",
+            "vendor": "POS Company",
+            "product_type": "Apparel",
+            "images": [{"src": "https://example.com/products/classic-tee.jpg"}],
+        },
         bulk_payload_example=[
-            {"sku": "ABC123", "price": 19.99, "quantity": 10},
-            {"sku": "DEF456", "price": 24.99, "quantity": 5},
+            {
+                "name": "Classic Tee",
+                "sku": "ABC123",
+                "regular_price": "19.99",
+                "stock_quantity": 10,
+                "status": "draft",
+            },
+            {
+                "name": "Canvas Hat",
+                "sku": "DEF456",
+                "regular_price": "24.99",
+                "stock_quantity": 5,
+                "status": "draft",
+            },
         ],
         created_at=credentials.created_at,
         rotated_at=credentials.rotated_at,
         last_used_at=credentials.last_used_at,
         timestamp=utc_now_iso(),
     )
+
+
+async def parse_external_request_payload(request: Request) -> Any:
+    if request.method.upper() == "GET":
+        payload = _query_payload_without_auth(request)
+        return payload or None
+
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+
+    if content_type == "application/json":
+        try:
+            return await request.json()
+        except json.JSONDecodeError as exc:
+            raise SyncProcessingError(
+                "Request body is not valid JSON.",
+                {"content_type": content_type},
+                code="invalid_json",
+            ) from exc
+
+    if content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+        form = await request.form()
+        return _coerce_multidict(form.multi_items())
+
+    body = await request.body()
+    if not body:
+        return None
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SyncProcessingError(
+            "Unsupported request content type. Send JSON, form data, or query parameters.",
+            {"content_type": content_type or "unknown"},
+            code="unsupported_content_type",
+        )
+
+
+def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
+    if isinstance(raw_payload, ProductSyncRequest):
+        return raw_payload
+    if not isinstance(raw_payload, dict):
+        raise SyncProcessingError(
+            "Product payload must be a JSON object.",
+            {"received_type": type(raw_payload).__name__},
+            code="invalid_product_payload",
+        )
+
+    image_inputs = _normalize_image_inputs(raw_payload)
+    categories = _extract_named_values(raw_payload.get("categories"))
+    tags = _normalize_tags(raw_payload.get("tags"), categories)
+    product_type = _string_or_none(raw_payload.get("product_type")) or (categories[0] if categories else None)
+    quantity = _as_int(raw_payload.get("quantity"))
+    if quantity is None:
+        quantity = _as_int(raw_payload.get("stock_quantity"))
+
+    normalized = {
+        "title": _string_or_none(raw_payload.get("title")) or _string_or_none(raw_payload.get("name")),
+        "name": _string_or_none(raw_payload.get("name")),
+        "handle": _string_or_none(raw_payload.get("handle")) or _string_or_none(raw_payload.get("slug")),
+        "external_id": _string_or_none(raw_payload.get("external_id")) or _string_or_none(raw_payload.get("id")),
+        "description_html": _string_or_none(raw_payload.get("description_html")) or _string_or_none(raw_payload.get("description")),
+        "short_description": _string_or_none(raw_payload.get("short_description")),
+        "vendor": _string_or_none(raw_payload.get("vendor")) or _string_or_none(raw_payload.get("brand")),
+        "brand": _string_or_none(raw_payload.get("brand")),
+        "product_type": product_type,
+        "tags": tags,
+        "status": _string_or_none(raw_payload.get("status")),
+        "sku": _string_or_none(raw_payload.get("sku")),
+        "barcode": _string_or_none(raw_payload.get("barcode"))
+        or _string_or_none(raw_payload.get("ean"))
+        or _string_or_none(raw_payload.get("upc"))
+        or _string_or_none(raw_payload.get("gtin")),
+        "price": _as_float(raw_payload.get("price"))
+        if raw_payload.get("price") not in (None, "")
+        else _as_float(raw_payload.get("regular_price")),
+        "compare_at_price": _as_float(raw_payload.get("compare_at_price"))
+        if raw_payload.get("compare_at_price") not in (None, "")
+        else _as_float(raw_payload.get("sale_price")),
+        "quantity": quantity,
+        "tracked": _as_bool(raw_payload.get("tracked"))
+        if raw_payload.get("tracked") not in (None, "")
+        else _as_bool(raw_payload.get("manage_stock")),
+        "requires_shipping": _as_bool(raw_payload.get("requires_shipping")),
+        "image_url": image_inputs[0]["src"] if image_inputs else _string_or_none(raw_payload.get("image_url")),
+        "image_urls": [item["src"] for item in image_inputs],
+        "images": image_inputs,
+    }
+    return ProductSyncRequest.model_validate(normalized)
+
+
+def normalize_external_bulk_payload(raw_payload: Any) -> List[ProductSyncRequest]:
+    if isinstance(raw_payload, list):
+        items = raw_payload
+    elif isinstance(raw_payload, dict):
+        if isinstance(raw_payload.get("products"), list):
+            items = raw_payload["products"]
+        elif isinstance(raw_payload.get("create"), list) or isinstance(raw_payload.get("update"), list):
+            items = list(raw_payload.get("create") or []) + list(raw_payload.get("update") or [])
+        else:
+            items = [raw_payload]
+    else:
+        raise SyncProcessingError(
+            "Bulk payload must be a JSON array or object.",
+            {"received_type": type(raw_payload).__name__},
+            code="invalid_bulk_payload",
+        )
+
+    return [normalize_external_product_payload(item) for item in items]
+
+
+def _query_payload_without_auth(request: Request) -> dict[str, Any]:
+    return _coerce_multidict(
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key not in POS_AUTH_QUERY_KEYS
+    )
+
+
+def _coerce_multidict(items: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in items:
+        if key in payload:
+            if not isinstance(payload[key], list):
+                payload[key] = [payload[key]]
+            payload[key].append(value)
+            continue
+        payload[key] = value
+    return payload
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise SyncProcessingError(
+            "Price values must be numeric.",
+            {"value": value},
+            code="invalid_price",
+        ) from exc
+
+
+def _as_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError) as exc:
+        raise SyncProcessingError(
+            "Quantity values must be whole numbers.",
+            {"value": value},
+            code="invalid_quantity",
+        ) from exc
+
+
+def _as_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise SyncProcessingError(
+        "Boolean fields must be true/false style values.",
+        {"value": value},
+        code="invalid_boolean",
+    )
+
+
+def _extract_named_values(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        results = []
+        for item in value:
+            if isinstance(item, dict):
+                name = _string_or_none(item.get("name"))
+                if name:
+                    results.append(name)
+            else:
+                name = _string_or_none(item)
+                if name:
+                    results.append(name)
+        return results
+    return []
+
+
+def _normalize_tags(raw_tags: Any, categories: List[str]) -> List[str]:
+    tags = _extract_named_values(raw_tags)
+    for category in categories:
+        if category not in tags:
+            tags.append(category)
+    return tags
+
+
+def _normalize_image_inputs(raw_payload: dict[str, Any]) -> List[dict[str, Any]]:
+    images = []
+    raw_images = raw_payload.get("images") or raw_payload.get("image_urls") or []
+    if isinstance(raw_images, str):
+        raw_images = [item.strip() for item in raw_images.split(",") if item.strip()]
+
+    for item in raw_images:
+        if isinstance(item, dict):
+            src = _string_or_none(item.get("src")) or _string_or_none(item.get("url"))
+            if not src:
+                continue
+            images.append(
+                {
+                    "src": src,
+                    "alt": _string_or_none(item.get("alt")),
+                    "filename": _string_or_none(item.get("filename")),
+                    "content_type": _string_or_none(item.get("content_type")) or _string_or_none(item.get("contentType")),
+                }
+            )
+            continue
+
+        src = _string_or_none(item)
+        if src:
+            images.append({"src": src})
+
+    single_image = _string_or_none(raw_payload.get("image_url")) or _string_or_none(raw_payload.get("image"))
+    if single_image and all(item["src"] != single_image for item in images):
+        images.insert(0, {"src": single_image})
+
+    return images
 
 
 def verify_webhook_request(request: Request, body: bytes) -> str:
@@ -409,6 +715,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 @app.get("/app", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
+@app.get("/app/catalog", include_in_schema=False)
 @app.get("/app/settings", include_in_schema=False)
 async def app_shell(request: Request) -> Response:
     session = session_manager.get_app_session(request)
@@ -517,6 +824,151 @@ async def activity(request: Request, limit: int = 25) -> SyncActivityResponse:
     )
 
 
+@app.get("/api/catalog", response_model=CatalogResponse)
+async def catalog(request: Request, limit: int = 100) -> CatalogResponse:
+    shop, _session = _get_session_context(request)
+    safe_limit = max(1, min(limit, 500))
+
+    def load(active_shop: ShopRecord) -> CatalogResponse:
+        items = inventory_service.list_catalog(active_shop)[:safe_limit]
+        return CatalogResponse(
+            shop=active_shop.shop_domain,
+            total=len(items),
+            items=items,
+            timestamp=utc_now_iso(),
+        )
+
+    return run_with_shop_retry(shop, load)
+
+
+@app.get("/api/catalog.csv")
+async def catalog_csv(request: Request) -> StreamingResponse:
+    shop, _session = _get_session_context(request)
+
+    def load(active_shop: ShopRecord) -> list[Any]:
+        return inventory_service.list_catalog(active_shop)
+
+    items = run_with_shop_retry(shop, load)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "product_id",
+            "variant_id",
+            "title",
+            "handle",
+            "status",
+            "sku",
+            "barcode",
+            "price",
+            "quantity",
+            "vendor",
+            "product_type",
+            "image_url",
+            "updated_at",
+        ]
+    )
+    for item in items:
+        writer.writerow(
+            [
+                item.product_id,
+                item.variant_id or "",
+                item.title,
+                item.handle or "",
+                item.status or "",
+                item.sku or "",
+                item.barcode or "",
+                item.price if item.price is not None else "",
+                item.quantity if item.quantity is not None else "",
+                item.vendor or "",
+                item.product_type or "",
+                item.image_url or "",
+                item.updated_at or "",
+            ]
+        )
+    output.seek(0)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{shop.shop_domain}-catalog.csv"'
+    }
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+
+
+@app.get("/api/feed", response_model=FeedEventsResponse)
+async def feed(request: Request, limit: int = 50) -> FeedEventsResponse:
+    shop, _session = _get_session_context(request)
+    safe_limit = max(1, min(limit, 250))
+    rows = db.list_feed_events(shop.shop_domain, limit=safe_limit)
+    return FeedEventsResponse(
+        shop=shop.shop_domain,
+        total=db.feed_event_count(shop.shop_domain),
+        items=[
+            {
+                "id": row.id,
+                "source": row.source,
+                "endpoint": row.endpoint,
+                "method": row.method,
+                "sku": row.sku,
+                "title": row.title,
+                "success": row.success,
+                "message": row.message,
+                "product_id": row.product_id,
+                "variant_id": row.variant_id,
+                "received_at": row.received_at,
+            }
+            for row in rows
+        ],
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/feed.csv")
+async def feed_csv(request: Request) -> StreamingResponse:
+    shop, _session = _get_session_context(request)
+    rows = db.list_feed_events(shop.shop_domain, limit=1000)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "id",
+            "source",
+            "endpoint",
+            "method",
+            "sku",
+            "title",
+            "success",
+            "message",
+            "product_id",
+            "variant_id",
+            "received_at",
+            "request_payload",
+            "normalized_payload",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.id,
+                row.source,
+                row.endpoint,
+                row.method,
+                row.sku or "",
+                row.title or "",
+                "true" if row.success else "false",
+                row.message,
+                row.product_id or "",
+                row.variant_id or "",
+                row.received_at,
+                row.request_payload,
+                row.normalized_payload or "",
+            ]
+        )
+    output.seek(0)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{shop.shop_domain}-feed.csv"'
+    }
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+
+
 @app.post(
     "/api/sync/product",
     response_model=SyncResult,
@@ -537,28 +989,264 @@ async def ui_sync_bulk(request: Request, payload: List[ProductSyncRequest]) -> B
     return run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_bulk(payload, active_shop))
 
 
-@app.post(
+def _feed_source_for_path(path: str) -> str:
+    if path.startswith("/wp-json/") or path.startswith("/wc-api/"):
+        return "woo_compatible"
+    return "pos_direct"
+
+
+def _serialize_payload(value: Any) -> str:
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+def _build_woo_product_list(items: list[Any]) -> list[dict[str, Any]]:
+    payload = []
+    for item in items:
+        payload.append(
+            {
+                "id": item.product_id,
+                "name": item.title,
+                "slug": item.handle,
+                "status": (item.status or "draft").lower(),
+                "sku": item.sku,
+                "barcode": item.barcode,
+                "regular_price": f"{item.price:.2f}" if item.price is not None else None,
+                "stock_quantity": item.quantity,
+                "vendor": item.vendor,
+                "product_type": item.product_type,
+                "images": [{"src": item.image_url}] if item.image_url else [],
+                "updated_at": item.updated_at,
+            }
+        )
+    return payload
+
+
+def _looks_like_product_mutation(raw_payload: Any) -> bool:
+    if not isinstance(raw_payload, dict):
+        return False
+    mutation_keys = {
+        "name",
+        "title",
+        "description",
+        "description_html",
+        "price",
+        "regular_price",
+        "sale_price",
+        "quantity",
+        "stock_quantity",
+        "barcode",
+        "images",
+        "image_url",
+        "image",
+    }
+    return any(key in raw_payload for key in mutation_keys)
+
+
+async def _handle_external_single_sync(request: Request, shop: ShopRecord) -> SyncResult | JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    source = _feed_source_for_path(request.url.path)
+
+    if request.method.upper() == "GET" and request.url.path in {"/wc-api/v3/products", "/wp-json/wc/v3/products"} and not _looks_like_product_mutation(raw_payload):
+        try:
+            page = max(int(request.query_params.get("page", "1")), 1)
+            per_page = max(1, min(int(request.query_params.get("per_page", "100")), 250))
+        except ValueError as exc:
+            raise SyncProcessingError(
+                "page and per_page must be whole numbers.",
+                {"page": request.query_params.get("page"), "per_page": request.query_params.get("per_page")},
+                code="invalid_pagination",
+            ) from exc
+
+        requested_sku = _string_or_none(request.query_params.get("sku"))
+        requested_status = _string_or_none(request.query_params.get("status"))
+        search = (_string_or_none(request.query_params.get("search")) or "").lower()
+
+        def load(active_shop: ShopRecord) -> list[Any]:
+            return inventory_service.list_catalog(active_shop)
+
+        rows = run_with_shop_retry(shop, load)
+        if requested_sku:
+            rows = [row for row in rows if (row.sku or "").strip() == requested_sku]
+        if requested_status:
+            rows = [row for row in rows if (row.status or "").lower() == requested_status.lower()]
+        if search:
+            rows = [
+                row
+                for row in rows
+                if search in (row.title or "").lower()
+                or search in (row.sku or "").lower()
+                or search in (row.handle or "").lower()
+            ]
+        start = (page - 1) * per_page
+        end = start + per_page
+        filtered_rows = rows[start:end]
+        return JSONResponse(_build_woo_product_list(filtered_rows))
+
+    if raw_payload is None:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "POS sync endpoint is reachable.",
+                "shop": shop.shop_domain,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "timestamp": utc_now_iso(),
+            }
+        )
+
+    normalized = normalize_external_product_payload(raw_payload)
+    try:
+        result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_product(normalized, active_shop))
+    except Exception as exc:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=normalized.sku,
+            title=normalized.title,
+            success=False,
+            message=str(exc),
+            product_id=None,
+            variant_id=None,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+        )
+        raise
+
+    db.record_feed_event(
+        shop_domain=shop.shop_domain,
+        source=source,
+        endpoint=request.url.path,
+        method=request.method,
+        sku=result.sku,
+        title=result.details.get("product_title"),
+        success=True,
+        message=result.message,
+        product_id=result.product_id,
+        variant_id=result.variant_id,
+        request_payload=_serialize_payload(raw_payload),
+        normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+    )
+    return result
+
+
+async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> BulkSyncResponse | JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    source = _feed_source_for_path(request.url.path)
+
+    if raw_payload is None:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "POS bulk sync endpoint is reachable.",
+                "shop": shop.shop_domain,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "timestamp": utc_now_iso(),
+            }
+        )
+
+    normalized_items = normalize_external_bulk_payload(raw_payload)
+    try:
+        result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_bulk(normalized_items, active_shop))
+    except Exception as exc:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=None,
+            title=f"{len(normalized_items)} products",
+            success=False,
+            message=str(exc),
+            product_id=None,
+            variant_id=None,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=_serialize_payload([item.model_dump(mode="json") for item in normalized_items]),
+        )
+        raise
+
+    for row in result.results:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=row.sku,
+            title=row.details.get("product_title"),
+            success=row.success,
+            message=row.message,
+            product_id=row.product_id,
+            variant_id=row.variant_id,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=_serialize_payload([item.model_dump(mode="json") for item in normalized_items]),
+        )
+    return result
+
+
+@app.api_route(
     "/sync/product",
-    response_model=SyncResult,
+    methods=["GET", "POST"],
+    response_model=None,
     responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
 )
 async def sync_product(
-    payload: ProductSyncRequest,
+    request: Request,
     shop: ShopRecord = Depends(require_pos_shop),
-) -> SyncResult:
-    return run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_product(payload, active_shop))
+) -> SyncResult | JSONResponse:
+    return await _handle_external_single_sync(request, shop)
 
 
-@app.post(
+@app.api_route(
     "/sync/bulk",
-    response_model=BulkSyncResponse,
+    methods=["GET", "POST"],
+    response_model=None,
     responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
 )
 async def sync_bulk(
-    payload: List[ProductSyncRequest],
+    request: Request,
     shop: ShopRecord = Depends(require_pos_shop),
-) -> BulkSyncResponse:
-    return run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_bulk(payload, active_shop))
+) -> BulkSyncResponse | JSONResponse:
+    return await _handle_external_bulk_sync(request, shop)
+
+
+@app.api_route(
+    "/wc-api/v3/products",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_products(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> SyncResult | JSONResponse:
+    return await _handle_external_single_sync(request, shop)
+
+
+@app.api_route(
+    "/wc-api/v3/products/batch",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products/batch",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_products_batch(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> BulkSyncResponse | JSONResponse:
+    return await _handle_external_bulk_sync(request, shop)
 
 
 @app.post("/webhooks/app-uninstalled")

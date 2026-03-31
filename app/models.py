@@ -1,12 +1,44 @@
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ProductImageInput(BaseModel):
+    src: Optional[str] = None
+    url: Optional[str] = None
+    alt: Optional[str] = None
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
+    position: Optional[int] = None
+
+    model_config = ConfigDict(extra="allow")
 
 
 class ProductSyncRequest(BaseModel):
-    sku: str = Field(..., min_length=1)
-    price: float = Field(..., ge=0)
-    quantity: int = Field(..., ge=0)
+    sku: Optional[str] = Field(default=None, min_length=1)
+    title: Optional[str] = None
+    name: Optional[str] = None
+    handle: Optional[str] = None
+    external_id: Optional[str] = None
+    description_html: Optional[str] = None
+    description: Optional[str] = None
+    short_description: Optional[str] = None
+    vendor: Optional[str] = None
+    brand: Optional[str] = None
+    product_type: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    status: Optional[str] = None
+    barcode: Optional[str] = None
+    price: Optional[float] = Field(default=None, ge=0)
+    compare_at_price: Optional[float] = Field(default=None, ge=0)
+    quantity: Optional[int] = Field(default=None, ge=0)
+    tracked: Optional[bool] = True
+    requires_shipping: Optional[bool] = True
+    image_url: Optional[str] = None
+    image_urls: List[str] = Field(default_factory=list)
+    images: List[ProductImageInput] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow")
 
 
 class InventoryLevelSnapshot(BaseModel):
@@ -111,6 +143,50 @@ class SyncActivityResponse(BaseModel):
     shop: str
     total: int
     items: List[SyncResult]
+    timestamp: str
+
+
+class CatalogProductRecord(BaseModel):
+    product_id: str
+    variant_id: Optional[str] = None
+    title: str
+    handle: Optional[str] = None
+    status: Optional[str] = None
+    sku: Optional[str] = None
+    barcode: Optional[str] = None
+    price: Optional[float] = None
+    quantity: Optional[int] = None
+    vendor: Optional[str] = None
+    product_type: Optional[str] = None
+    image_url: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class CatalogResponse(BaseModel):
+    shop: str
+    total: int
+    items: List[CatalogProductRecord]
+    timestamp: str
+
+
+class FeedEventRecord(BaseModel):
+    id: int
+    source: str
+    endpoint: str
+    method: str
+    sku: Optional[str] = None
+    title: Optional[str] = None
+    success: bool
+    message: str
+    product_id: Optional[str] = None
+    variant_id: Optional[str] = None
+    received_at: str
+
+
+class FeedEventsResponse(BaseModel):
+    shop: str
+    total: int
+    items: List[FeedEventRecord]
     timestamp: str
 
 

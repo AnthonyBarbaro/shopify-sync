@@ -5,8 +5,9 @@ import json
 import re
 import secrets
 import time
+from threading import Lock
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 import requests
 from fastapi import Request, Response
@@ -18,6 +19,39 @@ from app.utils import AuthenticationError, AuthorizationError, seconds_from_now_
 
 pos_basic_security = HTTPBasic(auto_error=False)
 SHOP_DOMAIN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9\-]*\.myshopify\.com$")
+WOO_AUTH_WINDOW_SECONDS = 15 * 60
+WOO_SIGNATURE_HASHES = {
+    "HMAC-SHA1": hashlib.sha1,
+    "HMAC-SHA256": hashlib.sha256,
+}
+
+
+class WooNonceStore:
+    def __init__(self, *, ttl_seconds: int = WOO_AUTH_WINDOW_SECONDS, max_entries: int = 5000) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._lock = Lock()
+        self._entries: Dict[Tuple[str, str], int] = {}
+
+    def register(self, api_key: str, nonce: str, timestamp: int) -> bool:
+        now = int(time.time())
+        cutoff = now - self.ttl_seconds
+
+        with self._lock:
+            stale_keys = [key for key, value in self._entries.items() if value < cutoff]
+            for key in stale_keys:
+                self._entries.pop(key, None)
+
+            cache_key = (api_key, nonce)
+            if cache_key in self._entries:
+                return False
+
+            if len(self._entries) >= self.max_entries:
+                oldest_key = min(self._entries, key=self._entries.get)
+                self._entries.pop(oldest_key, None)
+
+            self._entries[cache_key] = timestamp
+            return True
 
 
 class AppSessionManager:
@@ -128,6 +162,110 @@ def extract_pos_credentials(
     if credentials:
         return credentials.username, credentials.password
     return x_api_key, x_api_secret
+
+
+def extract_woo_query_credentials(request: Request) -> Tuple[Optional[str], Optional[str]]:
+    api_key = request.query_params.get("consumer_key") or request.query_params.get("oauth_consumer_key")
+    api_secret = request.query_params.get("consumer_secret")
+    return api_key, api_secret
+
+
+def has_woo_oauth_signature(request: Request) -> bool:
+    return bool(request.query_params.get("oauth_signature"))
+
+
+def verify_woo_oauth_request(
+    request: Request,
+    *,
+    api_key: str,
+    api_secret: str,
+    nonce_store: WooNonceStore,
+) -> None:
+    signature = request.query_params.get("oauth_signature")
+    nonce = request.query_params.get("oauth_nonce")
+    timestamp_raw = request.query_params.get("oauth_timestamp")
+    signature_method = (request.query_params.get("oauth_signature_method") or "HMAC-SHA256").upper()
+
+    if not signature or not nonce or not timestamp_raw:
+        raise AuthorizationError(
+            "Woo-style signed requests must include oauth_nonce, oauth_timestamp, and oauth_signature.",
+            {"api_key": api_key},
+        )
+
+    if signature_method not in WOO_SIGNATURE_HASHES:
+        raise AuthorizationError(
+            "Unsupported OAuth signature method.",
+            {"signature_method": signature_method, "accepted": sorted(WOO_SIGNATURE_HASHES)},
+        )
+
+    try:
+        timestamp = int(timestamp_raw)
+    except (TypeError, ValueError) as exc:
+        raise AuthorizationError("Invalid OAuth timestamp.", {"oauth_timestamp": timestamp_raw}) from exc
+
+    now = int(time.time())
+    if abs(now - timestamp) > WOO_AUTH_WINDOW_SECONDS:
+        raise AuthorizationError(
+            "OAuth timestamp is outside the accepted window.",
+            {"oauth_timestamp": timestamp, "server_timestamp": now},
+        )
+
+    if not nonce_store.register(api_key, nonce, timestamp):
+        raise AuthorizationError(
+            "OAuth nonce has already been used.",
+            {"oauth_nonce": nonce, "api_key": api_key},
+        )
+
+    provided_signature = signature.replace(" ", "+")
+    expected_signature = build_woo_signature(
+        request=request,
+        api_secret=api_secret,
+        signature_method=signature_method,
+    )
+    if not secrets.compare_digest(expected_signature, provided_signature):
+        raise AuthorizationError(
+            "Woo-style OAuth signature verification failed.",
+            {
+                "api_key": api_key,
+                "signature_method": signature_method,
+            },
+        )
+
+
+def build_woo_signature(
+    *,
+    request: Request,
+    api_secret: str,
+    signature_method: str,
+) -> str:
+    digestmod = WOO_SIGNATURE_HASHES[signature_method]
+    base_url = str(request.url).split("?", 1)[0]
+    params = []
+
+    for key, value in request.query_params.multi_items():
+        if key == "oauth_signature":
+            continue
+        params.append((key, value))
+
+    normalized_pairs = sorted(
+        (_oauth_quote(key), _oauth_quote(value))
+        for key, value in params
+    )
+    parameter_string = "&".join(f"{key}={value}" for key, value in normalized_pairs)
+    base_string = "&".join(
+        [
+            request.method.upper(),
+            _oauth_quote(base_url),
+            _oauth_quote(parameter_string),
+        ]
+    )
+    signing_key = f"{_oauth_quote(api_secret)}&"
+    digest = hmac.new(signing_key.encode("utf-8"), base_string.encode("utf-8"), digestmod).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _oauth_quote(value: Any) -> str:
+    return quote(str(value), safe="~-._")
 
 
 def verify_shopify_query_hmac(query_string: str, client_secret: str) -> bool:

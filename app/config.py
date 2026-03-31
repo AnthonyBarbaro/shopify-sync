@@ -17,6 +17,7 @@ class Settings:
     shopify_client_secret: str
     app_base_url: str
     app_session_secret: str
+    credential_encryption_secret: str
     app_scopes: str
     database_path: str
     shopify_api_version: str = "2026-01"
@@ -54,6 +55,9 @@ def get_settings() -> Settings:
         shopify_client_secret=client_secret,
         app_base_url=_require_env("APP_BASE_URL"),
         app_session_secret=(os.getenv("APP_SESSION_SECRET") or "").strip() or client_secret,
+        credential_encryption_secret=(
+            os.getenv("POS_SECRET_ENCRYPTION_SECRET") or os.getenv("APP_SESSION_SECRET") or client_secret
+        ).strip(),
         app_scopes=(
             os.getenv("APP_SCOPES")
             or "read_products,write_products,read_inventory,write_inventory,read_locations"
