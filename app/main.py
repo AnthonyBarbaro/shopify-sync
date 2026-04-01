@@ -103,7 +103,15 @@ REQUEST_LOG_MASK_KEYS = {
 
 @app.middleware("http")
 async def capture_incoming_request_logs(request: Request, call_next: Callable) -> Response:
-    if not _should_log_incoming_request(request.url.path):
+    original_path = request.scope.get("path") or request.url.path
+    normalized_path = _normalize_pos_request_path(original_path)
+    if normalized_path != original_path:
+        request.scope["path"] = normalized_path
+        request.scope["raw_path"] = normalized_path.encode("utf-8")
+        request.state.original_path = original_path
+
+    effective_path = request.scope.get("path") or request.url.path
+    if not _should_log_incoming_request(original_path) and not _should_log_incoming_request(effective_path):
         return await call_next(request)
 
     started_at = time.perf_counter()
@@ -136,7 +144,7 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
         shop_domain=shop_domain,
         api_key_preview=_mask_api_key(api_key),
         method=request.method,
-        path=request.url.path,
+        path=getattr(request.state, "original_path", effective_path),
         query_string=_mask_query_string(request.url.query),
         status_code=response.status_code,
         route_path=route_path,
@@ -630,6 +638,29 @@ def _coerce_multidict(items: Any) -> dict[str, Any]:
 
 def _should_log_incoming_request(path: str) -> bool:
     return path.startswith("/sync/") or path.startswith("/wc-api/") or path.startswith("/wp-json/wc/")
+
+
+def _normalize_pos_request_path(path: str) -> str:
+    stripped = (path or "").strip()
+    if not stripped:
+        return path
+
+    if not (
+        stripped.startswith("/sync/")
+        or stripped.startswith("/wc-api/")
+        or stripped.startswith("/wp-json/wc/")
+    ):
+        return path
+
+    segments = [segment.strip() for segment in stripped.split("/") if segment.strip()]
+    if not segments:
+        return "/"
+    return "/" + "/".join(segments)
+
+
+def _canonicalize_woo_rest_path(rest: str) -> str:
+    segments = [segment.strip() for segment in (rest or "").split("/") if segment.strip()]
+    return "/".join(segments)
 
 
 def _mask_api_key(value: str | None) -> str | None:
@@ -1602,6 +1633,45 @@ async def woo_products_batch(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> BulkSyncResponse | JSONResponse:
     return await _handle_external_bulk_sync(request, shop)
+
+
+@app.api_route(
+    "/wc-api/{rest:path}",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/{rest:path}",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_compat_fallback(
+    request: Request,
+    rest: str,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> BulkSyncResponse | SyncResult | JSONResponse:
+    normalized_rest = _canonicalize_woo_rest_path(rest)
+    if normalized_rest == "v3/products":
+        return await _handle_external_single_sync(request, shop)
+    if normalized_rest == "v3/products/batch":
+        return await _handle_external_bulk_sync(request, shop)
+    raise SyncProcessingError(
+        "Woo-compatible path not found.",
+        {
+            "path": request.url.path,
+            "normalized_path": normalized_rest,
+            "supported_paths": [
+                "/wc-api/v3/products",
+                "/wc-api/v3/products/batch",
+                "/wp-json/wc/v3/products",
+                "/wp-json/wc/v3/products/batch",
+            ],
+        },
+        status_code=404,
+        code="woo_path_not_found",
+    )
 
 
 @app.post("/webhooks/app-uninstalled")
