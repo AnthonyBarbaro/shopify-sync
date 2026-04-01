@@ -64,6 +64,23 @@ class FeedEventRow:
     received_at: str
 
 
+@dataclass(frozen=True)
+class RequestLogRow:
+    id: int
+    shop_domain: Optional[str]
+    api_key_preview: Optional[str]
+    method: str
+    path: str
+    query_string: Optional[str]
+    status_code: int
+    route_path: Optional[str]
+    request_body: Optional[str]
+    user_agent: Optional[str]
+    source_ip: Optional[str]
+    duration_ms: int
+    created_at: str
+
+
 class DatabaseStore:
     def __init__(self, database_path: str, encryption_secret: str) -> None:
         self.database_path = Path(database_path)
@@ -135,12 +152,35 @@ class DatabaseStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT,
+                    api_key_preview TEXT,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    query_string TEXT,
+                    status_code INTEGER NOT NULL,
+                    route_path TEXT,
+                    request_body TEXT,
+                    user_agent TEXT,
+                    source_ip TEXT,
+                    duration_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
             self._ensure_column(connection, "pos_credentials", "secret_ciphertext", "TEXT")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_credentials_api_key ON pos_credentials(api_key)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_feed_events_shop_created ON feed_events(shop_domain, received_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_request_logs_shop_created ON request_logs(shop_domain, created_at DESC)"
             )
             connection.commit()
 
@@ -486,6 +526,57 @@ class DatabaseStore:
             )
             connection.commit()
 
+    def record_request_log(
+        self,
+        *,
+        shop_domain: Optional[str],
+        api_key_preview: Optional[str],
+        method: str,
+        path: str,
+        query_string: Optional[str],
+        status_code: int,
+        route_path: Optional[str],
+        request_body: Optional[str],
+        user_agent: Optional[str],
+        source_ip: Optional[str],
+        duration_ms: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO request_logs (
+                    shop_domain,
+                    api_key_preview,
+                    method,
+                    path,
+                    query_string,
+                    status_code,
+                    route_path,
+                    request_body,
+                    user_agent,
+                    source_ip,
+                    duration_ms,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    shop_domain,
+                    api_key_preview,
+                    method.upper(),
+                    path,
+                    query_string,
+                    int(status_code),
+                    route_path,
+                    request_body,
+                    user_agent,
+                    source_ip,
+                    int(duration_ms),
+                    utc_now_iso(),
+                ),
+            )
+            connection.commit()
+
     def list_feed_events(self, shop_domain: str, *, limit: int = 50) -> list[FeedEventRow]:
         safe_limit = max(1, min(limit, 500))
         with self._connect() as connection:
@@ -507,6 +598,50 @@ class DatabaseStore:
                 "SELECT COUNT(*) AS count FROM feed_events WHERE shop_domain = ?",
                 (shop_domain,),
             ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def list_request_logs(
+        self,
+        *,
+        shop_domain: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[RequestLogRow]:
+        safe_limit = max(1, min(limit, 1000))
+        with self._connect() as connection:
+            if shop_domain:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM request_logs
+                    WHERE shop_domain = ? OR shop_domain IS NULL
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (shop_domain, safe_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM request_logs
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+        return [self._row_to_request_log(row) for row in rows]
+
+    def request_log_count(self, *, shop_domain: Optional[str] = None) -> int:
+        with self._connect() as connection:
+            if shop_domain:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM request_logs WHERE shop_domain = ? OR shop_domain IS NULL",
+                    (shop_domain,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM request_logs"
+                ).fetchone()
         return int(row["count"]) if row else 0
 
     def mark_shop_uninstalled(self, shop_domain: str) -> None:
@@ -561,6 +696,24 @@ class DatabaseStore:
             request_payload=row["request_payload"],
             normalized_payload=row["normalized_payload"],
             received_at=row["received_at"],
+        )
+
+    @staticmethod
+    def _row_to_request_log(row: sqlite3.Row) -> RequestLogRow:
+        return RequestLogRow(
+            id=int(row["id"]),
+            shop_domain=row["shop_domain"],
+            api_key_preview=row["api_key_preview"],
+            method=row["method"],
+            path=row["path"],
+            query_string=row["query_string"],
+            status_code=int(row["status_code"]),
+            route_path=row["route_path"],
+            request_body=row["request_body"],
+            user_agent=row["user_agent"],
+            source_ip=row["source_ip"],
+            duration_ms=int(row["duration_ms"]),
+            created_at=row["created_at"],
         )
 
 

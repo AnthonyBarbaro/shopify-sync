@@ -3,11 +3,12 @@ import csv
 import html
 import json
 import secrets
+import time
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -41,6 +42,7 @@ from app.models import (
     FeedEventsResponse,
     HealthResponse,
     ProductSyncRequest,
+    RequestLogsResponse,
     ShopifyConnectionResponse,
     SyncActivityResponse,
     SyncResult,
@@ -92,6 +94,58 @@ POS_AUTH_QUERY_KEYS = {
     "oauth_nonce",
     "oauth_version",
 }
+REQUEST_LOG_MASK_KEYS = {
+    "consumer_secret",
+    "oauth_signature",
+    "x-api-secret",
+}
+
+
+@app.middleware("http")
+async def capture_incoming_request_logs(request: Request, call_next: Callable) -> Response:
+    if not _should_log_incoming_request(request.url.path):
+        return await call_next(request)
+
+    started_at = time.perf_counter()
+    request_body = await request.body()
+
+    async def receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": request_body,
+            "more_body": False,
+        }
+
+    request = Request(request.scope, receive)
+    response = await call_next(request)
+
+    api_key = _extract_api_key_for_logging(request)
+    shop_domain = _resolve_request_log_shop(api_key)
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    body_preview: str | None = None
+    if request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
+        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+            body_preview = _truncate_text(request_body.decode("utf-8", errors="replace"))
+        else:
+            body_preview = _truncate_text(f"[{content_type or 'binary'} payload {len(request_body)} bytes]")
+
+    db.record_request_log(
+        shop_domain=shop_domain,
+        api_key_preview=_mask_api_key(api_key),
+        method=request.method,
+        path=request.url.path,
+        query_string=_mask_query_string(request.url.query),
+        status_code=response.status_code,
+        route_path=route_path,
+        request_body=body_preview,
+        user_agent=request.headers.get("user-agent"),
+        source_ip=request.client.host if request.client else None,
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+    )
+    return response
 
 
 def render_ui_shell() -> HTMLResponse:
@@ -572,6 +626,62 @@ def _coerce_multidict(items: Any) -> dict[str, Any]:
             continue
         payload[key] = value
     return payload
+
+
+def _should_log_incoming_request(path: str) -> bool:
+    return path.startswith("/sync/") or path.startswith("/wc-api/") or path.startswith("/wp-json/wc/")
+
+
+def _mask_api_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    if len(normalized) <= 10:
+        return normalized
+    return f"{normalized[:8]}...{normalized[-4:]}"
+
+
+def _mask_query_string(query_string: str) -> str | None:
+    if not query_string:
+        return None
+    masked_pairs = []
+    for key, value in parse_qsl(query_string, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in REQUEST_LOG_MASK_KEYS:
+            masked_pairs.append((key, "***"))
+        elif lowered in {"consumer_key", "oauth_consumer_key"}:
+            masked_pairs.append((key, _mask_api_key(value) or ""))
+        else:
+            masked_pairs.append((key, value))
+    return urlencode(masked_pairs, doseq=True)
+
+
+def _truncate_text(value: str | None, *, limit: int = 4000) -> str | None:
+    if not value:
+        return None
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}... [truncated]"
+
+
+def _extract_api_key_for_logging(request: Request) -> str | None:
+    api_key, _api_secret = extract_woo_query_credentials(request)
+    if api_key:
+        return api_key
+    x_api_key = request.headers.get("x-api-key")
+    if x_api_key:
+        return x_api_key
+    authorization = request.headers.get("authorization") or ""
+    if authorization.lower().startswith("basic "):
+        return "basic-auth"
+    return None
+
+
+def _resolve_request_log_shop(api_key: str | None) -> str | None:
+    if not api_key or api_key == "basic-auth":
+        return None
+    auth_record = db.get_pos_auth_record(api_key)
+    return auth_record.shop_domain if auth_record else None
 
 
 def _string_or_none(value: Any) -> str | None:
@@ -1108,6 +1218,84 @@ async def feed_csv(request: Request) -> StreamingResponse:
     output.seek(0)
     headers = {
         "Content-Disposition": f'attachment; filename="{shop.shop_domain}-feed.csv"'
+    }
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+
+
+@app.get("/api/request-logs", response_model=RequestLogsResponse)
+async def request_logs(request: Request, limit: int = 100) -> RequestLogsResponse:
+    shop, _session = _get_session_context(request)
+    safe_limit = max(1, min(limit, 500))
+    rows = db.list_request_logs(shop_domain=shop.shop_domain, limit=safe_limit)
+    return RequestLogsResponse(
+        shop=shop.shop_domain,
+        total=db.request_log_count(shop_domain=shop.shop_domain),
+        items=[
+            {
+                "id": row.id,
+                "shop_domain": row.shop_domain,
+                "api_key_preview": row.api_key_preview,
+                "method": row.method,
+                "path": row.path,
+                "query_string": row.query_string,
+                "status_code": row.status_code,
+                "route_path": row.route_path,
+                "request_body": row.request_body,
+                "user_agent": row.user_agent,
+                "source_ip": row.source_ip,
+                "duration_ms": row.duration_ms,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ],
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/request-logs.csv")
+async def request_logs_csv(request: Request) -> StreamingResponse:
+    shop, _session = _get_session_context(request)
+    rows = db.list_request_logs(shop_domain=shop.shop_domain, limit=2000)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "id",
+            "shop_domain",
+            "api_key_preview",
+            "method",
+            "path",
+            "query_string",
+            "status_code",
+            "route_path",
+            "request_body",
+            "user_agent",
+            "source_ip",
+            "duration_ms",
+            "created_at",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.id,
+                row.shop_domain or "",
+                row.api_key_preview or "",
+                row.method,
+                row.path,
+                row.query_string or "",
+                row.status_code,
+                row.route_path or "",
+                row.request_body or "",
+                row.user_agent or "",
+                row.source_ip or "",
+                row.duration_ms,
+                row.created_at,
+            ]
+        )
+    output.seek(0)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{shop.shop_domain}-request-logs.csv"'
     }
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
 

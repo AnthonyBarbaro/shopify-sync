@@ -12,6 +12,7 @@ const state = {
   activity: { total: 0, items: [] },
   catalog: { total: 0, items: [] },
   feed: { total: 0, items: [] },
+  requestLogs: { total: 0, items: [] },
   shopifyHealth: null,
   singleResult: null,
   bulkResult: null,
@@ -107,12 +108,14 @@ async function boot() {
     loadActivity(),
     loadCatalog(),
     loadFeed(),
+    loadRequestLogs(),
   ])
   render()
 
   window.setInterval(async () => {
     try {
       await Promise.all([loadHealth(), loadActivity(), loadFeed()])
+      await loadRequestLogs()
       render()
     } catch (error) {
       console.error(error)
@@ -142,6 +145,10 @@ async function loadCatalog() {
 
 async function loadFeed() {
   state.feed = await fetchJson("/api/feed?limit=12")
+}
+
+async function loadRequestLogs() {
+  state.requestLogs = await fetchJson("/api/request-logs?limit=15")
 }
 
 function navigate(path) {
@@ -350,12 +357,12 @@ function renderHome() {
       <article class="card">
         <div class="section-head">
           <div>
-            <h3>POS feed</h3>
-            <p>Recent requests that came through the POS-facing API.</p>
+            <h3>Incoming requests</h3>
+            <p>Every hit to the POS-facing API, including bad paths and 404s.</p>
           </div>
-          <a class="button-ghost" href="/api/feed.csv" target="_blank" rel="noreferrer">Download feed CSV</a>
+          <a class="button-ghost" href="/api/request-logs.csv" target="_blank" rel="noreferrer">Download request CSV</a>
         </div>
-        ${renderFeedList()}
+        ${renderRequestLogList()}
       </article>
 
       <article class="card">
@@ -502,6 +509,19 @@ function renderCatalog() {
           <a class="button-secondary" href="/api/feed.csv" target="_blank" rel="noreferrer">Download feed CSV</a>
         </div>
         ${renderFeedTable()}
+      </article>
+    </section>
+
+    <section class="grid one">
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <h3>Request log</h3>
+            <p>Use this when the POS says 404 or sends a malformed path.</p>
+          </div>
+          <a class="button-ghost" href="/api/request-logs.csv" target="_blank" rel="noreferrer">Download request CSV</a>
+        </div>
+        ${renderRequestLogTable()}
       </article>
     </section>
   `
@@ -723,6 +743,28 @@ function renderFeedList() {
   `
 }
 
+function renderRequestLogList() {
+  const items = state.requestLogs?.items || []
+  if (!items.length) {
+    return `<p class="empty-state">No incoming requests logged yet.</p>`
+  }
+
+  return `
+    <ul class="activity-list">
+      ${items.map((item) => `
+        <li class="activity-item">
+          <div class="activity-title">
+            <span class="status-dot ${item.status_code >= 400 ? "error" : "success"}"></span>
+            <strong>${escapeHtml(`${item.method} ${item.path}`)}</strong>
+            <span class="meta-value muted">${escapeHtml(formatDate(item.created_at))}</span>
+          </div>
+          <span class="meta-value muted">${escapeHtml(`status ${item.status_code}${item.query_string ? ` • ${item.query_string}` : ""}`)}</span>
+        </li>
+      `).join("")}
+    </ul>
+  `
+}
+
 function renderCatalogTable() {
   const items = state.catalog?.items || []
   if (!items.length) {
@@ -781,6 +823,40 @@ function renderFeedTable() {
               <td>${escapeHtml(item.source)}</td>
               <td>${escapeHtml(item.sku || "—")}</td>
               <td>${escapeHtml(item.message)}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `
+}
+
+function renderRequestLogTable() {
+  const items = state.requestLogs?.items || []
+  if (!items.length) {
+    return `<p class="empty-state">No request rows available yet.</p>`
+  }
+
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Status</th>
+            <th>Method</th>
+            <th>Path</th>
+            <th>Query</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.map((item) => `
+            <tr>
+              <td>${escapeHtml(formatDate(item.created_at))}</td>
+              <td>${escapeHtml(String(item.status_code))}</td>
+              <td>${escapeHtml(item.method)}</td>
+              <td>${escapeHtml(item.path)}</td>
+              <td>${escapeHtml(item.query_string || "—")}</td>
             </tr>
           `).join("")}
         </tbody>

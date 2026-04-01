@@ -190,6 +190,29 @@ class FeedEventsResponse(BaseModel):
     timestamp: str
 
 
+class RequestLogRecord(BaseModel):
+    id: int
+    shop_domain: Optional[str] = None
+    api_key_preview: Optional[str] = None
+    method: str
+    path: str
+    query_string: Optional[str] = None
+    status_code: int
+    route_path: Optional[str] = None
+    request_body: Optional[str] = None
+    user_agent: Optional[str] = None
+    source_ip: Optional[str] = None
+    duration_ms: int
+    created_at: str
+
+
+class RequestLogsResponse(BaseModel):
+    shop: str
+    total: int
+    items: List[RequestLogRecord]
+    timestamp: str
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
