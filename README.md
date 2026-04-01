@@ -133,7 +133,7 @@ GET /api/request-logs.csv
 
 Use the shareable connector guide here:
 
-[POS_CONNECTOR_GUIDE.md](/home/anthony/projects/InventorySync-Shopify/POS_CONNECTOR_GUIDE.md)
+[POS_CONNECTOR_GUIDE.md](https://github.com/AnthonyBarbaro/shopify-sync/blob/main/POS_CONNECTOR_GUIDE.md)
 
 Recommended POS path:
 
