@@ -1361,7 +1361,19 @@ async def sync_bulk(
     include_in_schema=False,
 )
 @app.api_route(
+    "/wc-api/v3/products/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
     "/wp-json/wc/v3/products",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products/",
     methods=["GET", "POST"],
     response_model=None,
     include_in_schema=False,
@@ -1380,7 +1392,19 @@ async def woo_products(
     include_in_schema=False,
 )
 @app.api_route(
+    "/wc-api/v3/products/batch/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
     "/wp-json/wc/v3/products/batch",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products/batch/",
     methods=["GET", "POST"],
     response_model=None,
     include_in_schema=False,
