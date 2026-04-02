@@ -101,6 +101,22 @@ REQUEST_LOG_MASK_KEYS = {
 }
 
 
+def _asset_version() -> str:
+    asset_paths = [
+        INDEX_FILE,
+        STATIC_DIR / "app.js",
+        STATIC_DIR / "styles.css",
+    ]
+    try:
+        return str(int(max(path.stat().st_mtime for path in asset_paths)))
+    except OSError:
+        return str(int(time.time()))
+
+
+def _asset_url(name: str) -> str:
+    return f"/assets/{name}?v={_asset_version()}"
+
+
 @app.middleware("http")
 async def capture_incoming_request_logs(request: Request, call_next: Callable) -> Response:
     original_path = request.scope.get("path") or request.url.path
@@ -159,6 +175,8 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
 def render_ui_shell() -> HTMLResponse:
     html_content = INDEX_FILE.read_text(encoding="utf-8")
     html_content = html_content.replace("__SHOPIFY_CLIENT_ID__", settings.shopify_client_id)
+    html_content = html_content.replace("/assets/styles.css", _asset_url("styles.css"))
+    html_content = html_content.replace("/assets/app.js", _asset_url("app.js"))
     return HTMLResponse(content=html_content)
 
 
@@ -188,7 +206,7 @@ def render_install_page(
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Install Inventory Sync</title>
-        <link rel="stylesheet" href="/assets/styles.css" />
+        <link rel="stylesheet" href="{_asset_url('styles.css')}" />
       </head>
       <body>
         <div class="shell" style="min-height:100vh;display:grid;place-items:center;">
@@ -234,7 +252,7 @@ def render_top_level_redirect_page(target_url: str) -> HTMLResponse:
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Opening Shopify</title>
         <meta name="shopify-api-key" content="{html.escape(settings.shopify_client_id)}" />
-        <link rel="stylesheet" href="/assets/styles.css" />
+        <link rel="stylesheet" href="{_asset_url('styles.css')}" />
       </head>
       <body>
         <div class="shell" style="min-height:100vh;display:grid;place-items:center;">
