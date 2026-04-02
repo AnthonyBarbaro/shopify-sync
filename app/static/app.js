@@ -1,5 +1,5 @@
 const routeTitles = {
-  "/app": "Home",
+  "/app": "Overview",
   "/app/product-sync": "Product Sync",
   "/app/catalog": "Catalog",
   "/app/settings": "Settings",
@@ -279,28 +279,40 @@ function render() {
 
 function renderHero(route) {
   const embedded = isEmbeddedContext()
+  const latestSync = getLatestActivity()
+  const latestRequest = getLatestRequest()
+  const requestIssues = getFailedRequestCount()
+  const storeName = state.config?.shop_name || state.config?.shop || "Loading store"
+
   return `
     <section class="hero">
-      <div class="hero-row">
+      <div class="hero-copy">
         <div>
+          <p class="eyebrow">Shopify Inventory Sync</p>
           <h2>${routeTitles[route]}</h2>
           <p>${routeDescription(route)}</p>
         </div>
+        <div class="pill-row">
+          <span class="pill ${state.health?.status === "ok" ? "success" : "danger"}">API ${state.health?.status === "ok" ? "ready" : "error"}</span>
+          <span class="pill">${escapeHtml(storeName)}</span>
+          <span class="pill ${embedded ? "success" : "warning"}">${embedded ? "Inside Shopify" : "Browser preview"}</span>
+        </div>
       </div>
-      <div class="pill-row">
-        <span class="pill ${state.health?.status === "ok" ? "success" : "danger"}">API ${state.health?.status === "ok" ? "ready" : "error"}</span>
-        <span class="pill">${escapeHtml(state.config?.shop_name || state.config?.shop || "Loading store")}</span>
-        <span class="pill ${embedded ? "success" : "warning"}">${embedded ? "Inside Shopify" : "Browser preview"}</span>
+      <div class="hero-aside">
+        ${renderMetricTile("Store", storeName, state.config?.shop || "Shop context")}
+        ${renderMetricTile("Catalog rows", state.catalog?.total || 0, "Current Shopify snapshot")}
+        ${renderMetricTile("Requests logged", state.requestLogs?.total || 0, requestIssues ? `${requestIssues} with issues` : "No recent 4xx or 5xx", requestIssues ? "warning" : "success")}
+        ${renderMetricTile("Last sync", latestSync ? formatShortDate(latestSync.timestamp) : "No sync yet", latestSync ? (latestSync.details?.product_title || latestSync.sku || latestSync.message) : "Waiting for activity", latestSync && !latestSync.success ? "warning" : latestRequest && latestRequest.status_code >= 400 ? "danger" : "neutral")}
       </div>
     </section>
   `
 }
 
 function routeDescription(route) {
-  if (route === "/app/product-sync") return "Create draft products from POS data or update existing Shopify products by SKU."
-  if (route === "/app/catalog") return "Preview what the POS-compatible API can read, and download CSV exports."
-  if (route === "/app/settings") return "Copy the Woo-compatible URL, path, key, and secret into your POS."
-  return "A simple control panel for POS-to-Shopify product sync."
+  if (route === "/app/product-sync") return "Create draft products from POS payloads or update matching Shopify SKUs with price, quantity, barcode, and image data."
+  if (route === "/app/catalog") return "Inspect the Shopify snapshot your POS can read, compare inbound feed rows, and export clean CSVs."
+  if (route === "/app/settings") return "Keep your connector values clean, stable, and easy for the POS team to copy without guesswork."
+  return "Monitor connector health, incoming traffic, and the Shopify catalog from one compact operations view."
 }
 
 function renderRoute(route) {
@@ -311,87 +323,128 @@ function renderRoute(route) {
 }
 
 function renderHome() {
+  const latestRequest = getLatestRequest()
+  const latestSync = getLatestActivity()
+  const failedRequests = getFailedRequestCount()
+
   return `
-    <section class="grid three">
-      <article class="card">
-        <p class="meta-label">Store</p>
-        <div class="metric-value">${escapeHtml(state.config?.shop_name || state.config?.shop || "Loading")}</div>
-      </article>
-      <article class="card">
-        <p class="meta-label">Catalog Rows</p>
-        <div class="metric-value">${state.catalog?.total || 0}</div>
-      </article>
-      <article class="card">
-        <p class="meta-label">Inbound Feed</p>
-        <div class="metric-value">${state.feed?.total || 0}</div>
-      </article>
-    </section>
-
-    <section class="grid two">
-      <article class="card">
-        <div class="section-head">
-          <div>
-            <h3>Start here</h3>
-            <p>The app is set up to look like a Woo-style products API to your POS.</p>
+    <section class="dashboard-grid">
+      <div class="stack">
+        <article class="card card-accent">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Workflow</div>
+              <h3>Run the connector like a monitored service</h3>
+              <p>Keep the POS pointed at one clean Woo-style endpoint, watch request traffic, and verify what is landing in Shopify.</p>
+            </div>
           </div>
-        </div>
-        <div class="button-row">
-          <a class="button" href="/app/product-sync" data-route>Open product sync</a>
-          <a class="button-secondary" href="/app/catalog" data-route>Open catalog</a>
-          <a class="button-ghost" href="/app/settings" data-route>View settings</a>
-        </div>
-      </article>
-
-      <article class="card">
-        <div class="section-head">
-          <div>
-            <h3>Recent syncs</h3>
-            <p>Your latest sync activity shows up here.</p>
+          <div class="action-grid">
+            <a class="button" href="/app/product-sync" data-route>Open product sync</a>
+            <a class="button-secondary" href="/app/catalog" data-route>Review catalog</a>
+            <a class="button-ghost" href="/app/settings" data-route>Open settings</a>
           </div>
-        </div>
-        ${renderActivity()}
-      </article>
-    </section>
+        </article>
 
-    <section class="grid two">
-      <article class="card">
-        <div class="section-head">
-          <div>
-            <h3>Incoming requests</h3>
-            <p>Every hit to the POS-facing API, including bad paths and 404s.</p>
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Activity</div>
+              <h3>Recent syncs</h3>
+              <p>Use this to confirm the last product updates that made it through to Shopify.</p>
+            </div>
           </div>
-          <a class="button-ghost" href="/api/request-logs.csv" target="_blank" rel="noreferrer">Download request CSV</a>
-        </div>
-        ${renderRequestLogList()}
-      </article>
+          ${renderActivity()}
+        </article>
 
-      <article class="card">
-        <div class="section-head">
-          <div>
-            <h3>Connection</h3>
-            <p>These are the values you’ll copy into the POS connector.</p>
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Traffic</div>
+              <h3>Incoming requests</h3>
+              <p>Every hit to the POS-facing API, including malformed paths and 404s, shows up here.</p>
+            </div>
+            <a class="button-ghost" href="/api/request-logs.csv" target="_blank" rel="noreferrer">Download request CSV</a>
           </div>
-        </div>
-        ${renderCopyRow("URL", state.connection?.base_url || "")}
-        ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
-        ${renderCopyRow("Key", state.connection?.api_key || "")}
-      </article>
+          ${renderRequestLogList()}
+        </article>
+      </div>
+
+      <aside class="stack">
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Connector</div>
+              <h3>POS connection summary</h3>
+              <p>The values your POS team needs most often are surfaced here without the full settings page.</p>
+            </div>
+            <a class="button-ghost" href="/app/settings" data-route>Full settings</a>
+          </div>
+          <div class="copy-stack">
+            ${renderCopyRow("URL", state.connection?.base_url || "")}
+            ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
+            ${renderCopyRow("Key", state.connection?.api_key || "")}
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Watchlist</div>
+              <h3>What needs attention</h3>
+              <p>A compact view of sync traffic, feed volume, and credential usage.</p>
+            </div>
+          </div>
+          <div class="setting-row">
+            <strong>Last sync</strong>
+            <span>${escapeHtml(latestSync ? `${formatShortDate(latestSync.timestamp)} • ${latestSync.details?.product_title || latestSync.sku || latestSync.message}` : "No syncs yet")}</span>
+          </div>
+          <div class="setting-row">
+            <strong>Last request</strong>
+            <span>${escapeHtml(latestRequest ? `${formatShortDate(latestRequest.created_at)} • ${latestRequest.method} ${latestRequest.path}` : "No request traffic yet")}</span>
+          </div>
+          <div class="setting-row">
+            <strong>Feed rows</strong>
+            <span>${escapeHtml(`${state.feed?.total || 0} captured payloads`)}${failedRequests ? ` • ${failedRequests} issues flagged` : ""}</span>
+          </div>
+          <div class="setting-row">
+            <strong>Credential use</strong>
+            <span>${escapeHtml(state.connection?.last_used_at ? formatDate(state.connection.last_used_at) : "Connector has not been used yet")}</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Exports</div>
+              <h3>Download the working data</h3>
+              <p>Share the exact catalog, inbound feed, or request trace with your POS team.</p>
+            </div>
+          </div>
+          <div class="action-grid">
+            <a class="button-ghost" href="/api/catalog.csv" target="_blank" rel="noreferrer">Catalog CSV</a>
+            <a class="button-ghost" href="/api/feed.csv" target="_blank" rel="noreferrer">Feed CSV</a>
+            <a class="button-ghost" href="/api/request-logs.csv" target="_blank" rel="noreferrer">Request CSV</a>
+          </div>
+        </article>
+      </aside>
     </section>
   `
 }
 
 function renderProductSync() {
   return `
-    <section class="grid two">
+    <section class="sync-grid">
       <form class="form-card" data-single-form>
         <div class="section-head">
           <div>
-            <h3>Single product</h3>
-            <p>New products are created as drafts. Existing SKUs update in place.</p>
+            <div class="section-kicker">Single item</div>
+            <h3>Create or update one product</h3>
+            <p>Missing SKUs create draft products. Existing Shopify matches update in place by SKU.</p>
           </div>
+          <span class="pill warning">Draft on first upload</span>
         </div>
-        <div class="form-grid">
-          <div class="field">
+        <div class="form-grid split">
+          <div class="field field-full">
             <label for="title">Product name</label>
             <input id="title" name="title" placeholder="Classic Tee" />
           </div>
@@ -411,7 +464,7 @@ function renderProductSync() {
             <label for="quantity">Quantity</label>
             <input id="quantity" name="quantity" type="number" step="1" min="0" placeholder="10" />
           </div>
-          <div class="field">
+          <div class="field field-full">
             <label for="image_url">Image URL</label>
             <input id="image_url" name="image_url" placeholder="https://example.com/products/classic-tee.jpg" />
           </div>
@@ -435,6 +488,16 @@ function renderProductSync() {
       <div class="stack">
         ${renderSingleResult()}
         ${renderMiniConnectionCard(state.connection?.product_sync_path || "", state.connection?.bulk_sync_path || "")}
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Recent</div>
+              <h3>Latest sync activity</h3>
+              <p>Confirm recent product pushes without leaving the sync screen.</p>
+            </div>
+          </div>
+          ${renderActivity()}
+        </article>
       </div>
     </section>
 
@@ -442,8 +505,9 @@ function renderProductSync() {
       <form class="form-card" data-bulk-form>
         <div class="section-head">
           <div>
-            <h3>Bulk import JSON</h3>
-            <p>Paste an array from the POS. Woo-style fields work here too.</p>
+            <div class="section-kicker">Bulk import</div>
+            <h3>Paste Woo-style JSON</h3>
+            <p>Send an array from the POS and the backend will upsert catalog data in sequence.</p>
           </div>
         </div>
         <div class="form-grid">
@@ -464,21 +528,26 @@ function renderProductSync() {
         <article class="card">
           <div class="section-head">
             <div>
-              <h3>What happens</h3>
-              <p>The backend looks up Shopify by SKU, updates matches, and creates missing products as drafts.</p>
+              <div class="section-kicker">Field mapping</div>
+              <h3>What the sync expects</h3>
+              <p>These are the values that matter most when the POS posts product data into Shopify.</p>
             </div>
           </div>
           <div class="setting-row">
-            <strong>Images</strong>
-            <span>Public image URLs are attached during sync.</span>
+            <strong>Name</strong>
+            <span><code>name</code> or <code>title</code> becomes the Shopify product title.</span>
+          </div>
+          <div class="setting-row">
+            <strong>Pricing</strong>
+            <span><code>regular_price</code> or <code>price</code> updates the matching variant.</span>
           </div>
           <div class="setting-row">
             <strong>Inventory</strong>
-            <span>Quantity is set after the product or variant is ready.</span>
+            <span><code>stock_quantity</code> or <code>quantity</code> sets on-hand inventory after sync.</span>
           </div>
           <div class="setting-row">
-            <strong>Feed logging</strong>
-            <span>Each external sync is saved for CSV export.</span>
+            <strong>Images</strong>
+            <span><code>images[].src</code> or <code>image_url</code> needs a public URL.</span>
           </div>
         </article>
       </div>
@@ -488,12 +557,19 @@ function renderProductSync() {
 
 function renderCatalog() {
   return `
+    <section class="metric-strip">
+      ${renderMetricTile("Catalog rows", state.catalog?.total || 0, "Products available to the POS")}
+      ${renderMetricTile("Feed rows", state.feed?.total || 0, "Captured product payloads")}
+      ${renderMetricTile("Request issues", getFailedRequestCount(), getFailedRequestCount() ? "Malformed or failed requests need review" : "Request traffic looks healthy", getFailedRequestCount() ? "warning" : "success")}
+    </section>
+
     <section class="grid two">
       <article class="card">
         <div class="section-head">
           <div>
+            <div class="section-kicker">Snapshot</div>
             <h3>Catalog export</h3>
-            <p>This is the current Shopify product data your POS-compatible API can expose.</p>
+            <p>This is the current Shopify product data your Woo-compatible API can expose back to the POS.</p>
           </div>
           <a class="button" href="/api/catalog.csv" target="_blank" rel="noreferrer">Download catalog CSV</a>
         </div>
@@ -503,8 +579,9 @@ function renderCatalog() {
       <article class="card">
         <div class="section-head">
           <div>
-            <h3>Inbound feed log</h3>
-            <p>These rows show what came into the POS-facing API.</p>
+            <div class="section-kicker">Inbound</div>
+            <h3>Feed log</h3>
+            <p>These rows show which product payloads came into the POS-facing API.</p>
           </div>
           <a class="button-secondary" href="/api/feed.csv" target="_blank" rel="noreferrer">Download feed CSV</a>
         </div>
@@ -516,6 +593,7 @@ function renderCatalog() {
       <article class="card">
         <div class="section-head">
           <div>
+            <div class="section-kicker">Diagnostics</div>
             <h3>Request log</h3>
             <p>Use this when the POS says 404 or sends a malformed path.</p>
           </div>
@@ -535,8 +613,9 @@ function renderSettings() {
       <article class="card">
         <div class="section-head">
           <div>
+            <div class="section-kicker">Connector</div>
             <h3>POS connection</h3>
-            <p>Use the Woo-compatible path first. Your POS can call this as a products API.</p>
+            <p>Use the clean Woo-compatible path first. This server is tolerant of malformed path variants, but the documented path should stay clean.</p>
           </div>
           <div class="button-row">
             <button class="button-ghost" type="button" data-copy="${escapeAttribute(buildSimpleSettingsText())}">Copy all</button>
@@ -545,20 +624,23 @@ function renderSettings() {
             </button>
           </div>
         </div>
-        ${state.connection?.secret_is_temporary ? `<div class="pill success">Copy this secret now. It will be hidden after you reload the page.</div>` : `<div class="pill warning">For Woo-style signed requests, rotate old credentials once so the new secret is stored in the updated format.</div>`}
-        ${renderCopyRow("URL", state.connection?.base_url || "")}
-        ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
-        ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "")}
-        ${renderCopyRow("Key", state.connection?.api_key || "")}
-        ${renderCopyRow("Secret", visibleSecret)}
+        ${state.connection?.secret_is_temporary ? `<div class="notice success">Copy this secret now. It will be hidden after you reload the page.</div>` : `<div class="notice warning">Keys stay stable unless you rotate them or the runtime database is reset.</div>`}
+        <div class="copy-stack">
+          ${renderCopyRow("URL", state.connection?.base_url || "")}
+          ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
+          ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "")}
+          ${renderCopyRow("Key", state.connection?.api_key || "")}
+          ${renderCopyRow("Secret", visibleSecret)}
+        </div>
       </article>
 
       <div class="stack">
         <article class="card">
           <div class="section-head">
             <div>
-              <h3>Simple checks</h3>
-              <p>Make sure the store and connector are pointing at the same place.</p>
+              <div class="section-kicker">Checks</div>
+              <h3>Simple connection checks</h3>
+              <p>Make sure the installed Shopify store and the POS connector are pointed at the same environment.</p>
             </div>
             <button class="button" type="button" data-test-shopify ${state.isTestingShopify ? "disabled" : ""}>
               ${state.isTestingShopify ? "Testing..." : "Test Shopify"}
@@ -575,6 +657,27 @@ function renderSettings() {
           <div class="setting-row">
             <strong>Last Used</strong>
             <span>${escapeHtml(state.connection?.last_used_at ? formatDate(state.connection.last_used_at) : "Not used yet")}</span>
+          </div>
+        </article>
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Operational note</div>
+              <h3>Credential stability</h3>
+              <p>The POS key and secret should stay the same across deploys as long as the runtime database persists.</p>
+            </div>
+          </div>
+          <div class="setting-row">
+            <strong>Rotate only when needed</strong>
+            <span>Updating code should not change credentials. Manual rotation is the normal way to replace them.</span>
+          </div>
+          <div class="setting-row">
+            <strong>Production storage</strong>
+            <span>Use a persistent volume or database so keys survive redeploys and restarts.</span>
+          </div>
+          <div class="setting-row">
+            <strong>POS path</strong>
+            <span>Document <code>/wc-api/v3/products</code> as the clean path even if the server tolerates malformed variants.</span>
           </div>
         </article>
         ${renderShopifyResult()}
@@ -657,8 +760,9 @@ function renderMiniConnectionCard(path, batchPath) {
     <article class="card">
       <div class="section-head">
         <div>
-          <h3>Connection</h3>
-          <p>The app uses the same paths your POS will call.</p>
+          <div class="section-kicker">Connection</div>
+          <h3>Connector paths</h3>
+          <p>The app uses the same clean endpoints your POS team should be configured to call.</p>
         </div>
       </div>
       <div class="setting-row">
@@ -712,6 +816,7 @@ function renderActivity() {
           <div class="activity-title">
             <span class="status-dot ${item.success ? "success" : "error"}"></span>
             <strong>${escapeHtml(item.details?.product_title || item.sku)}</strong>
+            ${renderStatusBadge(item.success ? "Synced" : "Failed", item.success ? "success" : "danger")}
             <span class="meta-value muted">${escapeHtml(formatDate(item.timestamp))}</span>
           </div>
           <span class="meta-value muted">${escapeHtml(item.message)}</span>
@@ -756,9 +861,10 @@ function renderRequestLogList() {
           <div class="activity-title">
             <span class="status-dot ${item.status_code >= 400 ? "error" : "success"}"></span>
             <strong>${escapeHtml(`${item.method} ${item.path}`)}</strong>
+            ${renderStatusBadge(item.status_code, toneForRequestStatus(item.status_code))}
             <span class="meta-value muted">${escapeHtml(formatDate(item.created_at))}</span>
           </div>
-          <span class="meta-value muted">${escapeHtml(`status ${item.status_code}${item.query_string ? ` • ${item.query_string}` : ""}`)}</span>
+          <span class="meta-value muted">${escapeHtml(item.query_string ? truncateText(item.query_string, 120) : "No query string")}</span>
         </li>
       `).join("")}
     </ul>
@@ -786,9 +892,14 @@ function renderCatalogTable() {
         <tbody>
           ${items.map((item) => `
             <tr>
-              <td>${escapeHtml(item.title)}</td>
+              <td>
+                <div class="cell-stack">
+                  <span class="cell-main">${escapeHtml(item.title)}</span>
+                  <span class="cell-meta">${escapeHtml(item.sku || "No SKU")}</span>
+                </div>
+              </td>
               <td>${escapeHtml(item.sku || "—")}</td>
-              <td>${escapeHtml(item.status || "—")}</td>
+              <td>${renderStatusBadge(item.status || "—", toneForProductStatus(item.status))}</td>
               <td>${escapeHtml(item.price ?? "—")}</td>
               <td>${escapeHtml(item.quantity ?? "—")}</td>
             </tr>
@@ -820,9 +931,14 @@ function renderFeedTable() {
           ${items.map((item) => `
             <tr>
               <td>${escapeHtml(formatDate(item.received_at))}</td>
-              <td>${escapeHtml(item.source)}</td>
+              <td>
+                <div class="cell-stack">
+                  <span class="cell-main">${escapeHtml(item.source)}</span>
+                  <span class="cell-meta">${escapeHtml(item.endpoint)}</span>
+                </div>
+              </td>
               <td>${escapeHtml(item.sku || "—")}</td>
-              <td>${escapeHtml(item.message)}</td>
+              <td>${escapeHtml(truncateText(item.message, 110))}</td>
             </tr>
           `).join("")}
         </tbody>
@@ -853,10 +969,10 @@ function renderRequestLogTable() {
           ${items.map((item) => `
             <tr>
               <td>${escapeHtml(formatDate(item.created_at))}</td>
-              <td>${escapeHtml(String(item.status_code))}</td>
+              <td>${renderStatusBadge(item.status_code, toneForRequestStatus(item.status_code))}</td>
               <td>${escapeHtml(item.method)}</td>
               <td>${escapeHtml(item.path)}</td>
-              <td>${escapeHtml(item.query_string || "—")}</td>
+              <td>${escapeHtml(truncateText(item.query_string || "—", 140))}</td>
             </tr>
           `).join("")}
         </tbody>
@@ -868,13 +984,27 @@ function renderRequestLogTable() {
 function renderCopyRow(label, value) {
   return `
     <div class="copy-row">
-      <div>
+      <div class="copy-meta">
         <div class="meta-label">${escapeHtml(label)}</div>
         <code>${escapeHtml(value)}</code>
       </div>
       <button class="copy-button" type="button" data-copy="${escapeAttribute(value)}">Copy</button>
     </div>
   `
+}
+
+function renderMetricTile(label, value, note, tone = "neutral") {
+  return `
+    <article class="metric-tile ${tone}">
+      <div class="metric-label">${escapeHtml(String(label))}</div>
+      <div class="metric-main">${escapeHtml(String(value ?? "—"))}</div>
+      <div class="metric-note">${escapeHtml(String(note ?? ""))}</div>
+    </article>
+  `
+}
+
+function renderStatusBadge(value, tone = "neutral") {
+  return `<span class="status-badge ${tone}">${escapeHtml(String(value))}</span>`
 }
 
 function buildSimpleSettingsText() {
@@ -949,6 +1079,19 @@ function formatDate(value) {
   }
 }
 
+function formatShortDate(value) {
+  try {
+    return new Date(value).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    })
+  } catch (_error) {
+    return String(value)
+  }
+}
+
 function coerceNumber(value) {
   if (value === null || value === "") return null
   return Number(value)
@@ -970,6 +1113,38 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value)
+}
+
+function truncateText(value, limit = 96) {
+  const text = String(value ?? "").trim()
+  if (text.length <= limit) return text
+  return `${text.slice(0, limit - 1)}...`
+}
+
+function getLatestActivity() {
+  return state.activity?.items?.[0] || null
+}
+
+function getLatestRequest() {
+  return state.requestLogs?.items?.[0] || null
+}
+
+function getFailedRequestCount() {
+  return (state.requestLogs?.items || []).filter((item) => Number(item.status_code) >= 400).length
+}
+
+function toneForRequestStatus(statusCode) {
+  if (Number(statusCode) >= 500) return "danger"
+  if (Number(statusCode) >= 400) return "warning"
+  return "success"
+}
+
+function toneForProductStatus(status) {
+  const normalized = String(status || "").toLowerCase()
+  if (normalized === "active") return "success"
+  if (normalized === "draft") return "warning"
+  if (normalized === "archived") return "neutral"
+  return "neutral"
 }
 
 function showToast(message, tone = "info") {

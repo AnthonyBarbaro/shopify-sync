@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="shopify-api-key" content="__SHOPIFY_CLIENT_ID__" />
     <title>Inventory Sync</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
     <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
     <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
     <link rel="stylesheet" href="/assets/styles.css" />
@@ -12,7 +18,7 @@
   </head>
   <body>
     <s-app-nav>
-      <s-link href="/app" rel="home">Home</s-link>
+      <s-link href="/app" rel="home">Overview</s-link>
       <s-link href="/app/product-sync">Product Sync</s-link>
       <s-link href="/app/catalog">Catalog</s-link>
       <s-link href="/app/settings">Settings</s-link>
@@ -24,11 +30,11 @@
           <span class="brand-mark">IS</span>
           <div>
             <p class="eyebrow">Shopify Inventory Sync</p>
-            <h1>Simple control panel</h1>
+            <h1>Operations Console</h1>
           </div>
         </div>
         <nav class="tabs" aria-label="Navigation">
-          <a href="/app" data-route>Home</a>
+          <a href="/app" data-route>Overview</a>
           <a href="/app/product-sync" data-route>Product Sync</a>
           <a href="/app/catalog" data-route>Catalog</a>
           <a href="/app/settings" data-route>Settings</a>
