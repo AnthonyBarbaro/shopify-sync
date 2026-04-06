@@ -116,6 +116,9 @@ POS-facing API:
 
 ```text
 GET/POST /wc-api/v3/products
+GET/POST /wp-json/wc/v3/products
+GET/PUT /wc-api/v3/products/{id}
+GET/PUT /wp-json/wc/v3/products/{id}
 GET/POST /wc-api/v3/products/batch
 GET/POST /sync/product
 GET/POST /sync/bulk
@@ -142,6 +145,18 @@ Recommended POS path:
 ```
 
 The server is tolerant of malformed Woo-style path variants for compatibility, but new integrations should always use the clean path above.
+
+Strict WooCommerce-compatible path:
+
+```text
+/wp-json/wc/v3/products
+```
+
+Woo-style product updates by ID are also supported:
+
+```text
+PUT /wp-json/wc/v3/products/{id}
+```
 
 ## Notes
 

@@ -237,6 +237,72 @@ class ShopifyClient:
         nodes = payload["data"]["products"]["nodes"]
         return nodes[0] if nodes else None
 
+    def get_product_by_id(
+        self,
+        shop_domain: str,
+        access_token: str,
+        product_id: str | int,
+    ) -> Optional[Dict[str, Any]]:
+        query = """
+        query ProductById($id: ID!) {
+          node(id: $id) {
+            ... on Product {
+              id
+              title
+              handle
+              status
+              vendor
+              productType
+              updatedAt
+              media(first: 10) {
+                nodes {
+                  alt
+                  mediaContentType
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+              }
+              variants(first: 100) {
+                nodes {
+                  id
+                  sku
+                  barcode
+                  price
+                  inventoryItem {
+                    id
+                    inventoryLevels(first: 10) {
+                      nodes {
+                        location {
+                          id
+                          name
+                        }
+                        quantities(names: ["available"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"id": normalize_gid("Product", str(product_id))},
+            operation_name="ProductById",
+        )
+        node = payload["data"]["node"]
+        return node if node else None
+
     def get_primary_location_id(self, shop_domain: str, access_token: str) -> str:
         if self.settings.shopify_location_id:
             return normalize_gid("Location", self.settings.shopify_location_id)
@@ -996,6 +1062,21 @@ def normalize_gid(resource_name: str, value: Optional[str]) -> str:
     if normalized.startswith("gid://shopify/"):
         return normalized
     return f"gid://shopify/{resource_name}/{normalized}"
+
+
+def extract_numeric_shopify_id(value: Optional[str | int]) -> Optional[int]:
+    if value is None:
+        return None
+
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+
+    tail = normalized.rsplit("/", 1)[-1]
+    if tail.isdigit():
+        return int(tail)
+
+    return None
 
 
 def format_price(price: float) -> Decimal:

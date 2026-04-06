@@ -48,7 +48,7 @@ from app.models import (
     SyncResult,
     UiConfigResponse,
 )
-from app.shopify import ShopifyClient, is_auth_error
+from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error
 from app.state import SyncActivityStore
 from app.utils import (
     AppError,
@@ -571,43 +571,111 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
             code="invalid_product_payload",
         )
 
-    image_inputs = _normalize_image_inputs(raw_payload)
-    categories = _extract_named_values(raw_payload.get("categories"))
-    tags = _normalize_tags(raw_payload.get("tags"), categories)
-    product_type = _string_or_none(raw_payload.get("product_type")) or (categories[0] if categories else None)
-    quantity = _as_int(raw_payload.get("quantity"))
+    key_lookup = _build_external_key_lookup(raw_payload)
+    image_inputs = _normalize_image_inputs(raw_payload, key_lookup)
+    categories = _collect_external_named_values(
+        raw_payload,
+        key_lookup,
+        "categories",
+        "category",
+        "category1",
+        "category2",
+        "category3",
+        "category4",
+        "category5",
+        "category6",
+        "web categories",
+        "web category 1",
+        "web category 2",
+        "web category 3",
+        "web category 4",
+        "web category 5",
+        "web category 6",
+    )
+    department = _string_or_none(_get_external_value(raw_payload, key_lookup, "department"))
+    raw_tags = _get_external_value(raw_payload, key_lookup, "tags")
+    tags = _normalize_tags(raw_tags, categories)
+    for label, value in (
+        ("Style", _get_external_value(raw_payload, key_lookup, "style")),
+        ("Size", _get_external_value(raw_payload, key_lookup, "size")),
+        ("Color", _get_external_value(raw_payload, key_lookup, "color")),
+        ("Department", department),
+        ("Vendor Item", _get_external_value(raw_payload, key_lookup, "vendor item", "vendor_item")),
+        ("PField1", _get_external_value(raw_payload, key_lookup, "pfield1")),
+        ("PField2", _get_external_value(raw_payload, key_lookup, "pfield2")),
+        ("PField3", _get_external_value(raw_payload, key_lookup, "pfield3")),
+        ("PField4", _get_external_value(raw_payload, key_lookup, "pfield4")),
+        ("PField5", _get_external_value(raw_payload, key_lookup, "pfield5")),
+    ):
+        tag = _build_labeled_tag(label, value)
+        if tag and tag not in tags:
+            tags.append(tag)
+
+    product_type = _string_or_none(
+        _get_external_value(raw_payload, key_lookup, "product_type", "product type")
+    ) or department or (categories[0] if categories else None)
+    quantity = _as_int(_get_external_value(raw_payload, key_lookup, "quantity", "qty"))
     if quantity is None:
-        quantity = _as_int(raw_payload.get("stock_quantity"))
+        quantity = _as_int(_get_external_value(raw_payload, key_lookup, "stock_quantity"))
+
+    title = _string_or_none(_get_external_value(raw_payload, key_lookup, "title", "name", "product_name"))
+    description_html = _string_or_none(
+        _get_external_value(
+            raw_payload,
+            key_lookup,
+            "description_html",
+            "body_html",
+            "long_description",
+            "full_description",
+        )
+    )
+    generic_description = _string_or_none(raw_payload.get("description"))
+    titled_description = _string_or_none(_get_external_exact_value(raw_payload, "Description", "DESCRIPTION"))
+    if title is None:
+        title = titled_description
+    if title is None and generic_description and _looks_like_cre_inventory_payload(raw_payload, key_lookup):
+        title = generic_description
+        generic_description = None
 
     normalized = {
-        "title": _string_or_none(raw_payload.get("title")) or _string_or_none(raw_payload.get("name")),
-        "name": _string_or_none(raw_payload.get("name")),
-        "handle": _string_or_none(raw_payload.get("handle")) or _string_or_none(raw_payload.get("slug")),
-        "external_id": _string_or_none(raw_payload.get("external_id")) or _string_or_none(raw_payload.get("id")),
-        "description_html": _string_or_none(raw_payload.get("description_html")) or _string_or_none(raw_payload.get("description")),
-        "short_description": _string_or_none(raw_payload.get("short_description")),
-        "vendor": _string_or_none(raw_payload.get("vendor")) or _string_or_none(raw_payload.get("brand")),
-        "brand": _string_or_none(raw_payload.get("brand")),
+        "title": title,
+        "name": _string_or_none(_get_external_value(raw_payload, key_lookup, "name")),
+        "handle": _string_or_none(_get_external_value(raw_payload, key_lookup, "handle", "slug")),
+        "external_id": _string_or_none(_get_external_value(raw_payload, key_lookup, "external_id", "id", "product_id")),
+        "description_html": description_html or generic_description,
+        "short_description": _string_or_none(
+            _get_external_value(raw_payload, key_lookup, "short_description", "short description")
+        ),
+        "vendor": _string_or_none(_get_external_value(raw_payload, key_lookup, "vendor", "brand")),
+        "brand": _string_or_none(_get_external_value(raw_payload, key_lookup, "brand")),
         "product_type": product_type,
         "tags": tags,
-        "status": _string_or_none(raw_payload.get("status")),
-        "sku": _string_or_none(raw_payload.get("sku")),
-        "barcode": _string_or_none(raw_payload.get("barcode"))
-        or _string_or_none(raw_payload.get("ean"))
-        or _string_or_none(raw_payload.get("upc"))
-        or _string_or_none(raw_payload.get("gtin")),
-        "price": _as_float(raw_payload.get("price"))
-        if raw_payload.get("price") not in (None, "")
-        else _as_float(raw_payload.get("regular_price")),
-        "compare_at_price": _as_float(raw_payload.get("compare_at_price"))
-        if raw_payload.get("compare_at_price") not in (None, "")
-        else _as_float(raw_payload.get("sale_price")),
+        "status": _string_or_none(_get_external_value(raw_payload, key_lookup, "status")),
+        "sku": _string_or_none(_get_external_value(raw_payload, key_lookup, "sku")),
+        "barcode": _string_or_none(
+            _get_external_value(
+                raw_payload,
+                key_lookup,
+                "barcode",
+                "ean",
+                "upc",
+                "gtin",
+                "alternate sku",
+                "alternate_sku",
+            )
+        ),
+        "price": _as_float(_get_external_value(raw_payload, key_lookup, "price", "regular_price", "web price", "web_price", "our sell price", "our_sell_price"))
+        if _get_external_value(raw_payload, key_lookup, "price", "regular_price", "web price", "web_price", "our sell price", "our_sell_price") not in (None, "")
+        else _as_float(_get_external_value(raw_payload, key_lookup, "sugg retail", "sugg. retail", "suggested retail")),
+        "compare_at_price": _as_float(_get_external_value(raw_payload, key_lookup, "compare_at_price", "sale_price", "sugg retail", "sugg. retail", "suggested retail"))
+        if _get_external_value(raw_payload, key_lookup, "compare_at_price", "sale_price", "sugg retail", "sugg. retail", "suggested retail") not in (None, "")
+        else None,
         "quantity": quantity,
-        "tracked": _as_bool(raw_payload.get("tracked"))
-        if raw_payload.get("tracked") not in (None, "")
-        else _as_bool(raw_payload.get("manage_stock")),
-        "requires_shipping": _as_bool(raw_payload.get("requires_shipping")),
-        "image_url": image_inputs[0]["src"] if image_inputs else _string_or_none(raw_payload.get("image_url")),
+        "tracked": _as_bool(_get_external_value(raw_payload, key_lookup, "tracked"))
+        if _get_external_value(raw_payload, key_lookup, "tracked") not in (None, "")
+        else _as_bool(_get_external_value(raw_payload, key_lookup, "manage_stock", "manage stock")),
+        "requires_shipping": _as_bool(_get_external_value(raw_payload, key_lookup, "requires_shipping", "requires shipping")),
+        "image_url": image_inputs[0]["src"] if image_inputs else _string_or_none(_get_external_value(raw_payload, key_lookup, "image_url", "image url")),
         "image_urls": [item["src"] for item in image_inputs],
         "images": image_inputs,
     }
@@ -652,6 +720,74 @@ def _coerce_multidict(items: Any) -> dict[str, Any]:
             continue
         payload[key] = value
     return payload
+
+
+def _build_external_key_lookup(raw_payload: dict[str, Any]) -> dict[str, Any]:
+    lookup: dict[str, Any] = {}
+    for key, value in raw_payload.items():
+        normalized_key = _normalize_external_key(key)
+        if normalized_key and normalized_key not in lookup:
+            lookup[normalized_key] = value
+    return lookup
+
+
+def _normalize_external_key(value: Any) -> str:
+    return "".join(character for character in str(value).strip().lower() if character.isalnum())
+
+
+def _get_external_exact_value(raw_payload: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = raw_payload.get(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _get_external_value(raw_payload: dict[str, Any], key_lookup: dict[str, Any], *names: str) -> Any:
+    exact_value = _get_external_exact_value(raw_payload, *names)
+    if exact_value not in (None, ""):
+        return exact_value
+
+    for name in names:
+        normalized_key = _normalize_external_key(name)
+        if not normalized_key:
+            continue
+        value = key_lookup.get(normalized_key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _collect_external_named_values(raw_payload: dict[str, Any], key_lookup: dict[str, Any], *names: str) -> List[str]:
+    values: List[str] = []
+    for name in names:
+        raw_value = _get_external_value(raw_payload, key_lookup, name)
+        for item in _extract_named_values(raw_value):
+            if item not in values:
+                values.append(item)
+    return values
+
+
+def _build_labeled_tag(label: str, value: Any) -> str | None:
+    normalized_value = _string_or_none(value)
+    if not normalized_value:
+        return None
+    return f"{label}:{normalized_value}"
+
+
+def _looks_like_cre_inventory_payload(raw_payload: dict[str, Any], key_lookup: dict[str, Any]) -> bool:
+    markers = 0
+    for aliases in (
+        ("sku",),
+        ("qty", "quantity", "stock_quantity"),
+        ("price", "regular_price"),
+        ("vendor",),
+        ("department",),
+        ("alternate sku", "alternate_sku"),
+    ):
+        if _get_external_value(raw_payload, key_lookup, *aliases) not in (None, ""):
+            markers += 1
+    return markers >= 2
 
 
 def _should_log_incoming_request(path: str) -> bool:
@@ -811,9 +947,10 @@ def _normalize_tags(raw_tags: Any, categories: List[str]) -> List[str]:
     return tags
 
 
-def _normalize_image_inputs(raw_payload: dict[str, Any]) -> List[dict[str, Any]]:
+def _normalize_image_inputs(raw_payload: dict[str, Any], key_lookup: dict[str, Any] | None = None) -> List[dict[str, Any]]:
+    resolved_lookup = key_lookup or _build_external_key_lookup(raw_payload)
     images = []
-    raw_images = raw_payload.get("images") or raw_payload.get("image_urls") or []
+    raw_images = _get_external_value(raw_payload, resolved_lookup, "images", "image_urls", "image urls") or []
     if isinstance(raw_images, str):
         raw_images = [item.strip() for item in raw_images.split(",") if item.strip()]
 
@@ -836,7 +973,9 @@ def _normalize_image_inputs(raw_payload: dict[str, Any]) -> List[dict[str, Any]]
         if src:
             images.append({"src": src})
 
-    single_image = _string_or_none(raw_payload.get("image_url")) or _string_or_none(raw_payload.get("image"))
+    single_image = _string_or_none(
+        _get_external_value(raw_payload, resolved_lookup, "image_url", "image url", "image")
+    )
     if single_image and all(item["src"] != single_image for item in images):
         images.insert(0, {"src": single_image})
 
@@ -1380,25 +1519,24 @@ def _serialize_payload(value: Any) -> str:
 
 
 def _build_woo_product_list(items: list[Any]) -> list[dict[str, Any]]:
-    payload = []
-    for item in items:
-        payload.append(
-            {
-                "id": item.product_id,
-                "name": item.title,
-                "slug": item.handle,
-                "status": (item.status or "draft").lower(),
-                "sku": item.sku,
-                "barcode": item.barcode,
-                "regular_price": f"{item.price:.2f}" if item.price is not None else None,
-                "stock_quantity": item.quantity,
-                "vendor": item.vendor,
-                "product_type": item.product_type,
-                "images": [{"src": item.image_url}] if item.image_url else [],
-                "updated_at": item.updated_at,
-            }
+    return [_build_woo_product_payload(item) for item in items]
+
+
+def _build_woo_product_payload(item: Any) -> dict[str, Any]:
+    numeric_product_id = extract_numeric_shopify_id(getattr(item, "product_id", None))
+    if numeric_product_id is None:
+        raise SyncProcessingError(
+            "Woo-compatible responses require a numeric product ID.",
+            {"product_id": getattr(item, "product_id", None)},
+            code="invalid_woo_product_id",
         )
-    return payload
+
+    return {
+        "id": numeric_product_id,
+        "name": item.title,
+        "regular_price": f"{item.price:.2f}" if item.price is not None else "",
+        "stock_quantity": int(item.quantity) if item.quantity is not None else 0,
+    }
 
 
 def _looks_like_product_mutation(raw_payload: Any) -> bool:
@@ -1565,6 +1703,165 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
     return result
 
 
+def _load_woo_catalog_for_shop(shop: ShopRecord) -> list[Any]:
+    return run_with_shop_retry(shop, lambda active_shop: inventory_service.list_woo_catalog(active_shop))
+
+
+def _load_woo_catalog_product(shop: ShopRecord, product_id: str | int) -> Any:
+    return run_with_shop_retry(
+        shop,
+        lambda active_shop: inventory_service.get_woo_catalog_product(active_shop, product_id),
+    )
+
+
+async def _handle_woo_products_collection(request: Request, shop: ShopRecord) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    source = _feed_source_for_path(request.url.path)
+
+    if request.method.upper() == "GET" and not _looks_like_product_mutation(raw_payload):
+        try:
+            page = max(int(request.query_params.get("page", "1")), 1)
+            per_page = max(1, min(int(request.query_params.get("per_page", "100")), 250))
+        except ValueError as exc:
+            raise SyncProcessingError(
+                "page and per_page must be whole numbers.",
+                {"page": request.query_params.get("page"), "per_page": request.query_params.get("per_page")},
+                code="invalid_pagination",
+            ) from exc
+
+        requested_sku = _string_or_none(request.query_params.get("sku"))
+        requested_status = _string_or_none(request.query_params.get("status"))
+        search = (_string_or_none(request.query_params.get("search")) or "").lower()
+
+        rows = _load_woo_catalog_for_shop(shop)
+        if requested_sku:
+            rows = [row for row in rows if (row.sku or "").strip() == requested_sku]
+        if requested_status:
+            rows = [row for row in rows if (row.status or "").lower() == requested_status.lower()]
+        if search:
+            rows = [
+                row
+                for row in rows
+                if search in (row.title or "").lower()
+                or search in (row.sku or "").lower()
+                or search in (row.handle or "").lower()
+            ]
+        start = (page - 1) * per_page
+        end = start + per_page
+        return JSONResponse(_build_woo_product_list(rows[start:end]))
+
+    if raw_payload is None:
+        raise SyncProcessingError(
+            "Product payload must be a JSON object.",
+            code="invalid_product_payload",
+        )
+
+    normalized = normalize_external_product_payload(raw_payload)
+    try:
+        result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_product(normalized, active_shop))
+        updated_product = _load_woo_catalog_product(shop, result.product_id or normalized.external_id or "")
+    except Exception as exc:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=normalized.sku,
+            title=normalized.title,
+            success=False,
+            message=str(exc),
+            product_id=None,
+            variant_id=None,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+        )
+        raise
+
+    db.record_feed_event(
+        shop_domain=shop.shop_domain,
+        source=source,
+        endpoint=request.url.path,
+        method=request.method,
+        sku=result.sku,
+        title=updated_product.title,
+        success=True,
+        message=result.message,
+        product_id=result.product_id,
+        variant_id=result.variant_id,
+        request_payload=_serialize_payload(raw_payload),
+        normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+    )
+    return JSONResponse(_build_woo_product_payload(updated_product))
+
+
+async def _handle_woo_product_detail(
+    request: Request,
+    shop: ShopRecord,
+    product_id: str,
+) -> JSONResponse:
+    if request.method.upper() == "GET":
+        product = _load_woo_catalog_product(shop, product_id)
+        return JSONResponse(_build_woo_product_payload(product))
+
+    raw_payload = await parse_external_request_payload(request)
+    if raw_payload is None:
+        raise SyncProcessingError(
+            "Product payload must be a JSON object.",
+            {"product_id": product_id},
+            code="invalid_product_payload",
+        )
+
+    existing_product = _load_woo_catalog_product(shop, product_id)
+    source = _feed_source_for_path(request.url.path)
+
+    if not isinstance(raw_payload, dict):
+        raise SyncProcessingError(
+            "Product payload must be a JSON object.",
+            {"product_id": product_id, "received_type": type(raw_payload).__name__},
+            code="invalid_product_payload",
+        )
+
+    raw_payload_with_id = dict(raw_payload)
+    raw_payload_with_id["id"] = product_id
+    normalized = normalize_external_product_payload(raw_payload_with_id)
+
+    try:
+        result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_product(normalized, active_shop))
+        updated_product = _load_woo_catalog_product(shop, product_id)
+    except Exception as exc:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=normalized.sku or existing_product.sku,
+            title=normalized.title or existing_product.title,
+            success=False,
+            message=str(exc),
+            product_id=str(product_id),
+            variant_id=existing_product.variant_id,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+        )
+        raise
+
+    db.record_feed_event(
+        shop_domain=shop.shop_domain,
+        source=source,
+        endpoint=request.url.path,
+        method=request.method,
+        sku=result.sku or existing_product.sku,
+        title=updated_product.title,
+        success=True,
+        message=result.message,
+        product_id=result.product_id or str(product_id),
+        variant_id=result.variant_id or existing_product.variant_id,
+        request_payload=_serialize_payload(raw_payload),
+        normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+    )
+    return JSONResponse(_build_woo_product_payload(updated_product))
+
+
 @app.api_route(
     "/sync/product",
     methods=["GET", "POST"],
@@ -1618,8 +1915,40 @@ async def sync_bulk(
 async def woo_products(
     request: Request,
     shop: ShopRecord = Depends(require_pos_shop),
-) -> SyncResult | JSONResponse:
-    return await _handle_external_single_sync(request, shop)
+) -> JSONResponse:
+    return await _handle_woo_products_collection(request, shop)
+
+
+@app.api_route(
+    "/wc-api/v3/products/{product_id}",
+    methods=["GET", "PUT"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wc-api/v3/products/{product_id}/",
+    methods=["GET", "PUT"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products/{product_id}",
+    methods=["GET", "PUT"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/products/{product_id}/",
+    methods=["GET", "PUT"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_product_detail(
+    request: Request,
+    product_id: str,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    return await _handle_woo_product_detail(request, shop, product_id)
 
 
 @app.api_route(

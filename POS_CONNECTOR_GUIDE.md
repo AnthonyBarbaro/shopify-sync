@@ -16,6 +16,12 @@ Primary products path:
 /wc-api/v3/products
 ```
 
+Strict WooCommerce REST path:
+
+```text
+/wp-json/wc/v3/products
+```
+
 Batch path:
 
 ```text
@@ -33,6 +39,7 @@ Important:
 
 ```text
 Type the path exactly as /wc-api/v3/products
+Or exactly as /wp-json/wc/v3/products for strict WooCommerce REST clients
 Do not add spaces
 Do not paste the full URL into the Path field
 Do not add hidden characters
@@ -63,22 +70,10 @@ Or a JSON array of products:
 ```json
 [
   {
-    "id": "gid://shopify/Product/1234567890",
+    "id": 1234567890,
     "name": "Classic Tee",
-    "slug": "classic-tee",
-    "status": "draft",
-    "sku": "ABC123",
-    "barcode": "012345678905",
     "regular_price": "19.99",
-    "stock_quantity": 10,
-    "vendor": "POS Company",
-    "product_type": "Apparel",
-    "images": [
-      {
-        "src": "https://example.com/products/classic-tee.jpg"
-      }
-    ],
-    "updated_at": "2026-04-01T20:00:00+00:00"
+    "stock_quantity": 10
   }
 ]
 ```
@@ -119,7 +114,36 @@ If SKU does not exist, a new Shopify product is created.
 For first-time uploads, send status=draft.
 ```
 
-### 3. Create or update multiple products
+### 3. Update one product by ID
+
+```http
+PUT /wp-json/wc/v3/products/{id}?consumer_key=...&consumer_secret=...
+Content-Type: application/json
+```
+
+Example request:
+
+```bash
+curl -i -X PUT "https://shopify-sync-production-905f.up.railway.app/wp-json/wc/v3/products/1234567890?consumer_key=POS_KEY&consumer_secret=POS_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "regular_price": "10.00",
+    "stock_quantity": 5
+  }'
+```
+
+Expected response:
+
+```json
+{
+  "id": 1234567890,
+  "name": "Classic Tee",
+  "regular_price": "10.00",
+  "stock_quantity": 5
+}
+```
+
+### 4. Create or update multiple products
 
 ```http
 POST /wc-api/v3/products/batch?consumer_key=...&consumer_secret=...
@@ -173,6 +197,42 @@ images[].src
 image_url
 ```
 
+## Cash Register Express Field Mapping
+
+If Cash Register Express sends inventory rows using labels like the ones shown in the inventory screen, the API now maps them like this:
+
+```text
+Sku -> sku
+Description -> name/title
+Price -> regular_price
+Qty -> stock_quantity
+Vendor -> vendor
+Department -> product_type
+Alternate Sku -> barcode
+Style -> Shopify tag "Style:<value>"
+Size -> Shopify tag "Size:<value>"
+Color -> Shopify tag "Color:<value>"
+Vendor Item -> Shopify tag "Vendor Item:<value>"
+PField1-PField5 -> Shopify tags "PField1:<value>" through "PField5:<value>"
+```
+
+Example CRE-style payload:
+
+```json
+{
+  "Sku": "006245",
+  "Description": "VEST CUSTOM FIT TAILORS",
+  "Price": "75.00",
+  "Qty": "0",
+  "Vendor": "CFT",
+  "Department": "VES",
+  "Size": "M",
+  "Color": "BURGUNDY",
+  "Style": "VEST",
+  "Alternate Sku": "079408529"
+}
+```
+
 ## Response Codes
 
 ```text
@@ -188,6 +248,12 @@ Use this exact path:
 
 ```text
 /wc-api/v3/products
+```
+
+Or this strict WooCommerce path:
+
+```text
+/wp-json/wc/v3/products
 ```
 
 Do not use:

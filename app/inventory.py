@@ -165,6 +165,25 @@ class InventorySyncService:
 
         return rows
 
+    def list_woo_catalog(self, shop: ShopRecord) -> List[CatalogProductRecord]:
+        products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
+        return [self._catalog_record_from_product(product) for product in products]
+
+    def get_woo_catalog_product(self, shop: ShopRecord, product_id: str | int) -> CatalogProductRecord:
+        product = self.shopify_client.get_product_by_id(
+            shop.shop_domain,
+            shop.access_token,
+            product_id,
+        )
+        if product is None:
+            raise SyncProcessingError(
+                "Product not found.",
+                {"product_id": str(product_id)},
+                status_code=404,
+                code="product_not_found",
+            )
+        return self._catalog_record_from_product(product)
+
     def _sync_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
         existing_mapping = self._find_existing_mapping(shop, payload)
         media_inputs = self._build_media_inputs(payload)
@@ -261,6 +280,15 @@ class InventorySyncService:
         )
 
     def _find_existing_mapping(self, shop: ShopRecord, payload: ProductSyncRequest) -> Optional[VariantMapping]:
+        if payload.external_id:
+            product = self.shopify_client.get_product_by_id(
+                shop.shop_domain,
+                shop.access_token,
+                payload.external_id,
+            )
+            if product:
+                return self._mapping_from_product(product, payload.sku)
+
         if payload.sku:
             try:
                 return self.shopify_client.get_variant_by_sku(
@@ -529,6 +557,7 @@ class InventorySyncService:
         return payload.model_copy(
             update={
                 "sku": sku,
+                "external_id": (payload.external_id or "").strip() or None,
                 "title": title,
                 "handle": handle,
                 "barcode": barcode,
@@ -554,6 +583,54 @@ class InventorySyncService:
             if normalize_gid("Location", level.location_id) == normalized_location_id:
                 return level.quantity
         return None
+
+    def _catalog_record_from_product(
+        self,
+        product: Dict[str, Any],
+        *,
+        sku: Optional[str] = None,
+    ) -> CatalogProductRecord:
+        media_nodes = ((product.get("media") or {}).get("nodes") or [])
+        primary_image = _extract_first_media_url(media_nodes)
+        variants = ((product.get("variants") or {}).get("nodes") or [])
+
+        target_variant = None
+        normalized_sku = (sku or "").strip()
+        for variant in variants:
+            if normalized_sku and (variant.get("sku") or "").strip() == normalized_sku:
+                target_variant = variant
+                break
+        if target_variant is None and variants:
+            target_variant = variants[0]
+
+        quantity = None
+        variant_id = None
+        variant_sku = None
+        barcode = None
+        price = None
+
+        if target_variant is not None:
+            variant_id = target_variant.get("id")
+            variant_sku = target_variant.get("sku")
+            barcode = target_variant.get("barcode")
+            price = _safe_float(target_variant.get("price"))
+            quantity = _extract_available_quantity(target_variant.get("inventoryItem") or {})
+
+        return CatalogProductRecord(
+            product_id=product["id"],
+            variant_id=variant_id,
+            title=product.get("title") or "Untitled product",
+            handle=product.get("handle"),
+            status=product.get("status"),
+            sku=variant_sku,
+            barcode=barcode,
+            price=price,
+            quantity=quantity,
+            vendor=product.get("vendor"),
+            product_type=product.get("productType"),
+            image_url=primary_image,
+            updated_at=product.get("updatedAt"),
+        )
 
 
 def _normalize_product_status(value: Optional[str], *, default: str) -> str:
