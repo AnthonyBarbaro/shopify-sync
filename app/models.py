@@ -14,6 +14,15 @@ class ProductImageInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ProductMetafieldInput(BaseModel):
+    namespace: str = "custom"
+    key: str = Field(min_length=1)
+    value: Any
+    type: str = "single_line_text_field"
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ProductSyncRequest(BaseModel):
     sku: Optional[str] = Field(default=None, min_length=1)
     title: Optional[str] = None
@@ -37,6 +46,7 @@ class ProductSyncRequest(BaseModel):
     image_url: Optional[str] = None
     image_urls: List[str] = Field(default_factory=list)
     images: List[ProductImageInput] = Field(default_factory=list)
+    metafields: List[ProductMetafieldInput] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="allow")
 

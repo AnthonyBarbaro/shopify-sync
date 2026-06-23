@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,7 @@ from app.models import (
     BulkSyncResponse,
     CatalogProductRecord,
     ProductImageInput,
+    ProductMetafieldInput,
     ProductSyncRequest,
     SyncResult,
     VariantMapping,
@@ -230,6 +232,14 @@ class InventorySyncService:
                 code="variant_resolution_failed",
             )
 
+        metafield_inputs = self._build_metafield_inputs(payload, mapping.product_id)
+        if metafield_inputs:
+            self.shopify_client.set_product_metafields(
+                shop.shop_domain,
+                shop.access_token,
+                metafield_inputs,
+            )
+
         location_id = self._resolve_location_id(shop, mapping)
         current_quantity = self._get_inventory_quantity(mapping, location_id)
         inventory_item_id = mapping.inventory_item_id
@@ -274,6 +284,7 @@ class InventorySyncService:
                 "product_title": product_title,
                 "product_status": product_status or _normalize_product_status(payload.status, default="DRAFT"),
                 "image_count": len(media_inputs),
+                "metafield_count": len(metafield_inputs),
                 "requested_price": payload.price,
                 "requested_quantity": payload.quantity,
             },
@@ -439,6 +450,22 @@ class InventorySyncService:
                 }
             )
         return media_inputs
+
+    def _build_metafield_inputs(
+        self,
+        payload: ProductSyncRequest,
+        product_id: str,
+    ) -> List[Dict[str, Any]]:
+        metafields: Dict[tuple[str, str], Dict[str, Any]] = {}
+        owner_id = normalize_gid("Product", product_id)
+
+        for metafield in payload.metafields:
+            prepared = _prepare_product_metafield(metafield, owner_id=owner_id)
+            if prepared is None:
+                continue
+            metafields[(prepared["namespace"], prepared["key"])] = prepared
+
+        return list(metafields.values())
 
     def _set_inventory_with_retries(
         self,
@@ -638,6 +665,43 @@ def _normalize_product_status(value: Optional[str], *, default: str) -> str:
     if normalized in {"ACTIVE", "ARCHIVED", "DRAFT"}:
         return normalized
     return default
+
+
+def _prepare_product_metafield(
+    metafield: ProductMetafieldInput,
+    *,
+    owner_id: str,
+) -> Optional[Dict[str, Any]]:
+    namespace = (metafield.namespace or "custom").strip()
+    key = (metafield.key or "").strip()
+    metafield_type = (metafield.type or "single_line_text_field").strip()
+    value = _serialize_metafield_value(metafield.value, metafield_type)
+
+    if not namespace or not key or value is None:
+        return None
+
+    return {
+        "ownerId": owner_id,
+        "namespace": namespace,
+        "key": key,
+        "type": metafield_type,
+        "value": value,
+    }
+
+
+def _serialize_metafield_value(value: Any, metafield_type: str) -> Optional[str]:
+    if value is None:
+        return None
+    if metafield_type == "json":
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, default=str, ensure_ascii=True, sort_keys=True)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, default=str, ensure_ascii=True, sort_keys=True)
+    text = str(value).strip()
+    return text or None
 
 
 def _safe_float(value: Any) -> Optional[float]:

@@ -595,6 +595,9 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
     department = _string_or_none(_get_external_value(raw_payload, key_lookup, "department"))
     raw_tags = _get_external_value(raw_payload, key_lookup, "tags")
     tags = _normalize_tags(raw_tags, categories)
+    metafields = _normalize_metafield_inputs(
+        _get_external_value(raw_payload, key_lookup, "metafields", "metafield")
+    )
     for label, value in (
         ("Style", _get_external_value(raw_payload, key_lookup, "style")),
         ("Size", _get_external_value(raw_payload, key_lookup, "size")),
@@ -678,6 +681,7 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
         "image_url": image_inputs[0]["src"] if image_inputs else _string_or_none(_get_external_value(raw_payload, key_lookup, "image_url", "image url")),
         "image_urls": [item["src"] for item in image_inputs],
         "images": image_inputs,
+        "metafields": metafields,
     }
     return ProductSyncRequest.model_validate(normalized)
 
@@ -980,6 +984,54 @@ def _normalize_image_inputs(raw_payload: dict[str, Any], key_lookup: dict[str, A
         images.insert(0, {"src": single_image})
 
     return images
+
+
+def _normalize_metafield_inputs(raw_metafields: Any) -> List[dict[str, Any]]:
+    if raw_metafields in (None, ""):
+        return []
+
+    if isinstance(raw_metafields, str):
+        try:
+            raw_metafields = json.loads(raw_metafields)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(raw_metafields, dict):
+        if raw_metafields.get("key"):
+            raw_metafields = [raw_metafields]
+        else:
+            raw_metafields = [
+                {
+                    "namespace": "custom",
+                    "key": str(key),
+                    "value": value,
+                    "type": "json" if isinstance(value, (dict, list)) else "single_line_text_field",
+                }
+                for key, value in raw_metafields.items()
+            ]
+
+    if not isinstance(raw_metafields, list):
+        return []
+
+    normalized: List[dict[str, Any]] = []
+    for item in raw_metafields:
+        if not isinstance(item, dict):
+            continue
+        key = _string_or_none(item.get("key"))
+        if not key:
+            continue
+        value = item.get("value")
+        if value in (None, ""):
+            continue
+        normalized.append(
+            {
+                "namespace": _string_or_none(item.get("namespace")) or "custom",
+                "key": key,
+                "value": value,
+                "type": _string_or_none(item.get("type")) or "single_line_text_field",
+            }
+        )
+    return normalized
 
 
 def verify_webhook_request(request: Request, body: bytes) -> str:
@@ -1556,6 +1608,7 @@ def _looks_like_product_mutation(raw_payload: Any) -> bool:
         "images",
         "image_url",
         "image",
+        "metafields",
     }
     return any(key in raw_payload for key in mutation_keys)
 

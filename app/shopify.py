@@ -548,6 +548,50 @@ class ShopifyClient:
         updated_variants = result.get("productVariants") or []
         return updated_variants[0] if updated_variants else {}
 
+    def set_product_metafields(
+        self,
+        shop_domain: str,
+        access_token: str,
+        metafields: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        mutation = """
+        mutation SetProductMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields {
+              namespace
+              key
+              value
+              createdAt
+              updatedAt
+            }
+            userErrors {
+              code
+              field
+              message
+            }
+          }
+        }
+        """
+        updated: List[Dict[str, Any]] = []
+        for start in range(0, len(metafields), 25):
+            chunk = metafields[start : start + 25]
+            payload = self.graphql(
+                shop_domain,
+                access_token,
+                mutation,
+                {"metafields": chunk},
+                operation_name="SetProductMetafields",
+            )
+            result = payload["data"]["metafieldsSet"]
+            user_errors = result.get("userErrors") or []
+            if user_errors:
+                raise ShopifyAPIError(
+                    "Shopify rejected the product metafield update.",
+                    {"metafields": chunk, "user_errors": user_errors},
+                )
+            updated.extend(result.get("metafields") or [])
+        return updated
+
     def update_variant_price(
         self,
         shop_domain: str,
