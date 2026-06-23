@@ -4,13 +4,14 @@ import html
 import json
 import secrets
 import time
+import zipfile
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, TypeVar
 from urllib.parse import parse_qsl, urlencode
 
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +42,10 @@ from app.models import (
     ErrorResponse,
     FeedEventsResponse,
     HealthResponse,
+    PosArchiveAnalysisResponse,
+    PosArchiveProductPreviewResponse,
+    PosArchiveTableSampleResponse,
+    PosArchiveUploadResponse,
     ProductSyncRequest,
     RequestLogsResponse,
     ShopifyConnectionResponse,
@@ -48,6 +53,7 @@ from app.models import (
     SyncResult,
     UiConfigResponse,
 )
+from app import pos_archive
 from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error
 from app.state import SyncActivityStore
 from app.utils import (
@@ -1194,6 +1200,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 @app.get("/app", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
+@app.get("/app/pos-archive", include_in_schema=False)
 @app.get("/app/catalog", include_in_schema=False)
 @app.get("/app/settings", include_in_schema=False)
 async def app_shell(request: Request) -> Response:
@@ -1384,6 +1391,163 @@ async def catalog_csv(request: Request) -> StreamingResponse:
         "Content-Disposition": f'attachment; filename="{shop.shop_domain}-catalog.csv"'
     }
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+
+
+def _resolve_pos_archive_root(shop: ShopRecord) -> Path:
+    storage_root = pos_archive.archive_storage_root(settings.database_path, shop.shop_domain)
+    return pos_archive.default_archive_root(storage_root)
+
+
+@app.get("/api/pos-archive/analyze", response_model=PosArchiveAnalysisResponse)
+async def pos_archive_analyze(request: Request) -> PosArchiveAnalysisResponse:
+    shop, _session = _get_session_context(request)
+    root = _resolve_pos_archive_root(shop)
+    analysis = pos_archive.analyze_archive(root)
+    return PosArchiveAnalysisResponse(
+        shop=shop.shop_domain,
+        timestamp=utc_now_iso(),
+        **analysis,
+    )
+
+
+@app.post("/api/pos-archive/upload", response_model=PosArchiveUploadResponse)
+async def pos_archive_upload(
+    request: Request,
+    file: UploadFile = File(...),
+) -> PosArchiveUploadResponse:
+    shop, _session = _get_session_context(request)
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".zip"):
+        raise SyncProcessingError(
+            "Upload a .zip file containing the POS DBF folder.",
+            {"filename": file.filename},
+            code="invalid_pos_archive_upload",
+        )
+    storage_root = pos_archive.archive_storage_root(settings.database_path, shop.shop_domain)
+    try:
+        root = pos_archive.save_uploaded_archive(file, storage_root)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise SyncProcessingError(
+            "The POS archive could not be extracted.",
+            {"reason": str(exc)},
+            code="pos_archive_extract_failed",
+        ) from exc
+    analysis = pos_archive.analyze_archive(root)
+    return PosArchiveUploadResponse(
+        shop=shop.shop_domain,
+        archive_path=str(root),
+        analysis=analysis,
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/pos-archive/tables/{table_name}", response_model=PosArchiveTableSampleResponse)
+async def pos_archive_table_sample(
+    request: Request,
+    table_name: str,
+    limit: int = 10,
+) -> PosArchiveTableSampleResponse:
+    shop, _session = _get_session_context(request)
+    root = _resolve_pos_archive_root(shop)
+    rows = pos_archive.sample_table(root, table_name, limit=limit)
+    return PosArchiveTableSampleResponse(
+        shop=shop.shop_domain,
+        table=table_name,
+        rows=rows,
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/pos-archive/tables/{table_name}/csv")
+async def pos_archive_table_csv(
+    request: Request,
+    table_name: str,
+    limit: int = 10000,
+) -> StreamingResponse:
+    shop, _session = _get_session_context(request)
+    root = _resolve_pos_archive_root(shop)
+    table_path = pos_archive.find_table(root, table_name)
+    if table_path is None:
+        raise SyncProcessingError(
+            "POS archive table not found.",
+            {"table": table_name, "archive_path": str(root)},
+            status_code=404,
+            code="pos_archive_table_not_found",
+        )
+    table = pos_archive.read_dbf_header(table_path, root=root)
+    safe_limit = max(1, min(limit, 100000))
+    field_names = [field.name for field in table.fields]
+
+    def iter_rows() -> Any:
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(field_names)
+        yield output.getvalue()
+
+        for row in pos_archive.iter_dbf_rows(table_path, limit=safe_limit):
+            output = StringIO()
+            writer = csv.writer(output)
+            writer.writerow([row.get(field_name) if row.get(field_name) is not None else "" for field_name in field_names])
+            yield output.getvalue()
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{shop.shop_domain}-{table.table_name}.csv"'
+    }
+    return StreamingResponse(iter_rows(), media_type="text/csv", headers=headers)
+
+
+@app.get("/api/pos-archive/products/preview", response_model=PosArchiveProductPreviewResponse)
+async def pos_archive_product_preview(
+    request: Request,
+    limit: int = 25,
+    offset: int = 0,
+    include_zero_quantity: bool = False,
+) -> PosArchiveProductPreviewResponse:
+    shop, _session = _get_session_context(request)
+    safe_limit = max(1, min(limit, 250))
+    safe_offset = max(0, offset)
+    root = _resolve_pos_archive_root(shop)
+    payloads = pos_archive.build_product_payloads(
+        root,
+        limit=safe_limit,
+        offset=safe_offset,
+        include_zero_quantity=include_zero_quantity,
+        rich=True,
+    )
+    return PosArchiveProductPreviewResponse(
+        shop=shop.shop_domain,
+        total=len(payloads),
+        items=[ProductSyncRequest.model_validate(payload) for payload in payloads],
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.post("/api/pos-archive/products/sync", response_model=BulkSyncResponse)
+async def pos_archive_product_sync(
+    request: Request,
+    limit: int = 25,
+    offset: int = 0,
+    include_zero_quantity: bool = False,
+) -> BulkSyncResponse:
+    shop, _session = _get_session_context(request)
+    safe_limit = max(1, min(limit, 250))
+    safe_offset = max(0, offset)
+    root = _resolve_pos_archive_root(shop)
+    payloads = pos_archive.build_product_payloads(
+        root,
+        limit=safe_limit,
+        offset=safe_offset,
+        include_zero_quantity=include_zero_quantity,
+        rich=True,
+    )
+    if not payloads:
+        raise SyncProcessingError(
+            "No POS product rows matched the selected filters.",
+            {"archive_path": str(root), "include_zero_quantity": include_zero_quantity},
+            code="empty_pos_archive_product_sync",
+        )
+    products = [ProductSyncRequest.model_validate(payload) for payload in payloads]
+    return run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_bulk(products, active_shop))
 
 
 @app.get("/api/feed", response_model=FeedEventsResponse)

@@ -179,6 +179,42 @@ class CatalogResponse(BaseModel):
     timestamp: str
 
 
+class PosArchiveUploadResponse(BaseModel):
+    shop: str
+    archive_path: str
+    analysis: Dict[str, Any]
+    timestamp: str
+
+
+class PosArchiveAnalysisResponse(BaseModel):
+    shop: str
+    archive_path: str
+    table_count: int
+    total_records: int
+    sensitive_table_count: int
+    categories: List[Dict[str, Any]]
+    tables: List[Dict[str, Any]]
+    core_tables: List[Dict[str, Any]]
+    samples: Dict[str, Any]
+    product_preview: List[Dict[str, Any]]
+    notes: List[str]
+    timestamp: str
+
+
+class PosArchiveTableSampleResponse(BaseModel):
+    shop: str
+    table: str
+    rows: List[Dict[str, Any]]
+    timestamp: str
+
+
+class PosArchiveProductPreviewResponse(BaseModel):
+    shop: str
+    total: int
+    items: List[ProductSyncRequest]
+    timestamp: str
+
+
 class FeedEventRecord(BaseModel):
     id: int
     source: str
