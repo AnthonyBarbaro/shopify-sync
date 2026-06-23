@@ -104,6 +104,147 @@ class ShopifyClient:
                 return products
             cursor = products_data["pageInfo"]["endCursor"]
 
+    def ensure_customer_custom_id_definition(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        namespace: str,
+        key: str,
+    ) -> None:
+        mutation = """
+        mutation CreateCustomerCustomIdDefinition($definition: MetafieldDefinitionInput!) {
+          metafieldDefinitionCreate(definition: $definition) {
+            createdDefinition {
+              id
+              namespace
+              key
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "definition": {
+                    "name": "POS Customer ID",
+                    "namespace": namespace,
+                    "key": key,
+                    "description": "Stable legacy POS customer identifier for imports.",
+                    "type": "id",
+                    "ownerType": "CUSTOMER",
+                    "pin": True,
+                }
+            },
+            operation_name="CreateCustomerCustomIdDefinition",
+        )
+        result = payload["data"]["metafieldDefinitionCreate"]
+        user_errors = result.get("userErrors") or []
+        blocking_errors = [
+            error
+            for error in user_errors
+            if str(error.get("code") or "").upper() not in {"TAKEN", "ALREADY_EXISTS"}
+            and "already" not in str(error.get("message") or "").lower()
+        ]
+        if blocking_errors:
+            raise ShopifyAPIError(
+                "Shopify could not create the POS customer ID metafield definition.",
+                {"user_errors": user_errors, "shop": shop_domain},
+            )
+
+    def customer_set(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        identifier: Dict[str, Any],
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation CustomerSet($identifier: CustomerSetIdentifiers, $input: CustomerSetInput!) {
+          customerSet(identifier: $identifier, input: $input) {
+            customer {
+              id
+              displayName
+              email
+              phone
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {"identifier": identifier or None, "input": input_data},
+            operation_name="CustomerSet",
+        )
+        result = payload["data"]["customerSet"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify could not create or update this customer.",
+                {"identifier": identifier, "user_errors": user_errors, "shop": shop_domain},
+            )
+        customer = result.get("customer")
+        if not customer:
+            raise ShopifyAPIError(
+                "Shopify did not return a customer for this import row.",
+                {"identifier": identifier, "shop": shop_domain},
+            )
+        return customer
+
+    def set_customer_metafields(
+        self,
+        shop_domain: str,
+        access_token: str,
+        metafields: List[Dict[str, Any]],
+    ) -> None:
+        if not metafields:
+            return
+        mutation = """
+        mutation SetCustomerMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields {
+              id
+              namespace
+              key
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {"metafields": metafields},
+            operation_name="SetCustomerMetafields",
+        )
+        result = payload["data"]["metafieldsSet"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify could not save customer metafields.",
+                {"user_errors": user_errors, "shop": shop_domain},
+            )
+
     def get_variant_by_sku(
         self,
         shop_domain: str,

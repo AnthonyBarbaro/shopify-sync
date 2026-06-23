@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +8,11 @@ from app.db import ShopRecord
 from app.models import (
     BulkSyncResponse,
     CatalogProductRecord,
+    CustomerAddressInput,
+    CustomerBulkSyncResponse,
+    CustomerMetafieldInput,
+    CustomerSyncRequest,
+    CustomerSyncResult,
     ProductImageInput,
     ProductMetafieldInput,
     ProductSyncRequest,
@@ -17,6 +23,7 @@ from app.shopify import ShopifyClient, format_price, normalize_gid
 from app.state import SyncActivityStore
 from app.utils import (
     AppError,
+    AuthenticationError,
     ShopifyAPIError,
     SyncProcessingError,
     has_user_error_code,
@@ -24,6 +31,10 @@ from app.utils import (
     setup_logging,
     utc_now_iso,
 )
+
+
+CUSTOMER_CUSTOM_ID_NAMESPACE = "pos"
+CUSTOMER_CUSTOM_ID_KEY = "legacy_customer_id"
 
 
 class InventorySyncService:
@@ -37,6 +48,7 @@ class InventorySyncService:
         self.settings = settings
         self.activity_store = activity_store
         self.logger = setup_logging().getChild("inventory")
+        self._customer_custom_id_ready: set[str] = set()
 
     def sync_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
         normalized = self._normalize_payload(payload)
@@ -127,6 +139,66 @@ class InventorySyncService:
             results=results,
         )
 
+    def sync_customer(self, payload: CustomerSyncRequest, shop: ShopRecord) -> CustomerSyncResult:
+        normalized = self._normalize_customer_payload(payload)
+        display_name = _customer_display_name(normalized)
+
+        try:
+            result = self._sync_customer_record(normalized, shop)
+        except AuthenticationError:
+            raise
+        except Exception as exc:
+            details = exc.details if isinstance(exc, AppError) else {"reason": str(exc)}
+            log_sync_event(
+                self.logger,
+                sku=normalized.pos_customer_number or normalized.email or normalized.phone or "unknown-customer",
+                success=False,
+                message="customer_sync_failed",
+                shop=shop.shop_domain,
+                error=str(exc),
+                title=display_name,
+            )
+            return CustomerSyncResult(
+                shop_domain=shop.shop_domain,
+                pos_customer_number=normalized.pos_customer_number,
+                source=normalized.source,
+                success=False,
+                message=str(exc),
+                timestamp=utc_now_iso(),
+                email=normalized.email,
+                phone=normalized.phone,
+                name=display_name,
+                details=details,
+            )
+
+        log_sync_event(
+            self.logger,
+            sku=result.pos_customer_number or result.email or result.phone or "unknown-customer",
+            success=True,
+            message="customer_sync_completed",
+            shop=shop.shop_domain,
+            title=result.name,
+            customer_id=result.customer_id,
+        )
+        return result
+
+    def sync_customers_bulk(self, customers: List[CustomerSyncRequest], shop: ShopRecord) -> CustomerBulkSyncResponse:
+        if not customers:
+            raise SyncProcessingError(
+                "Customer bulk sync request must include at least one customer.",
+                code="empty_customer_bulk_request",
+            )
+
+        results = [self.sync_customer(customer, shop) for customer in customers]
+        succeeded = sum(1 for result in results if result.success)
+        return CustomerBulkSyncResponse(
+            total=len(customers),
+            succeeded=succeeded,
+            failed=len(customers) - succeeded,
+            timestamp=utc_now_iso(),
+            results=results,
+        )
+
     def list_catalog(self, shop: ShopRecord) -> List[CatalogProductRecord]:
         products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
         rows: List[CatalogProductRecord] = []
@@ -192,6 +264,146 @@ class InventorySyncService:
                 code="product_not_found",
             )
         return self._catalog_record_from_product(product)
+
+    def _sync_customer_record(self, payload: CustomerSyncRequest, shop: ShopRecord) -> CustomerSyncResult:
+        custom_id = _customer_custom_id_value(payload)
+        if custom_id:
+            self._ensure_customer_custom_id_definition(shop)
+
+        customer_input = self._build_customer_set_input(payload)
+        identifier = _customer_identifier(payload, custom_id=custom_id)
+        fallback_used = False
+
+        try:
+            customer = self.shopify_client.customer_set(
+                shop.shop_domain,
+                shop.access_token,
+                identifier=identifier,
+                input_data=customer_input,
+            )
+        except ShopifyAPIError as exc:
+            fallback_identifier = _customer_contact_identifier(payload)
+            if not custom_id or fallback_identifier is None or not _is_customer_identity_conflict(exc.details):
+                raise
+            customer = self.shopify_client.customer_set(
+                shop.shop_domain,
+                shop.access_token,
+                identifier=fallback_identifier,
+                input_data=customer_input,
+            )
+            fallback_used = True
+
+        customer_id = customer["id"]
+        metafields = self._build_customer_metafields(payload, customer_id, custom_id=custom_id)
+        if metafields:
+            self.shopify_client.set_customer_metafields(
+                shop.shop_domain,
+                shop.access_token,
+                metafields,
+            )
+
+        return CustomerSyncResult(
+            shop_domain=shop.shop_domain,
+            pos_customer_number=payload.pos_customer_number,
+            source=payload.source,
+            success=True,
+            message="Customer synced successfully.",
+            timestamp=utc_now_iso(),
+            customer_id=customer_id,
+            email=customer.get("email") or payload.email,
+            phone=customer.get("phone") or payload.phone,
+            name=customer.get("displayName") or _customer_display_name(payload),
+            details={
+                "identifier": identifier,
+                "fallback_used": fallback_used,
+                "metafield_count": len(metafields),
+                "address_count": len(customer_input.get("addresses") or []),
+                "tag_count": len(customer_input.get("tags") or []),
+            },
+        )
+
+    def _ensure_customer_custom_id_definition(self, shop: ShopRecord) -> None:
+        cache_key = shop.shop_domain
+        if cache_key in self._customer_custom_id_ready:
+            return
+        self.shopify_client.ensure_customer_custom_id_definition(
+            shop.shop_domain,
+            shop.access_token,
+            namespace=CUSTOMER_CUSTOM_ID_NAMESPACE,
+            key=CUSTOMER_CUSTOM_ID_KEY,
+        )
+        self._customer_custom_id_ready.add(cache_key)
+
+    def _build_customer_set_input(self, payload: CustomerSyncRequest) -> Dict[str, Any]:
+        first_name = payload.firstName
+        last_name = payload.lastName
+        if not first_name and not last_name and payload.company:
+            last_name = payload.company
+
+        customer_input: Dict[str, Any] = {}
+        if first_name:
+            customer_input["firstName"] = first_name
+        if last_name:
+            customer_input["lastName"] = last_name
+        if payload.email:
+            customer_input["email"] = payload.email
+        if payload.phone:
+            customer_input["phone"] = payload.phone
+        if payload.note:
+            customer_input["note"] = payload.note
+        if payload.tags:
+            customer_input["tags"] = payload.tags
+        if payload.taxExempt is not None:
+            customer_input["taxExempt"] = bool(payload.taxExempt)
+
+        addresses = [_prepare_customer_address(address) for address in payload.addresses]
+        addresses = [address for address in addresses if address]
+        if addresses:
+            customer_input["addresses"] = addresses[:10]
+
+        if not customer_input:
+            raise SyncProcessingError(
+                "Customer payload does not contain any fields Shopify can import.",
+                {"pos_customer_number": payload.pos_customer_number, "source": payload.source},
+                code="empty_customer_payload",
+            )
+        return customer_input
+
+    def _build_customer_metafields(
+        self,
+        payload: CustomerSyncRequest,
+        customer_id: str,
+        *,
+        custom_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        owner_id = normalize_gid("Customer", customer_id)
+        metafields: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+        if custom_id:
+            metafields[(CUSTOMER_CUSTOM_ID_NAMESPACE, CUSTOMER_CUSTOM_ID_KEY)] = {
+                "ownerId": owner_id,
+                "namespace": CUSTOMER_CUSTOM_ID_NAMESPACE,
+                "key": CUSTOMER_CUSTOM_ID_KEY,
+                "type": "id",
+                "value": custom_id,
+            }
+
+        if payload.company:
+            metafields[("pos", "company")] = {
+                "ownerId": owner_id,
+                "namespace": "pos",
+                "key": "company",
+                "type": "single_line_text_field",
+                "value": payload.company,
+            }
+
+        for metafield in payload.metafields:
+            prepared = _prepare_customer_metafield(metafield, owner_id=owner_id)
+            if prepared is None:
+                continue
+            metafields[(prepared["namespace"], prepared["key"])] = prepared
+
+        return list(metafields.values())
 
     def _sync_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
         existing_mapping = self._find_existing_mapping(shop, payload)
@@ -616,6 +828,41 @@ class InventorySyncService:
             }
         )
 
+    def _normalize_customer_payload(self, payload: CustomerSyncRequest) -> CustomerSyncRequest:
+        tags = [tag.strip() for tag in payload.tags if str(tag).strip()]
+        addresses = [
+            address.model_copy(
+                update={
+                    "firstName": _clean_string(address.firstName),
+                    "lastName": _clean_string(address.lastName),
+                    "company": _clean_string(address.company),
+                    "address1": _clean_string(address.address1),
+                    "address2": _clean_string(address.address2),
+                    "city": _clean_string(address.city),
+                    "provinceCode": _clean_string(address.provinceCode or address.province),
+                    "province": None,
+                    "zip": _clean_string(address.zip),
+                    "countryCode": (_clean_string(address.countryCode) or "US").upper(),
+                    "phone": _clean_string(address.phone),
+                }
+            )
+            for address in payload.addresses
+        ]
+        return payload.model_copy(
+            update={
+                "source": _clean_string(payload.source),
+                "pos_customer_number": _clean_string(payload.pos_customer_number),
+                "firstName": _clean_string(payload.firstName),
+                "lastName": _clean_string(payload.lastName),
+                "email": _normalize_customer_email(payload.email),
+                "phone": _clean_string(payload.phone),
+                "company": _clean_string(payload.company),
+                "tags": tags,
+                "note": _clean_string(payload.note),
+                "addresses": addresses,
+            }
+        )
+
     def _resolve_location_id(self, shop: ShopRecord, mapping: VariantMapping) -> str:
         if self.settings.shopify_location_id:
             return normalize_gid("Location", self.settings.shopify_location_id)
@@ -691,6 +938,114 @@ def _normalize_product_status(value: Optional[str], *, default: str) -> str:
     if normalized in {"ACTIVE", "ARCHIVED", "DRAFT"}:
         return normalized
     return default
+
+
+def _customer_custom_id_value(payload: CustomerSyncRequest) -> Optional[str]:
+    customer_number = _clean_string(payload.pos_customer_number)
+    if not customer_number:
+        return None
+    source = _clean_string(payload.source) or "Customer.dbf"
+    return f"{source}:{customer_number}"
+
+
+def _customer_identifier(payload: CustomerSyncRequest, *, custom_id: Optional[str]) -> Dict[str, Any]:
+    if custom_id:
+        return {
+            "customId": {
+                "namespace": CUSTOMER_CUSTOM_ID_NAMESPACE,
+                "key": CUSTOMER_CUSTOM_ID_KEY,
+                "value": custom_id,
+            }
+        }
+    contact_identifier = _customer_contact_identifier(payload)
+    if contact_identifier is not None:
+        return contact_identifier
+    raise SyncProcessingError(
+        "Customer needs a POS customer number, email, or phone to sync safely.",
+        {"source": payload.source},
+        code="missing_customer_identifier",
+    )
+
+
+def _customer_contact_identifier(payload: CustomerSyncRequest) -> Optional[Dict[str, Any]]:
+    if payload.email:
+        return {"email": payload.email}
+    if payload.phone:
+        return {"phone": payload.phone}
+    return None
+
+
+def _customer_display_name(payload: CustomerSyncRequest) -> str:
+    name = " ".join(part for part in (payload.firstName, payload.lastName) if part).strip()
+    return name or payload.company or payload.email or payload.phone or payload.pos_customer_number or "POS customer"
+
+
+def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[str, Any]]:
+    prepared = {
+        "firstName": _clean_string(address.firstName),
+        "lastName": _clean_string(address.lastName),
+        "company": _clean_string(address.company),
+        "address1": _clean_string(address.address1),
+        "address2": _clean_string(address.address2),
+        "city": _clean_string(address.city),
+        "provinceCode": _clean_string(address.provinceCode or address.province),
+        "zip": _clean_string(address.zip),
+        "countryCode": (_clean_string(address.countryCode) or "US").upper(),
+        "phone": _clean_string(address.phone),
+    }
+    if not any(prepared.get(field) for field in ("address1", "address2", "city", "provinceCode", "zip")):
+        return None
+    return {key: value for key, value in prepared.items() if value not in (None, "")}
+
+
+def _prepare_customer_metafield(
+    metafield: CustomerMetafieldInput,
+    *,
+    owner_id: str,
+) -> Optional[Dict[str, Any]]:
+    namespace = (metafield.namespace or "pos").strip()
+    key = (metafield.key or "").strip()
+    metafield_type = (metafield.type or "single_line_text_field").strip()
+    value = _serialize_metafield_value(metafield.value, metafield_type)
+
+    if not namespace or not key or value is None:
+        return None
+
+    return {
+        "ownerId": owner_id,
+        "namespace": namespace,
+        "key": key,
+        "type": metafield_type,
+        "value": value,
+    }
+
+
+def _normalize_customer_email(value: Optional[str]) -> Optional[str]:
+    text = _clean_string(value)
+    if not text:
+        return None
+    email = text.lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return None
+    return email
+
+
+def _clean_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _is_customer_identity_conflict(details: Dict[str, Any]) -> bool:
+    for error in details.get("user_errors") or []:
+        code = str(error.get("code") or "").upper()
+        message = str(error.get("message") or "").lower()
+        if code in {"TAKEN", "CUSTOMER_ALREADY_EXISTS"}:
+            return True
+        if "already" in message or "taken" in message or "has already been" in message:
+            return True
+    return False
 
 
 def _prepare_product_metafield(

@@ -60,7 +60,7 @@ def get_settings() -> Settings:
         ).strip(),
         app_scopes=(
             os.getenv("APP_SCOPES")
-            or "read_products,write_products,read_inventory,write_inventory,read_locations"
+            or "read_products,write_products,read_inventory,write_inventory,read_locations,read_customers,write_customers"
         ).strip(),
         database_path=(os.getenv("DATABASE_PATH") or "inventory_sync.sqlite3").strip(),
         shopify_api_version=(os.getenv("SHOPIFY_API_VERSION") or "2026-01").strip(),

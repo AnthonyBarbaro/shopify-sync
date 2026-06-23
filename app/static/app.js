@@ -1026,6 +1026,8 @@ function renderSettings() {
           ${renderCopyRow("URL", state.connection?.base_url || "", state.connection?.base_url || "")}
           ${renderCopyRow("Path", state.connection?.product_sync_path || "", state.connection?.product_sync_path || "")}
           ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "", state.connection?.bulk_sync_path || "")}
+          ${renderCopyRow("Customer Path", state.connection?.customer_sync_path || "", state.connection?.customer_sync_path || "")}
+          ${renderCopyRow("Customer Batch Path", state.connection?.customer_bulk_sync_path || "", state.connection?.customer_bulk_sync_path || "")}
           ${renderCopyRow("Key", state.connection?.api_key || "", state.connection?.api_key || "")}
           ${renderCopyRow("Secret", visibleSecret, fullSecret)}
         </div>
@@ -1415,6 +1417,8 @@ function buildSimpleSettingsText() {
     `URL: ${state.connection?.base_url || ""}`,
     `Path: ${state.connection?.product_sync_path || ""}`,
     `Batch Path: ${state.connection?.bulk_sync_path || ""}`,
+    `Customer Path: ${state.connection?.customer_sync_path || ""}`,
+    `Customer Batch Path: ${state.connection?.customer_bulk_sync_path || ""}`,
     `Key: ${state.connection?.api_key || ""}`,
     `Secret: ${fullSecret || "ROTATE_CREDENTIALS_TO_REVEAL_FULL_SECRET"}`,
   ].join("\n")

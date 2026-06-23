@@ -39,6 +39,9 @@ from app.models import (
     BulkSyncResponse,
     CatalogResponse,
     ConnectionSettingsResponse,
+    CustomerBulkSyncResponse,
+    CustomerSyncRequest,
+    CustomerSyncResult,
     ErrorResponse,
     FeedEventsResponse,
     HealthResponse,
@@ -488,6 +491,10 @@ def build_connection_settings_response(
         product_sync_url=f"{base_url}/wc-api/v3/products",
         bulk_sync_path="/wc-api/v3/products/batch",
         bulk_sync_url=f"{base_url}/wc-api/v3/products/batch",
+        customer_sync_path="/wc-api/v3/customers",
+        customer_sync_url=f"{base_url}/wc-api/v3/customers",
+        customer_bulk_sync_path="/wc-api/v3/customers/batch",
+        customer_bulk_sync_url=f"{base_url}/wc-api/v3/customers/batch",
         api_key=credentials.api_key,
         api_secret=full_secret,
         api_secret_masked=credentials.api_secret_masked,
@@ -728,6 +735,93 @@ def normalize_external_bulk_payload(raw_payload: Any) -> List[ProductSyncRequest
         )
 
     return [normalize_external_product_payload(item) for item in items]
+
+
+def normalize_external_customer_payload(raw_payload: Any) -> CustomerSyncRequest:
+    if isinstance(raw_payload, CustomerSyncRequest):
+        return raw_payload
+    if not isinstance(raw_payload, dict):
+        raise SyncProcessingError(
+            "Customer payload must be a JSON object.",
+            {"received_type": type(raw_payload).__name__},
+            code="invalid_customer_payload",
+        )
+
+    key_lookup = _build_external_key_lookup(raw_payload)
+    normalized = {
+        "source": _string_or_none(_get_external_value(raw_payload, key_lookup, "source", "source_file")),
+        "pos_customer_number": _string_or_none(
+            _get_external_value(
+                raw_payload,
+                key_lookup,
+                "pos_customer_number",
+                "customer_number",
+                "customer number",
+                "cust_num",
+                "cust num",
+                "id",
+            )
+        ),
+        "firstName": _string_or_none(_get_external_value(raw_payload, key_lookup, "firstName", "first_name", "first name")),
+        "lastName": _string_or_none(_get_external_value(raw_payload, key_lookup, "lastName", "last_name", "last name")),
+        "email": _string_or_none(_get_external_value(raw_payload, key_lookup, "email", "internet")),
+        "phone": _string_or_none(_get_external_value(raw_payload, key_lookup, "phone", "phone_h", "phone_w")),
+        "company": _string_or_none(_get_external_value(raw_payload, key_lookup, "company")),
+        "tags": _normalize_tags(_get_external_value(raw_payload, key_lookup, "tags"), []),
+        "taxExempt": _as_bool(_get_external_value(raw_payload, key_lookup, "taxExempt", "tax_exempt", "tax exempt")),
+        "addresses": _normalize_customer_addresses(_get_external_value(raw_payload, key_lookup, "addresses", "address")),
+        "note": _string_or_none(_get_external_value(raw_payload, key_lookup, "note", "notes")),
+        "metafields": _normalize_metafield_inputs(
+            _get_external_value(raw_payload, key_lookup, "metafields", "metafield")
+        ),
+    }
+    return CustomerSyncRequest.model_validate(normalized)
+
+
+def normalize_external_customer_bulk_payload(raw_payload: Any) -> List[CustomerSyncRequest]:
+    if isinstance(raw_payload, list):
+        items = raw_payload
+    elif isinstance(raw_payload, dict):
+        if isinstance(raw_payload.get("customers"), list):
+            items = raw_payload["customers"]
+        elif isinstance(raw_payload.get("create"), list) or isinstance(raw_payload.get("update"), list):
+            items = list(raw_payload.get("create") or []) + list(raw_payload.get("update") or [])
+        else:
+            items = [raw_payload]
+    else:
+        raise SyncProcessingError(
+            "Customer bulk payload must be a JSON array or object.",
+            {"received_type": type(raw_payload).__name__},
+            code="invalid_customer_bulk_payload",
+        )
+
+    return [normalize_external_customer_payload(item) for item in items]
+
+
+def _normalize_customer_addresses(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, list) else [value]
+    addresses: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        key_lookup = _build_external_key_lookup(item)
+        addresses.append(
+            {
+                "firstName": _string_or_none(_get_external_value(item, key_lookup, "firstName", "first_name", "first name")),
+                "lastName": _string_or_none(_get_external_value(item, key_lookup, "lastName", "last_name", "last name")),
+                "company": _string_or_none(_get_external_value(item, key_lookup, "company")),
+                "address1": _string_or_none(_get_external_value(item, key_lookup, "address1", "address_1", "address")),
+                "address2": _string_or_none(_get_external_value(item, key_lookup, "address2", "address_2")),
+                "city": _string_or_none(_get_external_value(item, key_lookup, "city")),
+                "provinceCode": _string_or_none(_get_external_value(item, key_lookup, "provinceCode", "province_code", "state")),
+                "zip": _string_or_none(_get_external_value(item, key_lookup, "zip", "zipcode", "postal_code")),
+                "countryCode": _string_or_none(_get_external_value(item, key_lookup, "countryCode", "country_code", "country")) or "US",
+                "phone": _string_or_none(_get_external_value(item, key_lookup, "phone")),
+            }
+        )
+    return addresses
 
 
 def _query_payload_without_auth(request: Request) -> dict[str, Any]:
@@ -1943,6 +2037,81 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
     return result
 
 
+async def _handle_external_customer_sync(request: Request, shop: ShopRecord) -> CustomerSyncResult | JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    source = _feed_source_for_path(request.url.path)
+
+    if raw_payload is None:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "POS customer sync endpoint is reachable.",
+                "shop": shop.shop_domain,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "timestamp": utc_now_iso(),
+            }
+        )
+
+    normalized = normalize_external_customer_payload(raw_payload)
+    result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_customer(normalized, active_shop))
+    db.record_feed_event(
+        shop_domain=shop.shop_domain,
+        source=source,
+        endpoint=request.url.path,
+        method=request.method,
+        sku=normalized.pos_customer_number,
+        title=result.name,
+        success=result.success,
+        message=result.message,
+        product_id=result.customer_id,
+        variant_id=None,
+        request_payload=_serialize_payload(raw_payload),
+        normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+    )
+    return result
+
+
+async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord) -> CustomerBulkSyncResponse | JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    source = _feed_source_for_path(request.url.path)
+
+    if raw_payload is None:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "POS customer bulk sync endpoint is reachable.",
+                "shop": shop.shop_domain,
+                "method": request.method.upper(),
+                "path": request.url.path,
+                "timestamp": utc_now_iso(),
+            }
+        )
+
+    normalized_items = normalize_external_customer_bulk_payload(raw_payload)
+    result = run_with_shop_retry(
+        shop,
+        lambda active_shop: inventory_service.sync_customers_bulk(normalized_items, active_shop),
+    )
+    normalized_json = _serialize_payload([item.model_dump(mode="json") for item in normalized_items])
+    for row in result.results:
+        db.record_feed_event(
+            shop_domain=shop.shop_domain,
+            source=source,
+            endpoint=request.url.path,
+            method=request.method,
+            sku=row.pos_customer_number,
+            title=row.name,
+            success=row.success,
+            message=row.message,
+            product_id=row.customer_id,
+            variant_id=None,
+            request_payload=_serialize_payload(raw_payload),
+            normalized_payload=normalized_json,
+        )
+    return result
+
+
 def _load_woo_catalog_for_shop(shop: ShopRecord) -> list[Any]:
     return run_with_shop_retry(shop, lambda active_shop: inventory_service.list_woo_catalog(active_shop))
 
@@ -2129,6 +2298,32 @@ async def sync_bulk(
 
 
 @app.api_route(
+    "/sync/customer",
+    methods=["GET", "POST"],
+    response_model=None,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+async def sync_customer(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> CustomerSyncResult | JSONResponse:
+    return await _handle_external_customer_sync(request, shop)
+
+
+@app.api_route(
+    "/sync/customers",
+    methods=["GET", "POST"],
+    response_model=None,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+async def sync_customers(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> CustomerBulkSyncResponse | JSONResponse:
+    return await _handle_external_customer_bulk_sync(request, shop)
+
+
+@app.api_route(
     "/wc-api/v3/products",
     methods=["GET", "POST"],
     response_model=None,
@@ -2220,6 +2415,68 @@ async def woo_products_batch(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> BulkSyncResponse | JSONResponse:
     return await _handle_external_bulk_sync(request, shop)
+
+
+@app.api_route(
+    "/wc-api/v3/customers",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wc-api/v3/customers/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/customers",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/customers/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_customers(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> CustomerSyncResult | JSONResponse:
+    return await _handle_external_customer_sync(request, shop)
+
+
+@app.api_route(
+    "/wc-api/v3/customers/batch",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wc-api/v3/customers/batch/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/customers/batch",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+@app.api_route(
+    "/wp-json/wc/v3/customers/batch/",
+    methods=["GET", "POST"],
+    response_model=None,
+    include_in_schema=False,
+)
+async def woo_customers_batch(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> CustomerBulkSyncResponse | JSONResponse:
+    return await _handle_external_customer_bulk_sync(request, shop)
 
 
 @app.api_route(

@@ -23,6 +23,48 @@ class ProductMetafieldInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class CustomerAddressInput(BaseModel):
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    company: Optional[str] = None
+    address1: Optional[str] = None
+    address2: Optional[str] = None
+    city: Optional[str] = None
+    provinceCode: Optional[str] = None
+    province: Optional[str] = None
+    zip: Optional[str] = None
+    countryCode: Optional[str] = "US"
+    phone: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class CustomerMetafieldInput(BaseModel):
+    namespace: str = "pos"
+    key: str = Field(min_length=1)
+    value: Any
+    type: str = "single_line_text_field"
+
+    model_config = ConfigDict(extra="allow")
+
+
+class CustomerSyncRequest(BaseModel):
+    source: Optional[str] = None
+    pos_customer_number: Optional[str] = None
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    taxExempt: Optional[bool] = None
+    addresses: List[CustomerAddressInput] = Field(default_factory=list)
+    note: Optional[str] = None
+    metafields: List[CustomerMetafieldInput] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ProductSyncRequest(BaseModel):
     sku: Optional[str] = Field(default=None, min_length=1)
     title: Optional[str] = None
@@ -95,6 +137,28 @@ class BulkSyncResponse(BaseModel):
     results: List[SyncResult]
 
 
+class CustomerSyncResult(BaseModel):
+    shop_domain: Optional[str] = None
+    pos_customer_number: Optional[str] = None
+    source: Optional[str] = None
+    success: bool
+    message: str
+    timestamp: str
+    customer_id: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    name: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CustomerBulkSyncResponse(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    timestamp: str
+    results: List[CustomerSyncResult]
+
+
 class HealthResponse(BaseModel):
     status: str
     api_version: str
@@ -124,6 +188,10 @@ class ConnectionSettingsResponse(BaseModel):
     product_sync_url: str
     bulk_sync_path: str
     bulk_sync_url: str
+    customer_sync_path: str
+    customer_sync_url: str
+    customer_bulk_sync_path: str
+    customer_bulk_sync_url: str
     api_key: str
     api_secret: Optional[str] = None
     api_secret_masked: str
