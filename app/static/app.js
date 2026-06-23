@@ -20,6 +20,7 @@ const state = {
   shopifyHealth: null,
   singleResult: null,
   bulkResult: null,
+  loadErrors: {},
   isSubmittingSingle: false,
   isSubmittingBulk: false,
   isRotatingCredentials: false,
@@ -136,15 +137,7 @@ document.addEventListener("submit", async (event) => {
 })
 
 async function boot() {
-  await Promise.all([
-    loadUiConfig(),
-    loadConnection(),
-    loadHealth(),
-    loadActivity(),
-    loadCatalog(),
-    loadFeed(),
-    loadRequestLogs(),
-  ])
+  await loadInitialData()
   render()
 
   window.setInterval(async () => {
@@ -156,6 +149,30 @@ async function boot() {
       console.error(error)
     }
   }, 20000)
+}
+
+async function loadInitialData() {
+  const loaders = [
+    ["config", loadUiConfig],
+    ["connection", loadConnection],
+    ["health", loadHealth],
+    ["activity", loadActivity],
+    ["catalog", loadCatalog],
+    ["feed", loadFeed],
+    ["requestLogs", loadRequestLogs],
+  ]
+
+  await Promise.all(loaders.map(([key, loader]) => loadOptional(key, loader)))
+}
+
+async function loadOptional(key, loader) {
+  try {
+    await loader()
+    delete state.loadErrors[key]
+  } catch (error) {
+    state.loadErrors[key] = normalizeError(error)
+    console.error(`${key} load failed`, error)
+  }
 }
 
 async function loadUiConfig() {
@@ -407,6 +424,7 @@ function renderHero(route) {
   const latestRequest = getLatestRequest()
   const requestIssues = getFailedRequestCount()
   const storeName = state.config?.shop_name || state.config?.shop || "Loading store"
+  const apiReady = state.health?.status === "ok"
 
   return `
     <section class="hero">
@@ -417,7 +435,7 @@ function renderHero(route) {
           <p>${routeDescription(route)}</p>
         </div>
         <div class="pill-row">
-          <span class="pill ${state.health?.status === "ok" ? "success" : "danger"}">API ${state.health?.status === "ok" ? "ready" : "error"}</span>
+          <span class="pill ${apiReady ? "success" : state.loadErrors.health ? "danger" : "warning"}">API ${apiReady ? "ready" : state.loadErrors.health ? "error" : "loading"}</span>
           <span class="pill">${escapeHtml(storeName)}</span>
           <span class="pill ${embedded ? "success" : "warning"}">${embedded ? "Inside Shopify" : "Browser preview"}</span>
         </div>
@@ -967,8 +985,11 @@ function renderCatalog() {
 function renderSettings() {
   const fullSecret = state.connection?.api_secret || ""
   const visibleSecret = fullSecret || state.connection?.api_secret_masked || ""
+  const connectionError = state.loadErrors.connection
   const secretNotice = fullSecret
     ? `<div class="notice success">The full POS secret is available here. Keep it private and use Copy or Copy all for the exact value.</div>`
+    : connectionError
+      ? `<div class="notice danger">Settings could not load: ${escapeHtml(connectionError.message)}${connectionError.code ? ` (${escapeHtml(connectionError.code)})` : ""}</div>`
     : `<div class="notice warning">Only a masked secret preview is available. Generate a new key + secret to copy a full secret.</div>`
 
   return `
@@ -989,10 +1010,10 @@ function renderSettings() {
         </div>
         ${secretNotice}
         <div class="copy-stack">
-          ${renderCopyRow("URL", state.connection?.base_url || "")}
-          ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
-          ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "")}
-          ${renderCopyRow("Key", state.connection?.api_key || "")}
+          ${renderCopyRow("URL", state.connection?.base_url || "", state.connection?.base_url || "")}
+          ${renderCopyRow("Path", state.connection?.product_sync_path || "", state.connection?.product_sync_path || "")}
+          ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "", state.connection?.bulk_sync_path || "")}
+          ${renderCopyRow("Key", state.connection?.api_key || "", state.connection?.api_key || "")}
           ${renderCopyRow("Secret", visibleSecret, fullSecret)}
         </div>
       </article>

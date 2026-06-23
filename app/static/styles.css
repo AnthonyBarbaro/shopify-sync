@@ -571,6 +571,12 @@ code {
   border-color: rgba(155, 101, 8, 0.12);
 }
 
+.notice.danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: rgba(193, 65, 45, 0.16);
+}
+
 .setting-row {
   display: grid;
   grid-template-columns: 132px minmax(0, 1fr);
