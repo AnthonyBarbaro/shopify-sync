@@ -30,8 +30,6 @@ app/
 requirements.txt
 .env.example
 POS_CONNECTOR_GUIDE.md
-jbarbaro_db/dbf_pos_sync.py
-jbarbaro_db/DBF_PATH_SYNC.md
 ```
 
 ## Requirements
@@ -139,8 +137,6 @@ GET /api/request-logs.csv
 Use the shareable connector guide here:
 
 [POS_CONNECTOR_GUIDE.md](https://github.com/AnthonyBarbaro/shopify-sync/blob/main/POS_CONNECTOR_GUIDE.md)
-
-For local DBF-file imports from a host computer, see [jbarbaro_db/DBF_PATH_SYNC.md](jbarbaro_db/DBF_PATH_SYNC.md).
 
 Recommended POS path:
 
