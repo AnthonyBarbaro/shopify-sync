@@ -74,6 +74,7 @@ class ProductSyncRequest(BaseModel):
     description_html: Optional[str] = None
     description: Optional[str] = None
     short_description: Optional[str] = None
+    update_description: bool = False
     vendor: Optional[str] = None
     brand: Optional[str] = None
     product_type: Optional[str] = None

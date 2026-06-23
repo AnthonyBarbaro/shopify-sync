@@ -666,6 +666,17 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
         "short_description": _string_or_none(
             _get_external_value(raw_payload, key_lookup, "short_description", "short description")
         ),
+        "update_description": _as_bool(
+            _get_external_value(
+                raw_payload,
+                key_lookup,
+                "update_description",
+                "update description",
+                "overwrite_description",
+                "overwrite description",
+            )
+        )
+        or False,
         "vendor": _string_or_none(_get_external_value(raw_payload, key_lookup, "vendor", "brand")),
         "brand": _string_or_none(_get_external_value(raw_payload, key_lookup, "brand")),
         "product_type": product_type,

@@ -520,6 +520,11 @@ class InventorySyncService:
                 "requested_price": payload.price,
                 "requested_cost": payload.cost,
                 "requested_quantity": payload.quantity,
+                "description_update_skipped": (
+                    not created
+                    and not payload.update_description
+                    and bool(payload.description_html or payload.description or payload.short_description)
+                ),
             },
         )
 
@@ -622,7 +627,7 @@ class InventorySyncService:
         if payload.handle:
             product_update["handle"] = payload.handle
         description_html = payload.description_html or payload.description or payload.short_description
-        if description_html:
+        if payload.update_description and description_html:
             product_update["descriptionHtml"] = description_html
         vendor = payload.vendor or payload.brand
         if vendor:
