@@ -65,6 +65,9 @@ class ShopifyClient:
                   price
                   inventoryItem {
                     id
+                    unitCost {
+                      amount
+                    }
                     inventoryLevels(first: 10) {
                       nodes {
                         location {
@@ -131,6 +134,9 @@ class ShopifyClient:
               }
               inventoryItem {
                 id
+                unitCost {
+                  amount
+                }
                 inventoryLevels(first: 25) {
                   nodes {
                     location {
@@ -208,6 +214,9 @@ class ShopifyClient:
                   price
                   inventoryItem {
                     id
+                    unitCost {
+                      amount
+                    }
                     inventoryLevels(first: 10) {
                       nodes {
                         location {
@@ -274,6 +283,9 @@ class ShopifyClient:
                   price
                   inventoryItem {
                     id
+                    unitCost {
+                      amount
+                    }
                     inventoryLevels(first: 10) {
                       nodes {
                         location {
@@ -388,6 +400,9 @@ class ShopifyClient:
                   compareAtPrice
                   inventoryItem {
                     id
+                    unitCost {
+                      amount
+                    }
                     inventoryLevels(first: 25) {
                       nodes {
                         location {
@@ -519,6 +534,9 @@ class ShopifyClient:
               compareAtPrice
               inventoryItem {
                 id
+                unitCost {
+                  amount
+                }
               }
             }
             userErrors {
@@ -591,6 +609,54 @@ class ShopifyClient:
                 )
             updated.extend(result.get("metafields") or [])
         return updated
+
+    def update_inventory_item_cost(
+        self,
+        shop_domain: str,
+        access_token: str,
+        inventory_item_id: str,
+        cost: float,
+    ) -> Dict[str, Any]:
+        normalized_inventory_item_id = normalize_gid("InventoryItem", inventory_item_id)
+        formatted_cost = format_price(cost)
+        mutation = """
+        mutation UpdateInventoryItemCost($id: ID!, $input: InventoryItemInput!) {
+          inventoryItemUpdate(id: $id, input: $input) {
+            inventoryItem {
+              id
+              unitCost {
+                amount
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "id": normalized_inventory_item_id,
+                "input": {"cost": float(formatted_cost)},
+            },
+            operation_name="UpdateInventoryItemCost",
+        )
+        result = payload["data"]["inventoryItemUpdate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the inventory item cost update.",
+                {
+                    "inventory_item_id": normalized_inventory_item_id,
+                    "cost": float(formatted_cost),
+                    "user_errors": user_errors,
+                },
+            )
+        return result.get("inventoryItem") or {}
 
     def update_variant_price(
         self,
@@ -963,6 +1029,7 @@ class ShopifyClient:
         *,
         sku: str,
         price: float,
+        cost: Optional[float],
         quantity: int,
         location_id: str,
     ) -> None:
@@ -995,6 +1062,7 @@ class ShopifyClient:
             )
 
         cached.current_price = float(format_price(price))
+        cached.current_cost = float(format_price(cost)) if cost is not None else None
         cached.inventory_levels = updated_levels
         self._set_cached_variant(shop_domain, cached)
 
@@ -1168,8 +1236,20 @@ def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
         product_id=node["product"]["id"],
         inventory_item_id=inventory_item["id"],
         current_price=float(node["price"]) if node.get("price") is not None else None,
+        current_cost=_extract_unit_cost(inventory_item),
         inventory_levels=levels,
     )
+
+
+def _extract_unit_cost(inventory_item: Dict[str, Any]) -> Optional[float]:
+    unit_cost = inventory_item.get("unitCost") or {}
+    amount = unit_cost.get("amount")
+    if amount in (None, ""):
+        return None
+    try:
+        return float(amount)
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_sku_search_query(sku: str) -> str:

@@ -53,6 +53,7 @@ class InventorySyncService:
                 message=str(exc),
                 timestamp=utc_now_iso(),
                 price=normalized.price,
+                cost=normalized.cost,
                 quantity=normalized.quantity,
                 details=details,
             )
@@ -79,6 +80,7 @@ class InventorySyncService:
             product_id=result.product_id,
             location_id=result.location_id,
             price_updated=result.price_updated,
+            cost_updated=result.cost_updated,
             inventory_updated=result.inventory_updated,
             title=result.details.get("product_title"),
             created=result.details.get("created"),
@@ -111,6 +113,7 @@ class InventorySyncService:
                         message=str(exc),
                         timestamp=utc_now_iso(),
                         price=normalized.price,
+                        cost=normalized.cost,
                         quantity=normalized.quantity,
                         details=details,
                     )
@@ -139,13 +142,16 @@ class InventorySyncService:
                 sku = None
                 barcode = None
                 price = None
+                cost = None
 
                 if variant is not None:
                     variant_id = variant.get("id")
                     sku = variant.get("sku")
                     barcode = variant.get("barcode")
                     price = _safe_float(variant.get("price"))
-                    quantity = _extract_available_quantity(variant.get("inventoryItem") or {})
+                    inventory_item = variant.get("inventoryItem") or {}
+                    cost = _extract_unit_cost(inventory_item)
+                    quantity = _extract_available_quantity(inventory_item)
 
                 rows.append(
                     CatalogProductRecord(
@@ -157,6 +163,7 @@ class InventorySyncService:
                         sku=sku,
                         barcode=barcode,
                         price=price,
+                        cost=cost,
                         quantity=quantity,
                         vendor=product.get("vendor"),
                         product_type=product.get("productType"),
@@ -193,6 +200,7 @@ class InventorySyncService:
         product_title = payload.title or payload.sku or "POS Imported Product"
         mapping = existing_mapping
         price_updated = False
+        cost_updated = False
         inventory_updated = False
         product_status = None
 
@@ -232,6 +240,15 @@ class InventorySyncService:
                 code="variant_resolution_failed",
             )
 
+        if payload.cost is not None and _money_changed(mapping.current_cost, payload.cost):
+            self.shopify_client.update_inventory_item_cost(
+                shop.shop_domain,
+                shop.access_token,
+                mapping.inventory_item_id,
+                payload.cost,
+            )
+            cost_updated = True
+
         metafield_inputs = self._build_metafield_inputs(payload, mapping.product_id)
         if metafield_inputs:
             self.shopify_client.set_product_metafields(
@@ -261,6 +278,7 @@ class InventorySyncService:
                 shop.shop_domain,
                 sku=payload.sku,
                 price=cached_price,
+                cost=payload.cost if payload.cost is not None else mapping.current_cost,
                 quantity=cached_quantity,
                 location_id=location_id,
             )
@@ -276,8 +294,10 @@ class InventorySyncService:
             inventory_item_id=inventory_item_id,
             location_id=normalize_gid("Location", location_id),
             price_updated=price_updated,
+            cost_updated=cost_updated,
             inventory_updated=inventory_updated,
             price=payload.price,
+            cost=payload.cost,
             quantity=payload.quantity,
             details={
                 "created": created,
@@ -286,6 +306,7 @@ class InventorySyncService:
                 "image_count": len(media_inputs),
                 "metafield_count": len(metafield_inputs),
                 "requested_price": payload.price,
+                "requested_cost": payload.cost,
                 "requested_quantity": payload.quantity,
             },
         )
@@ -570,6 +591,7 @@ class InventorySyncService:
             product_id=product["id"],
             inventory_item_id=inventory_item["id"],
             current_price=_safe_float(target_variant.get("price")),
+            current_cost=_extract_unit_cost(inventory_item),
             inventory_levels=levels,
         )
 
@@ -635,13 +657,16 @@ class InventorySyncService:
         variant_sku = None
         barcode = None
         price = None
+        cost = None
 
         if target_variant is not None:
             variant_id = target_variant.get("id")
             variant_sku = target_variant.get("sku")
             barcode = target_variant.get("barcode")
             price = _safe_float(target_variant.get("price"))
-            quantity = _extract_available_quantity(target_variant.get("inventoryItem") or {})
+            inventory_item = target_variant.get("inventoryItem") or {}
+            cost = _extract_unit_cost(inventory_item)
+            quantity = _extract_available_quantity(inventory_item)
 
         return CatalogProductRecord(
             product_id=product["id"],
@@ -652,6 +677,7 @@ class InventorySyncService:
             sku=variant_sku,
             barcode=barcode,
             price=price,
+            cost=cost,
             quantity=quantity,
             vendor=product.get("vendor"),
             product_type=product.get("productType"),
@@ -711,6 +737,17 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _money_changed(current: Optional[float], requested: float) -> bool:
+    if current is None:
+        return True
+    return format_price(current) != format_price(requested)
+
+
+def _extract_unit_cost(inventory_item: Dict[str, Any]) -> Optional[float]:
+    unit_cost = inventory_item.get("unitCost") or {}
+    return _safe_float(unit_cost.get("amount"))
 
 
 def _extract_available_quantity(inventory_item: Dict[str, Any]) -> Optional[int]:

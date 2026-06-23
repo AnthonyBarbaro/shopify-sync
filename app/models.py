@@ -40,6 +40,7 @@ class ProductSyncRequest(BaseModel):
     barcode: Optional[str] = None
     price: Optional[float] = Field(default=None, ge=0)
     compare_at_price: Optional[float] = Field(default=None, ge=0)
+    cost: Optional[float] = Field(default=None, ge=0)
     quantity: Optional[int] = Field(default=None, ge=0)
     tracked: Optional[bool] = True
     requires_shipping: Optional[bool] = True
@@ -63,6 +64,7 @@ class VariantMapping(BaseModel):
     product_id: str
     inventory_item_id: str
     current_price: Optional[float] = None
+    current_cost: Optional[float] = None
     inventory_levels: List[InventoryLevelSnapshot] = Field(default_factory=list)
 
 
@@ -77,8 +79,10 @@ class SyncResult(BaseModel):
     inventory_item_id: Optional[str] = None
     location_id: Optional[str] = None
     price_updated: bool = False
+    cost_updated: bool = False
     inventory_updated: bool = False
     price: Optional[float] = None
+    cost: Optional[float] = None
     quantity: Optional[int] = None
     details: Dict[str, Any] = Field(default_factory=dict)
 
@@ -165,6 +169,7 @@ class CatalogProductRecord(BaseModel):
     sku: Optional[str] = None
     barcode: Optional[str] = None
     price: Optional[float] = None
+    cost: Optional[float] = None
     quantity: Optional[int] = None
     vendor: Optional[str] = None
     product_type: Optional[str] = None

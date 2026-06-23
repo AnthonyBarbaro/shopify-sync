@@ -37,6 +37,7 @@ const sampleBulkPayload = JSON.stringify(
       sku: "ABC123",
       barcode: "012345678905",
       regular_price: "19.99",
+      cost: "8.50",
       stock_quantity: 10,
       status: "draft",
       vendor: "POS Company",
@@ -47,6 +48,7 @@ const sampleBulkPayload = JSON.stringify(
       name: "Canvas Hat",
       sku: "DEF456",
       regular_price: "24.99",
+      cost: "11.25",
       stock_quantity: 5,
       status: "draft",
     },
@@ -235,6 +237,7 @@ async function submitSingle(form) {
     sku: String(formData.get("sku") || "").trim(),
     barcode: String(formData.get("barcode") || "").trim(),
     price: coerceNumber(formData.get("price")),
+    cost: coerceNumber(formData.get("cost")),
     quantity: coerceInteger(formData.get("quantity")),
     image_url: String(formData.get("image_url") || "").trim(),
     vendor: String(formData.get("vendor") || "").trim(),
@@ -605,6 +608,10 @@ function renderProductSync() {
             <input id="price" name="price" type="number" step="0.01" min="0" placeholder="19.99" />
           </div>
           <div class="field">
+            <label for="cost">Cost</label>
+            <input id="cost" name="cost" type="number" step="0.01" min="0" placeholder="8.50" />
+          </div>
+          <div class="field">
             <label for="quantity">Quantity</label>
             <input id="quantity" name="quantity" type="number" step="1" min="0" placeholder="10" />
           </div>
@@ -686,6 +693,10 @@ function renderProductSync() {
             <span><code>regular_price</code> or <code>price</code> updates the matching variant.</span>
           </div>
           <div class="setting-row">
+            <strong>Cost</strong>
+            <span><code>cost</code>, <code>cost_price</code>, or <code>unit_cost</code> updates Shopify cost per item.</span>
+          </div>
+          <div class="setting-row">
             <strong>Inventory</strong>
             <span><code>stock_quantity</code> or <code>quantity</code> sets on-hand inventory after sync.</span>
           </div>
@@ -745,7 +756,7 @@ function renderPosArchive() {
           <div>
             <div class="section-kicker">Safety</div>
             <h3>What gets synced</h3>
-            <p>Product sync uses SKU, title, barcode, price, quantity, vendor, type, tags, and POS product metafields. Customer and payment data remain archive-only.</p>
+            <p>Product sync uses SKU, title, barcode, price, cost, quantity, vendor, type, tags, and POS product metafields. Customer and payment data remain archive-only.</p>
           </div>
         </div>
         ${(analysis?.notes || [
@@ -875,6 +886,7 @@ function renderPosProductPreview(items) {
             <th>SKU</th>
             <th>Vendor</th>
             <th>Price</th>
+            <th>Cost</th>
             <th>Qty</th>
           </tr>
         </thead>
@@ -890,6 +902,7 @@ function renderPosProductPreview(items) {
               <td>${escapeHtml(item.sku || "—")}</td>
               <td>${escapeHtml(item.vendor || "—")}</td>
               <td>${escapeHtml(item.price ?? "—")}</td>
+              <td>${escapeHtml(item.cost ?? "—")}</td>
               <td>${escapeHtml(item.quantity ?? "—")}</td>
             </tr>
           `).join("")}
@@ -1086,6 +1099,7 @@ function renderSingleResult() {
       ["SKU", result.sku],
       ["Status", result.details?.product_status || "Unknown"],
       ["Price", result.price ?? "—"],
+      ["Cost", result.cost ?? "—"],
       ["Quantity", result.quantity ?? "—"],
       ["Message", result.message],
     ])
@@ -1270,6 +1284,7 @@ function renderCatalogTable() {
             <th>SKU</th>
             <th>Status</th>
             <th>Price</th>
+            <th>Cost</th>
             <th>Qty</th>
           </tr>
         </thead>
@@ -1285,6 +1300,7 @@ function renderCatalogTable() {
               <td>${escapeHtml(item.sku || "—")}</td>
               <td>${renderStatusBadge(item.status || "—", toneForProductStatus(item.status))}</td>
               <td>${escapeHtml(item.price ?? "—")}</td>
+              <td>${escapeHtml(item.cost ?? "—")}</td>
               <td>${escapeHtml(item.quantity ?? "—")}</td>
             </tr>
           `).join("")}

@@ -478,6 +478,7 @@ def build_product_payload(
     product_type = GROUP_PRODUCT_TYPE_MAP.get((department or "").upper()) or title_case(clean_text(row.get("PFIELD1")) or department or "")
     price = decimal_or_none(row.get("PRICE"))
     compare_at = choose_compare_at_price(row, price)
+    cost = first_decimal(row.get("COST"), row.get("LAST_COST"), row.get("VEND_COST"), row.get("BASE_COST"), vendor_item_row.get("BASE_COST"))
     item_quantity = decimal_or_none(row.get("QTY"))
     itemmqty_quantity = quantity_lookup.get(sku)
     quantity = decimal_to_quantity(max([value for value in (item_quantity, itemmqty_quantity) if value is not None], default=Decimal("0")))
@@ -493,6 +494,7 @@ def build_product_payload(
         "barcode": barcode,
         "price": decimal_to_price(price),
         "compare_at_price": decimal_to_price(compare_at),
+        "cost": decimal_to_price(cost),
         "quantity": quantity,
         "qty": quantity,
         "stock_quantity": quantity,
@@ -522,6 +524,14 @@ def choose_compare_at_price(row: Dict[str, Any], price: Optional[Decimal]) -> Op
         if value is not None and price < value <= price * Decimal("3"):
             candidates.append(value)
     return max(candidates) if candidates else None
+
+
+def first_decimal(*values: Any) -> Optional[Decimal]:
+    for value in values:
+        decimal_value = decimal_or_none(value)
+        if decimal_value is not None:
+            return decimal_value
+    return None
 
 
 def build_title(*, raw_desc: str, vendor_name: Optional[str], product_type: Optional[str], size: Optional[str], color: Optional[str]) -> str:

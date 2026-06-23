@@ -503,6 +503,7 @@ def build_connection_settings_response(
             "sku": "ABC123",
             "barcode": "012345678905",
             "regular_price": "19.99",
+            "cost": "8.50",
             "stock_quantity": 10,
             "status": "draft",
             "description": "<p>Imported from POS</p>",
@@ -515,6 +516,7 @@ def build_connection_settings_response(
                 "name": "Classic Tee",
                 "sku": "ABC123",
                 "regular_price": "19.99",
+                "cost": "8.50",
                 "stock_quantity": 10,
                 "status": "draft",
             },
@@ -522,6 +524,7 @@ def build_connection_settings_response(
                 "name": "Canvas Hat",
                 "sku": "DEF456",
                 "regular_price": "24.99",
+                "cost": "11.25",
                 "stock_quantity": 5,
                 "status": "draft",
             },
@@ -680,6 +683,20 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
         "compare_at_price": _as_float(_get_external_value(raw_payload, key_lookup, "compare_at_price", "sale_price", "sugg retail", "sugg. retail", "suggested retail"))
         if _get_external_value(raw_payload, key_lookup, "compare_at_price", "sale_price", "sugg retail", "sugg. retail", "suggested retail") not in (None, "")
         else None,
+        "cost": _as_float(
+            _get_external_value(
+                raw_payload,
+                key_lookup,
+                "cost",
+                "cost_price",
+                "cost price",
+                "unit_cost",
+                "unit cost",
+                "cost per item",
+                "our cost",
+                "item cost",
+            )
+        ),
         "quantity": quantity,
         "tracked": _as_bool(_get_external_value(raw_payload, key_lookup, "tracked"))
         if _get_external_value(raw_payload, key_lookup, "tracked") not in (None, "")
@@ -1362,6 +1379,7 @@ async def catalog_csv(request: Request) -> StreamingResponse:
             "sku",
             "barcode",
             "price",
+            "cost",
             "quantity",
             "vendor",
             "product_type",
@@ -1380,6 +1398,7 @@ async def catalog_csv(request: Request) -> StreamingResponse:
                 item.sku or "",
                 item.barcode or "",
                 item.price if item.price is not None else "",
+                item.cost if item.cost is not None else "",
                 item.quantity if item.quantity is not None else "",
                 item.vendor or "",
                 item.product_type or "",
@@ -1767,6 +1786,9 @@ def _looks_like_product_mutation(raw_payload: Any) -> bool:
         "price",
         "regular_price",
         "sale_price",
+        "cost",
+        "cost_price",
+        "unit_cost",
         "quantity",
         "stock_quantity",
         "barcode",
