@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 .venv/
+jbarbaro_db
+.codex
+ashpsdat
+ashpsdat.zip
+pos_archives

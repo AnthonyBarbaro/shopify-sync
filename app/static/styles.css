@@ -436,7 +436,8 @@ code {
 }
 
 .field input,
-.field textarea {
+.field textarea,
+.compact-input {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -454,13 +455,31 @@ code {
   font-size: 0.9rem;
 }
 
+.compact-input {
+  width: 82px;
+  min-height: 42px;
+  padding: 9px 10px;
+  background: var(--surface-soft);
+}
+
+.checkbox-row {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 0.86rem;
+}
+
 .field input::placeholder,
 .field textarea::placeholder {
   color: #8b98a4;
 }
 
 .field input:focus,
-.field textarea:focus {
+.field textarea:focus,
+.compact-input:focus {
   outline: none;
   background: var(--surface-strong);
   border-color: rgba(35, 77, 130, 0.42);

@@ -1,6 +1,7 @@
 const routeTitles = {
   "/app": "Overview",
   "/app/product-sync": "Product Sync",
+  "/app/pos-archive": "POS Archive",
   "/app/catalog": "Catalog",
   "/app/settings": "Settings",
 }
@@ -13,6 +14,9 @@ const state = {
   catalog: { total: 0, items: [] },
   feed: { total: 0, items: [] },
   requestLogs: { total: 0, items: [] },
+  posArchive: null,
+  posPreview: null,
+  posSyncResult: null,
   shopifyHealth: null,
   singleResult: null,
   bulkResult: null,
@@ -20,6 +24,9 @@ const state = {
   isSubmittingBulk: false,
   isRotatingCredentials: false,
   isTestingShopify: false,
+  isAnalyzingArchive: false,
+  isUploadingArchive: false,
+  isSyncingArchive: false,
 }
 
 const sampleBulkPayload = JSON.stringify(
@@ -82,7 +89,23 @@ document.addEventListener("click", async (event) => {
   if (copyButton) {
     event.preventDefault()
     await copyValue(copyButton.getAttribute("data-copy"))
+    return
   }
+
+  const analyzeArchiveButton = event.target.closest("[data-analyze-pos-archive]")
+  if (analyzeArchiveButton) {
+    event.preventDefault()
+    await loadPosArchive()
+    return
+  }
+
+  const previewArchiveButton = event.target.closest("[data-preview-pos-products]")
+  if (previewArchiveButton) {
+    event.preventDefault()
+    await loadPosProductPreview()
+    return
+  }
+
 })
 
 document.addEventListener("submit", async (event) => {
@@ -97,6 +120,18 @@ document.addEventListener("submit", async (event) => {
   if (form.matches("[data-bulk-form]")) {
     event.preventDefault()
     await submitBulk(form)
+    return
+  }
+
+  if (form.matches("[data-pos-upload-form]")) {
+    event.preventDefault()
+    await uploadPosArchive(form)
+    return
+  }
+
+  if (form.matches("[data-pos-sync-form]")) {
+    event.preventDefault()
+    await syncPosProducts(form)
   }
 })
 
@@ -261,6 +296,95 @@ async function rotateCredentials() {
   }
 }
 
+async function loadPosArchive() {
+  state.isAnalyzingArchive = true
+  render()
+
+  try {
+    state.posArchive = await fetchJson("/api/pos-archive/analyze")
+    state.posPreview = {
+      total: state.posArchive.product_preview?.length || 0,
+      items: state.posArchive.product_preview || [],
+    }
+    showToast("POS archive analyzed.", "success")
+  } catch (error) {
+    showToast(error.message || "POS archive analysis failed.", "error")
+  } finally {
+    state.isAnalyzingArchive = false
+    render()
+  }
+}
+
+async function uploadPosArchive(form) {
+  state.isUploadingArchive = true
+  render()
+
+  try {
+    const formData = new FormData(form)
+    const result = await fetchJson("/api/pos-archive/upload", {
+      method: "POST",
+      body: formData,
+    })
+    state.posArchive = result.analysis
+    state.posPreview = {
+      total: result.analysis.product_preview?.length || 0,
+      items: result.analysis.product_preview || [],
+    }
+    showToast("POS archive uploaded and analyzed.", "success")
+  } catch (error) {
+    showToast(error.message || "Archive upload failed.", "error")
+  } finally {
+    state.isUploadingArchive = false
+    render()
+  }
+}
+
+async function loadPosProductPreview() {
+  state.isAnalyzingArchive = true
+  render()
+
+  try {
+    state.posPreview = await fetchJson("/api/pos-archive/products/preview?limit=25")
+    showToast("Loaded product preview.", "success")
+  } catch (error) {
+    showToast(error.message || "Product preview failed.", "error")
+  } finally {
+    state.isAnalyzingArchive = false
+    render()
+  }
+}
+
+async function syncPosProducts(form) {
+  const formData = new FormData(form)
+  const limit = Math.min(Math.max(coerceInteger(formData.get("limit")) || 25, 1), 250)
+  const offset = Math.max(coerceInteger(formData.get("offset")) || 0, 0)
+  const includeZeroQuantity = formData.get("include_zero_quantity") === "on"
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    include_zero_quantity: includeZeroQuantity ? "true" : "false",
+  })
+  const confirmed = window.confirm(`Sync ${limit} POS products from offset ${offset} to Shopify by SKU? New products will be drafts.`)
+  if (!confirmed) return
+
+  state.isSyncingArchive = true
+  render()
+
+  try {
+    state.posSyncResult = await fetchJson(`/api/pos-archive/products/sync?${params.toString()}`, {
+      method: "POST",
+    })
+    await Promise.all([loadActivity(), loadCatalog(), loadFeed()])
+    showToast("POS product sync finished.", "success")
+  } catch (error) {
+    state.posSyncResult = { error: normalizeError(error) }
+    showToast(error.message || "POS product sync failed.", "error")
+  } finally {
+    state.isSyncingArchive = false
+    render()
+  }
+}
+
 function render() {
   const app = document.getElementById("app")
   if (!app) return
@@ -310,6 +434,7 @@ function renderHero(route) {
 
 function routeDescription(route) {
   if (route === "/app/product-sync") return "Create draft products from POS payloads or update matching Shopify SKUs with price, quantity, barcode, and image data."
+  if (route === "/app/pos-archive") return "Upload or inspect the old POS DBF archive, preview product data, and sync Shopify-ready rows when you are ready."
   if (route === "/app/catalog") return "Inspect the Shopify snapshot your POS can read, compare inbound feed rows, and export clean CSVs."
   if (route === "/app/settings") return "Keep your connector values clean, stable, and easy for the POS team to copy without guesswork."
   return "Monitor connector health, incoming traffic, and the Shopify catalog from one compact operations view."
@@ -317,6 +442,7 @@ function routeDescription(route) {
 
 function renderRoute(route) {
   if (route === "/app/product-sync") return renderProductSync()
+  if (route === "/app/pos-archive") return renderPosArchive()
   if (route === "/app/catalog") return renderCatalog()
   if (route === "/app/settings") return renderSettings()
   return renderHome()
@@ -553,6 +679,239 @@ function renderProductSync() {
       </div>
     </section>
   `
+}
+
+function renderPosArchive() {
+  const analysis = state.posArchive
+  const preview = state.posPreview?.items || analysis?.product_preview || []
+  const categories = analysis?.categories || []
+
+  return `
+    <section class="metric-strip">
+      ${renderMetricTile("DBF tables", analysis?.table_count ?? "—", analysis ? `${formatInteger(analysis.total_records)} total DBF records` : "Analyze an archive first")}
+      ${renderMetricTile("Sensitive tables", analysis?.sensitive_table_count ?? "—", "Customer, payment, contact, and credential fields stay out of product sync", analysis?.sensitive_table_count ? "warning" : "neutral")}
+      ${renderMetricTile("Product preview", preview.length, "Shopify-ready rows from Item.dbf and inventory lookups", preview.length ? "success" : "neutral")}
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">Archive</div>
+            <h3>Analyze uploaded POS data</h3>
+            <p>Use this before the final switch to inspect the DBF package, confirm tables, and build a Shopify product preview.</p>
+          </div>
+          <div class="button-row">
+            <button class="button" type="button" data-analyze-pos-archive ${state.isAnalyzingArchive ? "disabled" : ""}>
+              ${state.isAnalyzingArchive ? "Analyzing..." : "Analyze current archive"}
+            </button>
+            <button class="button-secondary" type="button" data-preview-pos-products ${state.isAnalyzingArchive ? "disabled" : ""}>Preview products</button>
+          </div>
+        </div>
+        <form class="form-grid" data-pos-upload-form>
+          <div class="field">
+            <label for="pos_archive_file">Upload ZIP</label>
+            <input id="pos_archive_file" name="file" type="file" accept=".zip,application/zip" required />
+            <div class="field-note">On Railway, mount persistent storage at <code>/data</code> before using this for the final production archive.</div>
+          </div>
+          <div class="button-row">
+            <button class="button-secondary" type="submit" ${state.isUploadingArchive ? "disabled" : ""}>
+              ${state.isUploadingArchive ? "Uploading..." : "Upload and analyze"}
+            </button>
+          </div>
+        </form>
+      </article>
+
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">Safety</div>
+            <h3>What gets synced</h3>
+            <p>Product sync uses SKU, title, barcode, price, quantity, vendor, type, tags, and POS product metafields. Customer and payment data remain archive-only.</p>
+          </div>
+        </div>
+        ${(analysis?.notes || [
+          "Products come from Item.dbf, Itemmqty.dbf, Vendor.dbf, vendors.dbf, and price-change lookups.",
+          "Customer, order, employee, payment, and vendor credential tables are readable for analysis but not pushed to Shopify products.",
+        ]).map((note) => `<div class="notice warning">${escapeHtml(note)}</div>`).join("")}
+      </article>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">Map</div>
+            <h3>DBF categories</h3>
+            <p>This shows how the archive is grouped before any Shopify sync action.</p>
+          </div>
+        </div>
+        ${renderCategoryTable(categories)}
+      </article>
+
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">Core</div>
+            <h3>Important tables</h3>
+            <p>These are the tables the app found that are most relevant for products, customers, vendors, orders, and history.</p>
+          </div>
+        </div>
+        ${renderCoreTableList(analysis?.core_tables || [])}
+      </article>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">Products</div>
+            <h3>Shopify payload preview</h3>
+            <p>Preview rows are built from POS data but are not synced until you click the sync button.</p>
+          </div>
+          <form class="button-row" data-pos-sync-form>
+            <input class="compact-input" name="offset" type="number" min="0" step="1" value="0" aria-label="Offset" />
+            <input class="compact-input" name="limit" type="number" min="1" max="250" step="1" value="25" aria-label="Limit" />
+            <label class="checkbox-row">
+              <input name="include_zero_quantity" type="checkbox" />
+              <span>Include zero qty</span>
+            </label>
+            <button class="button" type="submit" ${state.isSyncingArchive || !preview.length ? "disabled" : ""}>
+              ${state.isSyncingArchive ? "Syncing..." : "Sync batch"}
+            </button>
+          </form>
+        </div>
+        ${renderPosProductPreview(preview)}
+      </article>
+
+      <div class="stack">
+        ${renderPosSyncResult()}
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <div class="section-kicker">Samples</div>
+              <h3>Archive sample rows</h3>
+              <p>Small samples from the most useful tables, with blank fields removed for scanability.</p>
+            </div>
+          </div>
+          ${renderArchiveSamples(analysis?.samples || {})}
+        </article>
+      </div>
+    </section>
+  `
+}
+
+function renderCategoryTable(categories) {
+  if (!categories.length) return `<p class="empty-state">No archive analysis loaded yet.</p>`
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Tables</th>
+            <th>Records</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${categories.map((item) => `
+            <tr>
+              <td>${escapeHtml(item.category)}</td>
+              <td>${escapeHtml(item.tables ?? 0)}</td>
+              <td>${escapeHtml(formatInteger(item.records ?? 0))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `
+}
+
+function renderCoreTableList(tables) {
+  if (!tables.length) return `<p class="empty-state">No core DBF tables found yet.</p>`
+  return `
+    <ul class="activity-list">
+      ${tables.slice(0, 18).map((table) => `
+        <li class="activity-item">
+          <div class="activity-title">
+            <strong>${escapeHtml(table.name)}</strong>
+            ${renderStatusBadge(table.category, table.sensitive_fields?.length ? "warning" : "success")}
+            <span class="meta-value muted">${escapeHtml(`${formatInteger(table.records)} records`)}</span>
+            <a class="button-ghost" href="/api/pos-archive/tables/${encodeURIComponent(table.name)}/csv" target="_blank" rel="noreferrer">CSV</a>
+          </div>
+          <span class="meta-value muted">${escapeHtml((table.fields || []).slice(0, 10).join(", "))}</span>
+        </li>
+      `).join("")}
+    </ul>
+  `
+}
+
+function renderPosProductPreview(items) {
+  if (!items.length) return `<p class="empty-state">Analyze the archive to preview Shopify product payloads.</p>`
+  return `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Product</th>
+            <th>SKU</th>
+            <th>Vendor</th>
+            <th>Price</th>
+            <th>Qty</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.slice(0, 25).map((item) => `
+            <tr>
+              <td>
+                <div class="cell-stack">
+                  <span class="cell-main">${escapeHtml(item.title || item.name || "Untitled")}</span>
+                  <span class="cell-meta">${escapeHtml(item.product_type || "No type")}</span>
+                </div>
+              </td>
+              <td>${escapeHtml(item.sku || "—")}</td>
+              <td>${escapeHtml(item.vendor || "—")}</td>
+              <td>${escapeHtml(item.price ?? "—")}</td>
+              <td>${escapeHtml(item.quantity ?? "—")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `
+}
+
+function renderArchiveSamples(samples) {
+  const entries = Object.entries(samples)
+  if (!entries.length) return `<p class="empty-state">No table samples loaded yet.</p>`
+  return entries.slice(0, 6).map(([name, rows]) => `
+    <div class="setting-row">
+      <strong>${escapeHtml(name)}</strong>
+      <span><code>${escapeHtml(JSON.stringify((rows || [])[0] || {}, null, 0))}</code></span>
+    </div>
+  `).join("")
+}
+
+function renderPosSyncResult() {
+  if (!state.posSyncResult) {
+    return `
+      <article class="card">
+        <p class="empty-state">Run a POS product sync and the result will appear here.</p>
+      </article>
+    `
+  }
+  if (state.posSyncResult.error) {
+    return renderResultCard("Last POS archive sync", false, [
+      ["Message", state.posSyncResult.error.message],
+      ["Code", state.posSyncResult.error.code || "request_failed"],
+    ])
+  }
+  return renderResultCard("Last POS archive sync", true, [
+    ["Total", state.posSyncResult.total],
+    ["Succeeded", state.posSyncResult.succeeded],
+    ["Failed", state.posSyncResult.failed],
+    ["Timestamp", formatDate(state.posSyncResult.timestamp)],
+  ])
 }
 
 function renderCatalog() {
@@ -1090,6 +1449,12 @@ function formatShortDate(value) {
   } catch (_error) {
     return String(value)
   }
+}
+
+function formatInteger(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return String(value ?? "—")
+  return number.toLocaleString()
 }
 
 function coerceNumber(value) {
