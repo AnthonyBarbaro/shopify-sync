@@ -478,7 +478,8 @@ def build_connection_settings_response(
     credentials: PosCredentialRecord,
     raw_secret: str | None = None,
 ) -> ConnectionSettingsResponse:
-    flash_secret = raw_secret or session_manager.pop_secret_flash(request, response, shop=shop.shop_domain)
+    session_manager.pop_secret_flash(request, response, shop=shop.shop_domain)
+    full_secret = raw_secret or db.get_pos_secret_for_shop(shop.shop_domain)
     base_url = resolve_base_url(request)
     return ConnectionSettingsResponse(
         shop=shop.shop_domain,
@@ -488,9 +489,9 @@ def build_connection_settings_response(
         bulk_sync_path="/wc-api/v3/products/batch",
         bulk_sync_url=f"{base_url}/wc-api/v3/products/batch",
         api_key=credentials.api_key,
-        api_secret=flash_secret,
+        api_secret=full_secret,
         api_secret_masked=credentials.api_secret_masked,
-        secret_is_temporary=bool(flash_secret),
+        secret_is_temporary=False,
         auth_modes=["woo_query_string", "woo_oauth_signature", "basic", "x-api-key/x-api-secret"],
         auth_header_key="X-API-Key",
         auth_header_secret="X-API-Secret",

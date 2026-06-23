@@ -363,6 +363,24 @@ class DatabaseStore:
             last_used_at=row["last_used_at"],
         )
 
+    def get_pos_secret_for_shop(self, shop_domain: str) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT secret_ciphertext
+                FROM pos_credentials
+                WHERE shop_domain = ?
+                """,
+                (shop_domain,),
+            ).fetchone()
+        if row is None or not row["secret_ciphertext"]:
+            return None
+        try:
+            return self._fernet.decrypt(row["secret_ciphertext"].encode("utf-8")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            self.logger.warning("Stored POS credentials could not be decrypted for %s", shop_domain)
+            return None
+
     def get_pos_auth_record(self, api_key: str) -> Optional[PosAuthRecord]:
         with self._connect() as connection:
             row = connection.execute(

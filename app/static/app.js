@@ -965,7 +965,11 @@ function renderCatalog() {
 }
 
 function renderSettings() {
-  const visibleSecret = state.connection?.api_secret || state.connection?.api_secret_masked || ""
+  const fullSecret = state.connection?.api_secret || ""
+  const visibleSecret = fullSecret || state.connection?.api_secret_masked || ""
+  const secretNotice = fullSecret
+    ? `<div class="notice success">The full POS secret is available here. Keep it private and use Copy or Copy all for the exact value.</div>`
+    : `<div class="notice warning">Only a masked secret preview is available. Generate a new key + secret to copy a full secret.</div>`
 
   return `
     <section class="grid two">
@@ -983,13 +987,13 @@ function renderSettings() {
             </button>
           </div>
         </div>
-        ${state.connection?.secret_is_temporary ? `<div class="notice success">Copy this secret now. It will be hidden after you reload the page.</div>` : `<div class="notice warning">Keys stay stable unless you rotate them or the runtime database is reset.</div>`}
+        ${secretNotice}
         <div class="copy-stack">
           ${renderCopyRow("URL", state.connection?.base_url || "")}
           ${renderCopyRow("Path", state.connection?.product_sync_path || "")}
           ${renderCopyRow("Batch Path", state.connection?.bulk_sync_path || "")}
           ${renderCopyRow("Key", state.connection?.api_key || "")}
-          ${renderCopyRow("Secret", visibleSecret)}
+          ${renderCopyRow("Secret", visibleSecret, fullSecret)}
         </div>
       </article>
 
@@ -1340,14 +1344,15 @@ function renderRequestLogTable() {
   `
 }
 
-function renderCopyRow(label, value) {
+function renderCopyRow(label, value, copyValue = value) {
+  const canCopy = Boolean(copyValue)
   return `
     <div class="copy-row">
       <div class="copy-meta">
         <div class="meta-label">${escapeHtml(label)}</div>
         <code>${escapeHtml(value)}</code>
       </div>
-      <button class="copy-button" type="button" data-copy="${escapeAttribute(value)}">Copy</button>
+      <button class="copy-button" type="button" data-copy="${escapeAttribute(copyValue || "")}" ${canCopy ? "" : "disabled"}>Copy</button>
     </div>
   `
 }
@@ -1367,13 +1372,14 @@ function renderStatusBadge(value, tone = "neutral") {
 }
 
 function buildSimpleSettingsText() {
+  const fullSecret = state.connection?.api_secret || ""
   return [
     `Shop: ${state.connection?.shop || ""}`,
     `URL: ${state.connection?.base_url || ""}`,
     `Path: ${state.connection?.product_sync_path || ""}`,
     `Batch Path: ${state.connection?.bulk_sync_path || ""}`,
     `Key: ${state.connection?.api_key || ""}`,
-    `Secret: ${state.connection?.api_secret || state.connection?.api_secret_masked || ""}`,
+    `Secret: ${fullSecret || "ROTATE_CREDENTIALS_TO_REVEAL_FULL_SECRET"}`,
   ].join("\n")
 }
 
