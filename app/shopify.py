@@ -45,6 +45,9 @@ class ShopifyClient:
               vendor
               productType
               updatedAt
+              metafield(namespace: "pos", key: "sku") {
+                value
+              }
               media(first: 10) {
                 nodes {
                   alt
@@ -58,6 +61,9 @@ class ShopifyClient:
                 }
               }
               variants(first: 100) {
+                pageInfo {
+                  hasNextPage
+                }
                 nodes {
                   id
                   sku
