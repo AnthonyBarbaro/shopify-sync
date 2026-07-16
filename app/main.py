@@ -724,6 +724,7 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
         "image_urls": [item["src"] for item in image_inputs],
         "images": image_inputs,
         "metafields": metafields,
+        "variants": raw_payload.get("variants") if isinstance(raw_payload.get("variants"), list) else [],
     }
     return ProductSyncRequest.model_validate(normalized)
 
@@ -2332,6 +2333,57 @@ async def sync_customers(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> CustomerBulkSyncResponse | JSONResponse:
     return await _handle_external_customer_bulk_sync(request, shop)
+
+
+@app.post(
+    "/sync/catalog/reconcile",
+    response_model=None,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+)
+@app.post(
+    "/wc-api/v3/products/reconcile",
+    response_model=None,
+    include_in_schema=False,
+)
+@app.post(
+    "/wp-json/wc/v3/products/reconcile",
+    response_model=None,
+    include_in_schema=False,
+)
+async def reconcile_catalog_products(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    if not isinstance(raw_payload, dict):
+        raise SyncProcessingError(
+            "Catalog reconciliation payload must be a JSON object.",
+            code="invalid_reconciliation_payload",
+        )
+
+    source_skus = raw_payload.get("source_skus")
+    if not isinstance(source_skus, list):
+        raise SyncProcessingError(
+            "Catalog reconciliation requires a source_skus array.",
+            code="invalid_reconciliation_skus",
+        )
+
+    apply_changes = raw_payload.get("apply") is True
+    if apply_changes and raw_payload.get("confirmation") != "ARCHIVE_MISSING_PRODUCTS":
+        raise SyncProcessingError(
+            "Live reconciliation requires confirmation=ARCHIVE_MISSING_PRODUCTS.",
+            code="missing_reconciliation_confirmation",
+        )
+
+    result = run_with_shop_retry(
+        shop,
+        lambda active_shop: inventory_service.reconcile_catalog_skus(
+            source_skus,
+            active_shop,
+            apply=apply_changes,
+        ),
+    )
+    return JSONResponse(result)
 
 
 @app.api_route(

@@ -35,6 +35,7 @@ from app.utils import (
 
 CUSTOMER_CUSTOM_ID_NAMESPACE = "pos"
 CUSTOMER_CUSTOM_ID_KEY = "legacy_customer_id"
+MATRIX_VARIANT_SKU_RE = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 
 
 class InventorySyncService:
@@ -250,6 +251,119 @@ class InventorySyncService:
         products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
         return [self._catalog_record_from_product(product) for product in products]
 
+    def reconcile_catalog_skus(
+        self,
+        source_skus: List[str],
+        shop: ShopRecord,
+        *,
+        apply: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_source_skus = {
+            sku.strip().casefold()
+            for sku in source_skus
+            if isinstance(sku, str) and sku.strip()
+        }
+        if not normalized_source_skus:
+            raise SyncProcessingError(
+                "Catalog reconciliation requires at least one source SKU.",
+                code="empty_reconciliation_source",
+            )
+
+        products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
+        candidates: List[Dict[str, Any]] = []
+        matched_products = 0
+        already_archived = 0
+        skipped_without_sku = 0
+        skipped_unmanaged = 0
+        skipped_truncated_variants = 0
+
+        for product in products:
+            variants_connection = product.get("variants") or {}
+            if (variants_connection.get("pageInfo") or {}).get("hasNextPage"):
+                # Never archive when Shopify returned only part of a large variant set.
+                skipped_truncated_variants += 1
+                continue
+
+            product_skus = sorted(
+                {
+                    str(variant.get("sku") or "").strip()
+                    for variant in (variants_connection.get("nodes") or [])
+                    if str(variant.get("sku") or "").strip()
+                },
+                key=str.casefold,
+            )
+            if not product_skus:
+                skipped_without_sku += 1
+                continue
+            managed_sku = str((product.get("metafield") or {}).get("value") or "").strip()
+            product_source_skus = {
+                (_matrix_base_sku(sku) or sku).casefold()
+                for sku in product_skus
+            }
+            if not managed_sku or managed_sku.casefold() not in product_source_skus:
+                # Only reconcile products that a prior rich POS sync marked as managed.
+                skipped_unmanaged += 1
+                continue
+            if managed_sku.casefold() in normalized_source_skus or any(
+                sku.casefold() in normalized_source_skus for sku in product_skus
+            ):
+                matched_products += 1
+                continue
+
+            current_status = str(product.get("status") or "").upper()
+            if current_status == "ARCHIVED":
+                already_archived += 1
+                continue
+
+            candidates.append(
+                {
+                    "product_id": product.get("id"),
+                    "title": product.get("title") or "Untitled product",
+                    "status": current_status or None,
+                    "skus": product_skus,
+                }
+            )
+
+        archived = 0
+        failures: List[Dict[str, Any]] = []
+        if apply:
+            for candidate in candidates:
+                try:
+                    self.shopify_client.update_product(
+                        shop.shop_domain,
+                        shop.access_token,
+                        product={
+                            "id": normalize_gid("Product", candidate["product_id"]),
+                            "status": "ARCHIVED",
+                        },
+                    )
+                    archived += 1
+                except Exception as exc:
+                    failures.append(
+                        {
+                            **candidate,
+                            "error": str(exc),
+                        }
+                    )
+
+        return {
+            "shop": shop.shop_domain,
+            "apply": apply,
+            "source_sku_count": len(normalized_source_skus),
+            "shopify_product_count": len(products),
+            "matched_product_count": matched_products,
+            "candidate_count": len(candidates),
+            "archived_count": archived,
+            "failed_count": len(failures),
+            "already_archived_count": already_archived,
+            "skipped_without_sku_count": skipped_without_sku,
+            "skipped_unmanaged_count": skipped_unmanaged,
+            "skipped_truncated_variants_count": skipped_truncated_variants,
+            "candidates": candidates,
+            "failures": failures,
+            "timestamp": utc_now_iso(),
+        }
+
     def get_woo_catalog_product(self, shop: ShopRecord, product_id: str | int) -> CatalogProductRecord:
         product = self.shopify_client.get_product_by_id(
             shop.shop_domain,
@@ -406,6 +520,9 @@ class InventorySyncService:
         return list(metafields.values())
 
     def _sync_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
+        if payload.variants:
+            return self._sync_matrix_catalog_product(payload, shop)
+
         existing_mapping = self._find_existing_mapping(shop, payload)
         media_inputs = self._build_media_inputs(payload)
         created = existing_mapping is None
@@ -528,6 +645,93 @@ class InventorySyncService:
             },
         )
 
+    def _sync_matrix_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
+        existing_mapping = self._find_existing_mapping(shop, payload)
+        media_inputs = self._build_media_inputs(payload)
+        created = existing_mapping is None
+        product_title = payload.title or payload.sku or "POS Imported Product"
+        location_id = self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
+        existing_product: Optional[Dict[str, Any]] = None
+
+        if existing_mapping is not None:
+            existing_product = self.shopify_client.get_product_by_id(
+                shop.shop_domain,
+                shop.access_token,
+                existing_mapping.product_id,
+            )
+            if existing_product is None:
+                raise SyncProcessingError(
+                    "The Shopify product for this matrix SKU could not be loaded.",
+                    {"sku": payload.sku, "product_id": existing_mapping.product_id},
+                    code="matrix_product_not_found",
+                )
+            product_update = self._build_product_update_input(payload, existing_mapping.product_id)
+            if len(product_update) > 1 or media_inputs:
+                updated_product = self.shopify_client.update_product(
+                    shop.shop_domain,
+                    shop.access_token,
+                    product=product_update,
+                    media=media_inputs,
+                )
+                product_title = updated_product.get("title") or product_title
+
+        product_set_input = self._build_matrix_product_set_input(
+            payload,
+            location_id=location_id,
+            media_inputs=media_inputs if created else [],
+            existing_product=existing_product,
+        )
+        product = self.shopify_client.product_set(
+            shop.shop_domain,
+            shop.access_token,
+            input_data=product_set_input,
+            identifier={"id": normalize_gid("Product", existing_mapping.product_id)} if existing_mapping else None,
+        )
+
+        first_variant_sku = payload.variants[0].sku
+        mapping = self._mapping_from_product(product, first_variant_sku)
+        metafield_inputs = self._build_metafield_inputs(payload, mapping.product_id)
+        if metafield_inputs:
+            self.shopify_client.set_product_metafields(
+                shop.shop_domain,
+                shop.access_token,
+                metafield_inputs,
+            )
+
+        return SyncResult(
+            shop_domain=shop.shop_domain,
+            sku=payload.sku or first_variant_sku,
+            success=True,
+            message="Matrix product and POS barcodes synced successfully.",
+            timestamp=utc_now_iso(),
+            variant_id=mapping.variant_id,
+            product_id=mapping.product_id,
+            inventory_item_id=mapping.inventory_item_id,
+            location_id=normalize_gid("Location", location_id),
+            price_updated=True,
+            cost_updated=any(variant.cost is not None for variant in payload.variants),
+            inventory_updated=any(variant.quantity is not None for variant in payload.variants),
+            price=payload.price,
+            cost=payload.cost,
+            quantity=payload.quantity,
+            details={
+                "created": created,
+                "product_title": product.get("title") or product_title,
+                "product_status": product.get("status")
+                or _normalize_product_status(payload.status, default="DRAFT" if created else "ACTIVE"),
+                "image_count": len(media_inputs),
+                "metafield_count": len(metafield_inputs),
+                "matrix_variant_count": len(payload.variants),
+                "matrix_barcode_count": len({variant.barcode for variant in payload.variants}),
+                "requested_quantity": payload.quantity,
+                "description_update_skipped": (
+                    not created
+                    and not payload.update_description
+                    and bool(payload.description_html or payload.description or payload.short_description)
+                ),
+            },
+        )
+
     def _find_existing_mapping(self, shop: ShopRecord, payload: ProductSyncRequest) -> Optional[VariantMapping]:
         if payload.external_id:
             product = self.shopify_client.get_product_by_id(
@@ -549,6 +753,17 @@ class InventorySyncService:
                 if exc.code != "sku_not_found":
                     raise
 
+        for variant in payload.variants:
+            try:
+                return self.shopify_client.get_variant_by_sku(
+                    shop.shop_domain,
+                    shop.access_token,
+                    variant.sku,
+                )
+            except SyncProcessingError as exc:
+                if exc.code != "sku_not_found":
+                    raise
+
         if payload.handle:
             product = self.shopify_client.get_product_by_handle(
                 shop.shop_domain,
@@ -557,8 +772,9 @@ class InventorySyncService:
             )
             if product:
                 variants = ((product.get("variants") or {}).get("nodes") or [])
-                if len(variants) == 1:
-                    return self._mapping_from_product(product, payload.sku)
+                if len(variants) == 1 or payload.variants:
+                    target_sku = payload.variants[0].sku if payload.variants else payload.sku
+                    return self._mapping_from_product(product, target_sku)
                 raise SyncProcessingError(
                     "A product handle was found, but it has multiple variants. Send a SKU to update the correct variant.",
                     {"handle": payload.handle},
@@ -566,6 +782,109 @@ class InventorySyncService:
                 )
 
         return None
+
+    def _build_matrix_product_set_input(
+        self,
+        payload: ProductSyncRequest,
+        *,
+        location_id: str,
+        media_inputs: List[Dict[str, Any]],
+        existing_product: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        option_values_by_name: Dict[str, List[str]] = {}
+        for variant in payload.variants:
+            if not variant.option_values:
+                raise SyncProcessingError(
+                    "Every matrix variant needs at least one Shopify option value.",
+                    {"base_sku": payload.sku, "variant_sku": variant.sku},
+                    code="missing_matrix_option",
+                )
+            for name, value in variant.option_values.items():
+                clean_name = str(name).strip()
+                clean_value = str(value).strip()
+                if not clean_name or not clean_value:
+                    raise SyncProcessingError(
+                        "Matrix option names and values cannot be blank.",
+                        {"base_sku": payload.sku, "variant_sku": variant.sku},
+                        code="invalid_matrix_option",
+                    )
+                values = option_values_by_name.setdefault(clean_name, [])
+                if clean_value not in values:
+                    values.append(clean_value)
+
+        product_options = [
+            {
+                "name": name,
+                "position": position,
+                "values": [{"name": value} for value in values],
+            }
+            for position, (name, values) in enumerate(option_values_by_name.items(), start=1)
+        ]
+
+        existing_variants = ((existing_product or {}).get("variants") or {}).get("nodes") or []
+        existing_by_sku = {
+            str(variant.get("sku") or "").strip(): variant
+            for variant in existing_variants
+            if str(variant.get("sku") or "").strip()
+        }
+        fallback_variant = None
+        if payload.sku and payload.sku in existing_by_sku:
+            fallback_variant = existing_by_sku[payload.sku]
+        elif len(existing_variants) == 1:
+            fallback_variant = existing_variants[0]
+
+        used_variant_ids: set[str] = set()
+        variant_inputs: List[Dict[str, Any]] = []
+        for index, variant in enumerate(payload.variants):
+            variant_input: Dict[str, Any] = {
+                "sku": variant.sku,
+                "barcode": variant.barcode,
+                "optionValues": [
+                    {"optionName": str(name).strip(), "name": str(value).strip()}
+                    for name, value in variant.option_values.items()
+                ],
+                "inventoryItem": {
+                    "sku": variant.sku,
+                    "tracked": True if variant.tracked is None else bool(variant.tracked),
+                    "requiresShipping": (
+                        True if variant.requires_shipping is None else bool(variant.requires_shipping)
+                    ),
+                },
+            }
+            if variant.price is not None:
+                variant_input["price"] = float(format_price(variant.price))
+            if variant.compare_at_price is not None:
+                variant_input["compareAtPrice"] = float(format_price(variant.compare_at_price))
+            if variant.cost is not None:
+                variant_input["inventoryItem"]["cost"] = float(format_price(variant.cost))
+            if variant.quantity is not None:
+                variant_input["inventoryQuantities"] = [
+                    {
+                        "locationId": normalize_gid("Location", location_id),
+                        "name": "available",
+                        "quantity": int(variant.quantity),
+                    }
+                ]
+
+            existing_variant = existing_by_sku.get(variant.sku)
+            if existing_variant is None and index == 0:
+                existing_variant = fallback_variant
+            existing_variant_id = str((existing_variant or {}).get("id") or "")
+            if existing_variant_id and existing_variant_id not in used_variant_ids:
+                variant_input["id"] = normalize_gid("ProductVariant", existing_variant_id)
+                used_variant_ids.add(existing_variant_id)
+            variant_inputs.append(variant_input)
+
+        if existing_product is not None:
+            return {
+                "productOptions": product_options,
+                "variants": variant_inputs,
+            }
+
+        product_input = self._build_new_product_input(payload, media_inputs)
+        product_input["productOptions"] = product_options
+        product_input["variants"] = variant_inputs
+        return product_input
 
     def _build_new_product_input(
         self,
@@ -820,6 +1139,40 @@ class InventorySyncService:
         barcode = (payload.barcode or "").strip() or None
         product_type = (payload.product_type or "").strip() or None
         vendor = (payload.vendor or payload.brand or "").strip() or None
+        variants = []
+        seen_variant_skus: set[str] = set()
+        seen_barcodes: set[str] = set()
+        for variant in payload.variants:
+            variant_sku = variant.sku.strip()
+            variant_barcode = variant.barcode.strip()
+            if variant_sku in seen_variant_skus:
+                raise SyncProcessingError(
+                    "Matrix variant SKUs must be unique within a product.",
+                    {"base_sku": sku, "variant_sku": variant_sku},
+                    code="duplicate_matrix_variant_sku",
+                )
+            if variant_barcode in seen_barcodes:
+                raise SyncProcessingError(
+                    "Matrix barcodes must be unique within a product.",
+                    {"base_sku": sku, "barcode": variant_barcode},
+                    code="duplicate_matrix_barcode",
+                )
+            seen_variant_skus.add(variant_sku)
+            seen_barcodes.add(variant_barcode)
+            variants.append(
+                variant.model_copy(
+                    update={
+                        "sku": variant_sku,
+                        "barcode": variant_barcode,
+                        "option_values": {
+                            str(name).strip(): str(value).strip()
+                            for name, value in variant.option_values.items()
+                            if str(name).strip() and str(value).strip()
+                        },
+                        "pos_cell": _clean_string(variant.pos_cell),
+                    }
+                )
+            )
         return payload.model_copy(
             update={
                 "sku": sku,
@@ -830,6 +1183,7 @@ class InventorySyncService:
                 "product_type": product_type,
                 "vendor": vendor,
                 "tags": tags,
+                "variants": variants,
             }
         )
 
@@ -1097,6 +1451,11 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _matrix_base_sku(value: str) -> Optional[str]:
+    match = MATRIX_VARIANT_SKU_RE.fullmatch((value or "").strip())
+    return match.group(1).strip() if match else None
 
 
 def _money_changed(current: Optional[float], requested: float) -> bool:

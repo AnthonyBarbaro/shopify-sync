@@ -23,6 +23,21 @@ class ProductMetafieldInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ProductVariantSyncInput(BaseModel):
+    sku: str = Field(min_length=1)
+    barcode: str = Field(min_length=1)
+    option_values: Dict[str, str] = Field(default_factory=dict)
+    price: Optional[float] = Field(default=None, ge=0)
+    compare_at_price: Optional[float] = Field(default=None, ge=0)
+    cost: Optional[float] = Field(default=None, ge=0)
+    quantity: Optional[int] = Field(default=None, ge=0)
+    tracked: Optional[bool] = True
+    requires_shipping: Optional[bool] = True
+    pos_cell: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
 class CustomerAddressInput(BaseModel):
     firstName: Optional[str] = None
     lastName: Optional[str] = None
@@ -91,6 +106,7 @@ class ProductSyncRequest(BaseModel):
     image_urls: List[str] = Field(default_factory=list)
     images: List[ProductImageInput] = Field(default_factory=list)
     metafields: List[ProductMetafieldInput] = Field(default_factory=list)
+    variants: List[ProductVariantSyncInput] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="allow")
 
