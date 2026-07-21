@@ -1,7 +1,7 @@
 import time
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -22,7 +22,7 @@ from app.utils import (
 class ShopifyClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.session = requests.Session()
+        self._session_local = local()
         self.logger = setup_logging().getChild("shopify")
         self._sku_cache: Dict[str, Dict[str, Any]] = {}
         self._sku_cache_lock = Lock()
@@ -1037,7 +1037,7 @@ class ShopifyClient:
 
         for attempt in range(self.settings.shopify_retry_attempts):
             try:
-                response = self.session.post(
+                response = self._get_session().post(
                     base_url,
                     headers={
                         "Content-Type": "application/json",
@@ -1289,6 +1289,13 @@ class ShopifyClient:
 
     def _cache_key(self, shop_domain: str, sku: str) -> str:
         return f"{shop_domain}:{sku.strip()}"
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._session_local.session = session
+        return session
 
     def _get_cached_variant(self, shop_domain: str, sku: str) -> Optional[VariantMapping]:
         with self._sku_cache_lock:

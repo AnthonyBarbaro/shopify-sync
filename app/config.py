@@ -25,6 +25,7 @@ class Settings:
     shopify_retry_attempts: int = 3
     shopify_retry_backoff_seconds: float = 1.0
     shopify_sku_cache_ttl_seconds: int = 15 * 60
+    shopify_bulk_max_workers: int = 4
     shopify_location_id: Optional[str] = None
 
     @property
@@ -64,5 +65,9 @@ def get_settings() -> Settings:
         ).strip(),
         database_path=(os.getenv("DATABASE_PATH") or "inventory_sync.sqlite3").strip(),
         shopify_api_version=(os.getenv("SHOPIFY_API_VERSION") or "2026-01").strip(),
+        shopify_bulk_max_workers=max(
+            1,
+            min(4, int((os.getenv("SHOPIFY_BULK_MAX_WORKERS") or "4").strip())),
+        ),
         shopify_location_id=(os.getenv("SHOPIFY_LOCATION_ID") or "").strip() or None,
     )

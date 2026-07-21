@@ -11,6 +11,7 @@ FastAPI backend for syncing products, pricing, images, and inventory from an ext
 - creates new Shopify products as drafts
 - updates existing Shopify products by SKU
 - syncs price and inventory
+- preserves legacy POS matrix barcodes on Shopify size/color variants
 - provides CSV exports for catalog and incoming feed activity
 
 ## Project Structure
@@ -120,9 +121,18 @@ GET/POST /wp-json/wc/v3/products
 GET/PUT /wc-api/v3/products/{id}
 GET/PUT /wp-json/wc/v3/products/{id}
 GET/POST /wc-api/v3/products/batch
+POST /wc-api/v3/products/reconcile
 GET/POST /sync/product
 GET/POST /sync/bulk
+POST /sync/catalog/reconcile
 ```
+
+Catalog reconciliation accepts the complete source SKU list and previews Shopify products whose
+SKUs are absent. Applying the archive requires both `apply: true` and the explicit
+`confirmation: "ARCHIVE_MISSING_PRODUCTS"` value. Products without SKUs and products whose variant
+list is truncated are never archived by reconciliation. Reconciliation only manages products marked
+with the `pos.sku` metafield by a previous rich POS sync, so unrelated Shopify products remain intact.
+Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SKU `21741`.
 
 Exports:
 

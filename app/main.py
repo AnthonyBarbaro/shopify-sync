@@ -2013,7 +2013,29 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
 
     normalized_items = normalize_external_bulk_payload(raw_payload)
     try:
-        result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_bulk(normalized_items, active_shop))
+        worker_header = (request.headers.get("X-Sync-Workers") or "1").strip()
+        try:
+            requested_workers = int(worker_header)
+        except ValueError as exc:
+            raise SyncProcessingError(
+                "X-Sync-Workers must be a whole number.",
+                {"value": worker_header},
+                code="invalid_sync_workers",
+            ) from exc
+        if requested_workers < 1:
+            raise SyncProcessingError(
+                "X-Sync-Workers must be at least 1.",
+                {"value": worker_header},
+                code="invalid_sync_workers",
+            )
+        result = run_with_shop_retry(
+            shop,
+            lambda active_shop: inventory_service.sync_bulk(
+                normalized_items,
+                active_shop,
+                workers=requested_workers,
+            ),
+        )
     except Exception as exc:
         db.record_feed_event(
             shop_domain=shop.shop_domain,

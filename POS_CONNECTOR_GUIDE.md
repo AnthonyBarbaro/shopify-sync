@@ -195,7 +195,14 @@ description
 short_description
 images[].src
 image_url
+variants[].sku
+variants[].barcode
+variants[].option_values
+variants[].quantity
 ```
+
+Matrix-aware host syncs can send one product with multiple variants. Each variant can carry the exact
+legacy scanner value as both its SKU and barcode, plus its own size/color option values and quantity.
 
 ## Cash Register Express Field Mapping
 

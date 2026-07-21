@@ -1,5 +1,6 @@
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -100,37 +101,28 @@ class InventorySyncService:
         )
         return result
 
-    def sync_bulk(self, products: List[ProductSyncRequest], shop: ShopRecord) -> BulkSyncResponse:
+    def sync_bulk(
+        self,
+        products: List[ProductSyncRequest],
+        shop: ShopRecord,
+        *,
+        workers: int = 1,
+    ) -> BulkSyncResponse:
         if not products:
             raise SyncProcessingError(
                 "Bulk sync request must include at least one product.",
                 code="empty_bulk_request",
             )
 
-        results: List[SyncResult] = []
-        succeeded = 0
+        configured_max = max(1, int(getattr(self.settings, "shopify_bulk_max_workers", 4)))
+        worker_count = min(max(1, int(workers)), configured_max, len(products))
+        if worker_count == 1:
+            results = [self._sync_bulk_product(product, shop) for product in products]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="shopify-sync") as executor:
+                results = list(executor.map(lambda product: self._sync_bulk_product(product, shop), products))
 
-        for product in products:
-            try:
-                result = self.sync_product(product, shop)
-                results.append(result)
-                succeeded += 1
-            except Exception as exc:
-                normalized = self._normalize_payload(product)
-                details = exc.details if isinstance(exc, AppError) else {}
-                results.append(
-                    SyncResult(
-                        shop_domain=shop.shop_domain,
-                        sku=normalized.sku or normalized.handle or normalized.title or "unknown-product",
-                        success=False,
-                        message=str(exc),
-                        timestamp=utc_now_iso(),
-                        price=normalized.price,
-                        cost=normalized.cost,
-                        quantity=normalized.quantity,
-                        details=details,
-                    )
-                )
+        succeeded = sum(1 for result in results if result.success)
 
         return BulkSyncResponse(
             total=len(products),
@@ -139,6 +131,24 @@ class InventorySyncService:
             timestamp=utc_now_iso(),
             results=results,
         )
+
+    def _sync_bulk_product(self, product: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
+        try:
+            return self.sync_product(product, shop)
+        except Exception as exc:
+            normalized = self._normalize_payload(product)
+            details = exc.details if isinstance(exc, AppError) else {}
+            return SyncResult(
+                shop_domain=shop.shop_domain,
+                sku=normalized.sku or normalized.handle or normalized.title or "unknown-product",
+                success=False,
+                message=str(exc),
+                timestamp=utc_now_iso(),
+                price=normalized.price,
+                cost=normalized.cost,
+                quantity=normalized.quantity,
+                details=details,
+            )
 
     def sync_customer(self, payload: CustomerSyncRequest, shop: ShopRecord) -> CustomerSyncResult:
         normalized = self._normalize_customer_payload(payload)
