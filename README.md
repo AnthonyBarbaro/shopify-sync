@@ -52,7 +52,15 @@ APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_loca
 APP_SESSION_SECRET=replace_with_a_long_random_secret
 POS_SECRET_ENCRYPTION_SECRET=replace_with_a_second_long_random_secret
 DATABASE_PATH=inventory_sync.sqlite3
+FEED_EVENT_RETENTION_ROWS=2000
+REQUEST_LOG_RETENTION_ROWS=1000
 ```
+
+Feed and request history is automatically pruned to these limits so recurring connector traffic
+cannot grow the Railway SQLite volume without bound.
+
+Legacy POS ZIP uploads retain only the product/inventory DBFs and delete the ZIP after extraction.
+The unattended Windows connector does not upload DBF files at all.
 
 ## Local Run
 
@@ -122,8 +130,16 @@ GET/PUT /wc-api/v3/products/{id}
 GET/PUT /wp-json/wc/v3/products/{id}
 GET/POST /wc-api/v3/products/batch
 POST /wc-api/v3/products/reconcile
+GET /wc-api/v3/inventory
+POST /wc-api/v3/inventory/adjustments
+GET /wc-api/v3/inventory/changes
+POST /wc-api/v3/inventory/changes/ack
 GET/POST /sync/product
 GET/POST /sync/bulk
+GET /sync/inventory
+POST /sync/inventory/adjustments
+GET /sync/inventory/changes
+POST /sync/inventory/changes/ack
 POST /sync/catalog/reconcile
 ```
 
@@ -133,6 +149,13 @@ SKUs are absent. Applying the archive requires both `apply: true` and the explic
 list is truncated are never archived by reconciliation. Reconciliation only manages products marked
 with the `pos.sku` metafield by a previous rich POS sync, so unrelated Shopify products remain intact.
 Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SKU `21741`.
+
+## Windows Connector
+
+The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
+It starts with Windows, uploads product details only for first-run or newly discovered SKUs, and then
+reconciles quantity deltas every three minutes. It sends JSON changes rather than DBF ZIP archives and
+keeps only bounded state and rotating logs on the host computer.
 
 Exports:
 

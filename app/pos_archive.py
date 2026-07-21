@@ -78,6 +78,17 @@ GROUP_PRODUCT_TYPE_MAP = {
     "VES": "Vest",
 }
 
+PRODUCT_ARCHIVE_FILENAMES = {
+    "item.dbf",
+    "itemmqty.dbf",
+    "itemmrc.dbf",
+    "vendor.dbf",
+    "vendors.dbf",
+    "price.dbf",
+    "pricechg.dbf",
+    "itempict.dbf",
+}
+
 
 @dataclass(frozen=True)
 class DBFField:
@@ -124,23 +135,35 @@ def save_uploaded_archive(upload_file: Any, storage_root: Path) -> Path:
         shutil.rmtree(current_root)
     current_root.mkdir(parents=True, exist_ok=True)
 
-    bytes_written = 0
-    with upload_path.open("wb") as handle:
-        while True:
-            chunk = upload_file.file.read(1024 * 1024)
-            if not chunk:
-                break
-            bytes_written += len(chunk)
-            if bytes_written > MAX_UPLOAD_BYTES:
-                raise ValueError("Archive upload is larger than the configured 1GB limit.")
-            handle.write(chunk)
+    try:
+        bytes_written = 0
+        with upload_path.open("wb") as handle:
+            while True:
+                chunk = upload_file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > MAX_UPLOAD_BYTES:
+                    raise ValueError("Archive upload is larger than the configured 1GB limit.")
+                handle.write(chunk)
 
-    extract_zip_safely(upload_path, current_root)
+        extract_zip_safely(
+            upload_path,
+            current_root,
+            allowed_filenames=PRODUCT_ARCHIVE_FILENAMES,
+        )
+    finally:
+        upload_path.unlink(missing_ok=True)
     extracted_ashpsdat = current_root / "ashpsdat"
     return extracted_ashpsdat if extracted_ashpsdat.exists() else current_root
 
 
-def extract_zip_safely(zip_path: Path, destination: Path) -> None:
+def extract_zip_safely(
+    zip_path: Path,
+    destination: Path,
+    *,
+    allowed_filenames: Optional[set[str]] = None,
+) -> None:
     destination = destination.resolve()
     with zipfile.ZipFile(zip_path) as archive:
         members = archive.infolist()
@@ -150,6 +173,8 @@ def extract_zip_safely(zip_path: Path, destination: Path) -> None:
         if total_uncompressed > MAX_UNZIPPED_BYTES:
             raise ValueError("Archive expands beyond the configured 6GB limit.")
         for member in members:
+            if allowed_filenames is not None and Path(member.filename).name.casefold() not in allowed_filenames:
+                continue
             target = (destination / member.filename).resolve()
             if destination not in target.parents and target != destination:
                 raise ValueError(f"Refusing unsafe zip path: {member.filename}")

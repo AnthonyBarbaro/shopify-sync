@@ -257,6 +257,54 @@ class InventorySyncService:
 
         return rows
 
+    def list_inventory_snapshot(self, shop: ShopRecord) -> List[Dict[str, Any]]:
+        return [
+            {
+                "sku": row.sku,
+                "quantity": int(row.quantity or 0),
+            }
+            for row in self.list_catalog(shop)
+            if row.sku and row.quantity is not None
+        ]
+
+    def adjust_inventory_quantity(
+        self,
+        *,
+        sku: str,
+        delta: int,
+        idempotency_key: str,
+        shop: ShopRecord,
+    ) -> Dict[str, Any]:
+        normalized_sku = sku.strip()
+        if not normalized_sku:
+            raise SyncProcessingError("Inventory adjustment requires a SKU.", code="missing_adjustment_sku")
+        if not delta:
+            return {"sku": normalized_sku, "delta": 0, "success": True}
+
+        mapping = self.shopify_client.get_variant_by_sku(
+            shop.shop_domain,
+            shop.access_token,
+            normalized_sku,
+        )
+        location_id = self._resolve_location_id(shop, mapping)
+        self.shopify_client.adjust_inventory(
+            shop.shop_domain,
+            shop.access_token,
+            mapping.inventory_item_id,
+            location_id,
+            int(delta),
+            idempotency_key=idempotency_key,
+            sku=normalized_sku,
+        )
+        return {
+            "sku": normalized_sku,
+            "delta": int(delta),
+            "success": True,
+            "variant_id": mapping.variant_id,
+            "inventory_item_id": mapping.inventory_item_id,
+            "location_id": normalize_gid("Location", location_id),
+        }
+
     def list_woo_catalog(self, shop: ShopRecord) -> List[CatalogProductRecord]:
         products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
         return [self._catalog_record_from_product(product) for product in products]

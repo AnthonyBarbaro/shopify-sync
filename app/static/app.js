@@ -741,7 +741,7 @@ function renderPosArchive() {
           <div class="field">
             <label for="pos_archive_file">Upload ZIP</label>
             <input id="pos_archive_file" name="file" type="file" accept=".zip,application/zip" required />
-            <div class="field-note">On Railway, mount persistent storage at <code>/data</code> before using this for the final production archive.</div>
+            <div class="field-note">Only product and inventory DBFs are retained. The uploaded ZIP and unrelated POS files are discarded to protect Railway storage.</div>
           </div>
           <div class="button-row">
             <button class="button-secondary" type="submit" ${state.isUploadingArchive ? "disabled" : ""}>

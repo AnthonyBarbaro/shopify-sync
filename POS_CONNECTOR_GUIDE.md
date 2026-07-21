@@ -28,6 +28,15 @@ Batch path:
 /wc-api/v3/products/batch
 ```
 
+Inventory bridge paths:
+
+```text
+GET /wc-api/v3/inventory
+POST /wc-api/v3/inventory/adjustments
+GET /wc-api/v3/inventory/changes
+POST /wc-api/v3/inventory/changes/ack
+```
+
 Authentication:
 
 ```text

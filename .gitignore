@@ -1,12 +1,38 @@
+# Secrets and machine-specific configuration
 .env
+.env.local
+.env.*.local
+windows_connector/connector.env
+
+# Runtime databases, journals, and logs
 *.sqlite3
+*.sqlite3-*
+*.log
+*.pid
+
+# Python, test, and build output
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
-jbarbaro_db
-.codex
-ashpsdat
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.spec
+
+# Local Codex/session metadata
+.codex/
+.agents/
+
+# POS databases, archives, generated reports, and connector state
+jbarbaro_db/*
+!jbarbaro_db/dbf_pos_sync.py
+!jbarbaro_db/DBF_PATH_SYNC.md
+ashpsdat/
 ashpsdat.zip
-pos_archives
-ashpswin
+ashpswin/
 ashpswin.zip
+pos_archives/
+windows_connector/data/
+windows_connector/.venv/

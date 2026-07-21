@@ -26,6 +26,8 @@ class Settings:
     shopify_retry_backoff_seconds: float = 1.0
     shopify_sku_cache_ttl_seconds: int = 15 * 60
     shopify_bulk_max_workers: int = 4
+    feed_event_retention_rows: int = 2000
+    request_log_retention_rows: int = 1000
     shopify_location_id: Optional[str] = None
 
     @property
@@ -68,6 +70,14 @@ def get_settings() -> Settings:
         shopify_bulk_max_workers=max(
             1,
             min(4, int((os.getenv("SHOPIFY_BULK_MAX_WORKERS") or "4").strip())),
+        ),
+        feed_event_retention_rows=max(
+            100,
+            int((os.getenv("FEED_EVENT_RETENTION_ROWS") or "2000").strip()),
+        ),
+        request_log_retention_rows=max(
+            100,
+            int((os.getenv("REQUEST_LOG_RETENTION_ROWS") or "1000").strip()),
         ),
         shopify_location_id=(os.getenv("SHOPIFY_LOCATION_ID") or "").strip() or None,
     )

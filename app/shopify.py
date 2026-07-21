@@ -110,6 +110,94 @@ class ShopifyClient:
                 return products
             cursor = products_data["pageInfo"]["endCursor"]
 
+    def get_inventory_item_sku(
+        self,
+        shop_domain: str,
+        access_token: str,
+        inventory_item_id: str,
+    ) -> Optional[str]:
+        query = """
+        query InventoryItemSku($id: ID!) {
+          inventoryItem(id: $id) {
+            sku
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"id": normalize_gid("InventoryItem", inventory_item_id)},
+            operation_name="InventoryItemSku",
+        )
+        item = payload["data"].get("inventoryItem")
+        sku = (item or {}).get("sku")
+        return sku.strip() if isinstance(sku, str) and sku.strip() else None
+
+    def ensure_inventory_webhook(
+        self,
+        shop_domain: str,
+        access_token: str,
+        uri: str,
+    ) -> None:
+        query = """
+        query InventoryWebhookSubscriptions($topics: [WebhookSubscriptionTopic!], $uri: String) {
+          webhookSubscriptions(first: 10, topics: $topics, uri: $uri) {
+            nodes {
+              id
+              topic
+              uri
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"topics": ["INVENTORY_LEVELS_UPDATE"], "uri": uri},
+            operation_name="InventoryWebhookSubscriptions",
+        )
+        nodes = payload["data"]["webhookSubscriptions"]["nodes"]
+        if any(node.get("topic") == "INVENTORY_LEVELS_UPDATE" and node.get("uri") == uri for node in nodes):
+            return
+
+        mutation = """
+        mutation CreateInventoryWebhook(
+          $topic: WebhookSubscriptionTopic!,
+          $webhookSubscription: WebhookSubscriptionInput!
+        ) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+            webhookSubscription {
+              id
+              topic
+              uri
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        created = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "topic": "INVENTORY_LEVELS_UPDATE",
+                "webhookSubscription": {"uri": uri, "format": "JSON"},
+            },
+            operation_name="CreateInventoryWebhook",
+        )
+        result = created["data"]["webhookSubscriptionCreate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the inventory webhook subscription.",
+                {"uri": uri, "user_errors": user_errors},
+            )
+
     def ensure_customer_custom_id_definition(
         self,
         shop_domain: str,
@@ -980,6 +1068,77 @@ class ShopifyClient:
                     "user_errors": user_errors,
                 },
             )
+
+    def adjust_inventory(
+        self,
+        shop_domain: str,
+        access_token: str,
+        inventory_item_id: str,
+        location_id: str,
+        delta: int,
+        *,
+        idempotency_key: str,
+        sku: Optional[str] = None,
+    ) -> None:
+        normalized_inventory_item_id = normalize_gid("InventoryItem", inventory_item_id)
+        normalized_location_id = normalize_gid("Location", location_id)
+        mutation = """
+        mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
+          inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+            inventoryAdjustmentGroup {
+              createdAt
+              reason
+            }
+            userErrors {
+              code
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "input": {
+                    "name": "available",
+                    "reason": "correction",
+                    "referenceDocumentUri": f"gid://inventory-sync-shopify/ConnectorAdjustment/{idempotency_key}",
+                    "changes": [
+                        {
+                            "inventoryItemId": normalized_inventory_item_id,
+                            "locationId": normalized_location_id,
+                            "delta": int(delta),
+                        }
+                    ],
+                },
+                "idempotencyKey": idempotency_key,
+            },
+            operation_name="AdjustInventory",
+        )
+        result = payload["data"]["inventoryAdjustQuantities"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the inventory adjustment.",
+                {
+                    "inventory_item_id": normalized_inventory_item_id,
+                    "location_id": normalized_location_id,
+                    "sku": sku,
+                    "delta": int(delta),
+                    "user_errors": user_errors,
+                },
+            )
+
+        cached = self._get_cached_variant(shop_domain, sku) if sku else None
+        if cached is not None:
+            for level in cached.inventory_levels:
+                if normalize_gid("Location", level.location_id) == normalized_location_id:
+                    level.quantity = int(level.quantity or 0) + int(delta)
+                    break
+            self._set_cached_variant(shop_domain, cached)
 
     def activate_inventory(
         self,

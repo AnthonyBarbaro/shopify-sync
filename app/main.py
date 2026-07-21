@@ -57,7 +57,7 @@ from app.models import (
     UiConfigResponse,
 )
 from app import pos_archive
-from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error
+from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error, normalize_gid
 from app.state import SyncActivityStore
 from app.utils import (
     AppError,
@@ -78,7 +78,12 @@ INDEX_FILE = STATIC_DIR / "index.html"
 
 settings = get_settings()
 logger = setup_logging()
-db = DatabaseStore(settings.database_path, settings.credential_encryption_secret)
+db = DatabaseStore(
+    settings.database_path,
+    settings.credential_encryption_secret,
+    feed_event_retention_rows=settings.feed_event_retention_rows,
+    request_log_retention_rows=settings.request_log_retention_rows,
+)
 session_manager = AppSessionManager(settings)
 shopify_client = ShopifyClient(settings)
 activity_store = SyncActivityStore(limit=400)
@@ -108,6 +113,29 @@ REQUEST_LOG_MASK_KEYS = {
     "oauth_signature",
     "x-api-secret",
 }
+
+
+def ensure_inventory_webhook(shop: ShopRecord) -> None:
+    run_with_shop_retry(
+        shop,
+        lambda active_shop: shopify_client.ensure_inventory_webhook(
+            active_shop.shop_domain,
+            active_shop.access_token,
+            f"{settings.normalized_app_base_url}/webhooks/inventory-levels-update",
+        ),
+    )
+
+
+@app.on_event("startup")
+async def ensure_connector_webhooks_on_startup() -> None:
+    for shop in db.list_shops():
+        try:
+            ensure_inventory_webhook(shop)
+        except Exception as exc:
+            logger.warning(
+                "inventory_webhook_registration_failed %s",
+                safe_json_dumps({"shop": shop.shop_domain, "message": str(exc)}),
+            )
 
 
 def _asset_version() -> str:
@@ -730,23 +758,26 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
 
 
 def normalize_external_bulk_payload(raw_payload: Any) -> List[ProductSyncRequest]:
+    items = _extract_external_bulk_items(raw_payload)
+    return [normalize_external_product_payload(item) for item in items]
+
+
+def _extract_external_bulk_items(raw_payload: Any) -> List[Any]:
     if isinstance(raw_payload, list):
-        items = raw_payload
+        return raw_payload
     elif isinstance(raw_payload, dict):
         if isinstance(raw_payload.get("products"), list):
-            items = raw_payload["products"]
+            return raw_payload["products"]
         elif isinstance(raw_payload.get("create"), list) or isinstance(raw_payload.get("update"), list):
-            items = list(raw_payload.get("create") or []) + list(raw_payload.get("update") or [])
+            return list(raw_payload.get("create") or []) + list(raw_payload.get("update") or [])
         else:
-            items = [raw_payload]
+            return [raw_payload]
     else:
         raise SyncProcessingError(
             "Bulk payload must be a JSON array or object.",
             {"received_type": type(raw_payload).__name__},
             code="invalid_bulk_payload",
         )
-
-    return [normalize_external_product_payload(item) for item in items]
 
 
 def normalize_external_customer_payload(raw_payload: Any) -> CustomerSyncRequest:
@@ -1299,6 +1330,13 @@ async def auth_callback(request: Request) -> RedirectResponse:
         myshopify_domain=shop_info.get("myshopifyDomain"),
     )
     _, raw_secret = db.ensure_pos_credentials(saved_shop.shop_domain)
+    try:
+        ensure_inventory_webhook(saved_shop)
+    except Exception as exc:
+        logger.warning(
+            "inventory_webhook_registration_failed %s",
+            safe_json_dumps({"shop": saved_shop.shop_domain, "message": str(exc)}),
+        )
 
     host = request.query_params.get("host") or oauth_state.get("host")
     return_to = oauth_state.get("return_to") or "/app"
@@ -1876,6 +1914,8 @@ def _build_woo_product_payload(item: Any) -> dict[str, Any]:
     return {
         "id": numeric_product_id,
         "name": item.title,
+        "sku": item.sku or "",
+        "barcode": item.barcode or "",
         "regular_price": f"{item.price:.2f}" if item.price is not None else "",
         "stock_quantity": int(item.quantity) if item.quantity is not None else 0,
     }
@@ -2011,7 +2051,8 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
             }
         )
 
-    normalized_items = normalize_external_bulk_payload(raw_payload)
+    raw_items = _extract_external_bulk_items(raw_payload)
+    normalized_items = [normalize_external_product_payload(item) for item in raw_items]
     try:
         worker_header = (request.headers.get("X-Sync-Workers") or "1").strip()
         try:
@@ -2053,7 +2094,13 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
         )
         raise
 
-    for row in result.results:
+    for row, raw_item, normalized_item in zip(result.results, raw_items, normalized_items):
+        if row.success and row.inventory_item_id and row.sku:
+            db.upsert_inventory_item_sku(
+                shop_domain=shop.shop_domain,
+                inventory_item_id=normalize_gid("InventoryItem", row.inventory_item_id),
+                sku=row.sku,
+            )
         db.record_feed_event(
             shop_domain=shop.shop_domain,
             source=source,
@@ -2065,8 +2112,8 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
             message=row.message,
             product_id=row.product_id,
             variant_id=row.variant_id,
-            request_payload=_serialize_payload(raw_payload),
-            normalized_payload=_serialize_payload([item.model_dump(mode="json") for item in normalized_items]),
+            request_payload=_serialize_payload(raw_item),
+            normalized_payload=_serialize_payload(normalized_item.model_dump(mode="json")),
         )
     return result
 
@@ -2408,6 +2455,150 @@ async def reconcile_catalog_products(
     return JSONResponse(result)
 
 
+@app.get("/sync/inventory", response_model=None)
+@app.get("/wc-api/v3/inventory", response_model=None, include_in_schema=False)
+@app.get("/wp-json/wc/v3/inventory", response_model=None, include_in_schema=False)
+async def connector_inventory_snapshot(
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    items = run_with_shop_retry(
+        shop,
+        lambda active_shop: inventory_service.list_inventory_snapshot(active_shop),
+    )
+    return JSONResponse(
+        {
+            "shop": shop.shop_domain,
+            "total": len(items),
+            "items": items,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
+@app.get("/sync/inventory/changes", response_model=None)
+@app.get("/wc-api/v3/inventory/changes", response_model=None, include_in_schema=False)
+@app.get("/wp-json/wc/v3/inventory/changes", response_model=None, include_in_schema=False)
+async def connector_inventory_changes(
+    limit: int = 5000,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    rows = db.list_inventory_changes(shop_domain=shop.shop_domain, limit=limit)
+    return JSONResponse(
+        {
+            "shop": shop.shop_domain,
+            "total": len(rows),
+            "items": [
+                {
+                    "id": row.id,
+                    "version": row.version,
+                    "sku": row.sku,
+                    "quantity": row.quantity,
+                    "inventory_item_id": row.inventory_item_id,
+                    "location_id": row.location_id,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ],
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
+@app.post("/sync/inventory/changes/ack", response_model=None)
+@app.post("/wc-api/v3/inventory/changes/ack", response_model=None, include_in_schema=False)
+@app.post("/wp-json/wc/v3/inventory/changes/ack", response_model=None, include_in_schema=False)
+async def acknowledge_connector_inventory_changes(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_changes = raw_payload.get("changes") if isinstance(raw_payload, dict) else None
+    if not isinstance(raw_changes, list):
+        raise SyncProcessingError(
+            "Inventory change acknowledgement requires a changes array.",
+            code="invalid_inventory_change_ack",
+        )
+    changes: list[tuple[int, int]] = []
+    for raw_change in raw_changes[:10000]:
+        if isinstance(raw_change, dict):
+            changes.append((int(raw_change.get("id")), int(raw_change.get("version"))))
+    deleted = db.acknowledge_inventory_changes(shop_domain=shop.shop_domain, changes=changes)
+    return JSONResponse({"acknowledged": deleted, "requested": len(changes), "timestamp": utc_now_iso()})
+
+
+@app.post("/sync/inventory/adjustments", response_model=None)
+@app.post("/wc-api/v3/inventory/adjustments", response_model=None, include_in_schema=False)
+@app.post("/wp-json/wc/v3/inventory/adjustments", response_model=None, include_in_schema=False)
+async def connector_inventory_adjustments(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_adjustments = raw_payload.get("adjustments") if isinstance(raw_payload, dict) else raw_payload
+    if not isinstance(raw_adjustments, list) or not raw_adjustments:
+        raise SyncProcessingError(
+            "Inventory adjustments require a non-empty adjustments array.",
+            code="invalid_inventory_adjustments",
+        )
+    if len(raw_adjustments) > 250:
+        raise SyncProcessingError(
+            "Inventory adjustments are limited to 250 rows per request.",
+            {"count": len(raw_adjustments)},
+            code="too_many_inventory_adjustments",
+        )
+
+    results: list[dict[str, Any]] = []
+    for index, raw_adjustment in enumerate(raw_adjustments):
+        if not isinstance(raw_adjustment, dict):
+            results.append(
+                {"sku": "", "delta": 0, "success": False, "message": f"Row {index + 1} is not an object."}
+            )
+            continue
+        sku = _string_or_none(raw_adjustment.get("sku")) or ""
+        try:
+            delta = int(raw_adjustment.get("delta"))
+            idempotency_key = _string_or_none(raw_adjustment.get("idempotency_key")) or secrets.token_hex(16)
+            if len(idempotency_key) > 128:
+                raise ValueError("idempotency_key must be 128 characters or fewer")
+            result = run_with_shop_retry(
+                shop,
+                lambda active_shop: inventory_service.adjust_inventory_quantity(
+                    sku=sku,
+                    delta=delta,
+                    idempotency_key=idempotency_key,
+                    shop=active_shop,
+                ),
+            )
+            if result.get("success") and result.get("inventory_item_id") and result.get("sku"):
+                db.upsert_inventory_item_sku(
+                    shop_domain=shop.shop_domain,
+                    inventory_item_id=normalize_gid("InventoryItem", result["inventory_item_id"]),
+                    sku=result["sku"],
+                )
+            results.append(result)
+        except Exception as exc:
+            results.append(
+                {
+                    "sku": sku,
+                    "delta": raw_adjustment.get("delta"),
+                    "success": False,
+                    "message": str(exc),
+                    "details": exc.details if isinstance(exc, AppError) else {},
+                }
+            )
+
+    succeeded = sum(1 for result in results if result.get("success"))
+    return JSONResponse(
+        {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "results": results,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
 @app.api_route(
     "/wc-api/v3/products",
     methods=["GET", "POST"],
@@ -2601,6 +2792,60 @@ async def woo_compat_fallback(
         status_code=404,
         code="woo_path_not_found",
     )
+
+
+@app.post("/webhooks/inventory-levels-update")
+async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
+    body = await request.body()
+    shop_domain = verify_webhook_request(request, body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SyncProcessingError("Inventory webhook body is not valid JSON.", code="invalid_inventory_webhook") from exc
+
+    inventory_item_value = payload.get("inventory_item_id")
+    location_value = payload.get("location_id")
+    available = payload.get("available")
+    if inventory_item_value in (None, "") or location_value in (None, "") or available is None:
+        return JSONResponse({"status": "ignored", "reason": "missing_inventory_fields"})
+
+    inventory_item_id = normalize_gid("InventoryItem", str(inventory_item_value))
+    location_id = normalize_gid("Location", str(location_value))
+    if settings.shopify_location_id and location_id != normalize_gid("Location", settings.shopify_location_id):
+        return JSONResponse({"status": "ignored", "reason": "different_location"})
+
+    shop = db.get_shop(shop_domain)
+    if shop is None:
+        return JSONResponse({"status": "ignored", "reason": "shop_not_installed"})
+    sku = db.get_inventory_item_sku(
+        shop_domain=shop_domain,
+        inventory_item_id=inventory_item_id,
+    )
+    if not sku:
+        sku = run_with_shop_retry(
+            shop,
+            lambda active_shop: shopify_client.get_inventory_item_sku(
+                active_shop.shop_domain,
+                active_shop.access_token,
+                inventory_item_id,
+            ),
+        )
+        if not sku:
+            return JSONResponse({"status": "ignored", "reason": "inventory_item_has_no_sku"})
+        db.upsert_inventory_item_sku(
+            shop_domain=shop_domain,
+            inventory_item_id=inventory_item_id,
+            sku=sku,
+        )
+
+    db.upsert_inventory_change(
+        shop_domain=shop_domain,
+        inventory_item_id=inventory_item_id,
+        location_id=location_id,
+        sku=sku,
+        quantity=int(available),
+    )
+    return JSONResponse({"status": "queued"})
 
 
 @app.post("/webhooks/app-uninstalled")
