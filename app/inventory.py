@@ -53,7 +53,7 @@ class InventorySyncService:
         self._customer_custom_id_ready: set[str] = set()
 
     def sync_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
-        normalized = self._normalize_payload(payload)
+        normalized = self._apply_catalog_import_policy(self._normalize_payload(payload))
         display_sku = normalized.sku or normalized.handle or normalized.title or "unknown-product"
 
         try:
@@ -1004,8 +1004,11 @@ class InventorySyncService:
         if payload.handle:
             product_update["handle"] = payload.handle
         description_html = payload.description_html or payload.description or payload.short_description
-        if payload.update_description and description_html:
-            product_update["descriptionHtml"] = description_html
+        if payload.update_description:
+            # An explicit update with no content means "clear the description". This is
+            # used during the one-time POS catalog import so generated DBF text is not
+            # left in Shopify for merchants to clean up later.
+            product_update["descriptionHtml"] = description_html or ""
         vendor = payload.vendor or payload.brand
         if vendor:
             product_update["vendor"] = vendor
@@ -1242,6 +1245,39 @@ class InventorySyncService:
                 "vendor": vendor,
                 "tags": tags,
                 "variants": variants,
+            }
+        )
+
+    def _apply_catalog_import_policy(self, payload: ProductSyncRequest) -> ProductSyncRequest:
+        """Apply the storefront-safe rules for the one-time POS catalog import.
+
+        The unattended connector records successful base SKUs locally and does not send
+        catalog payloads for them again. Recurring syncs use the inventory adjustment
+        endpoint, so merchant edits to titles, descriptions, prices, tags, images, and
+        other product fields remain untouched after this import request succeeds.
+        """
+        tags = list(payload.tags)
+        if payload.title and payload.title.casefold() not in {tag.casefold() for tag in tags}:
+            tags.append(payload.title)
+
+        total_quantity = payload.quantity
+        if total_quantity is None and payload.variants:
+            variant_quantities = [variant.quantity for variant in payload.variants if variant.quantity is not None]
+            if variant_quantities:
+                total_quantity = sum(variant_quantities)
+
+        status = payload.status
+        if total_quantity is not None and int(total_quantity) <= 0:
+            status = "archived"
+
+        return payload.model_copy(
+            update={
+                "description_html": "",
+                "description": None,
+                "short_description": None,
+                "update_description": True,
+                "tags": tags,
+                "status": status,
             }
         )
 

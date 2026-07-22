@@ -5,10 +5,11 @@ three minutes but sends no ZIP archives to Railway.
 
 ## Sync behavior
 
-1. On its first successful run, it uploads product and SKU details. New Shopify products default to
-   draft because the connector does not force a status.
+1. On its first successful run, it uploads product and SKU details. New in-stock Shopify products
+   default to draft, while zero-quantity products are archived.
 2. It records a small local baseline for every SKU and matrix variant.
-3. Later runs send inventory deltas only. Product titles, prices, tags, and descriptions are not
+3. Initial descriptions are empty and the generated product name is included as a tag. Later runs
+   send inventory deltas only, so product titles, prices, tags, descriptions, and images are not
    repeatedly overwritten.
 4. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
    changed quantities; it does not scan the entire Shopify catalog.

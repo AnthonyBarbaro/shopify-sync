@@ -62,6 +62,11 @@ cannot grow the Railway SQLite volume without bound.
 Legacy POS ZIP uploads retain only the product/inventory DBFs and delete the ZIP after extraction.
 The unattended Windows connector does not upload DBF files at all.
 
+The unattended connector treats catalog data as a one-time import: zero-quantity products are
+archived, descriptions start empty, and the generated product name is added as a tag. After a base
+SKU is successfully imported, recurring connector traffic uses inventory-only endpoints so Shopify
+edits to titles, descriptions, prices, tags, images, and other merchandising fields are preserved.
+
 ## Local Run
 
 Install dependencies:

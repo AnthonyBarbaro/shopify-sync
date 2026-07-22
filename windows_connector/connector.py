@@ -285,7 +285,9 @@ class Connector:
             skip_zero_quantity=False,
             limit=None,
             name_mode="smart",
-            include_html_description=True,
+            # Railway deliberately creates products with an empty description so
+            # storefront copy can be managed in Shopify after the first import.
+            include_html_description=False,
             include_tags=True,
             include_desc2_description=False,
             include_metafields=True,
