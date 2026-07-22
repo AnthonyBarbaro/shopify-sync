@@ -128,6 +128,9 @@ class Connector:
 
         prepared_products, stats = dbf_pos_sync.load_products(self._reader_args())
         payloads = [prepared.payload for prepared in prepared_products]
+        # Python's sort is stable, so products keep their POS order within each
+        # group while every stocked product is uploaded before zero-stock rows.
+        payloads.sort(key=catalog_upload_priority)
         payload_by_base = {str(payload["sku"]): payload for payload in payloads}
         local_quantities = flatten_quantities(payloads)
         self.logger.info(
@@ -425,6 +428,17 @@ def flatten_quantities(payloads: Iterable[Dict[str, Any]]) -> Dict[str, int]:
         if sku:
             quantities[sku] = int(payload.get("quantity") or 0)
     return quantities
+
+
+def catalog_total_quantity(payload: Dict[str, Any]) -> int:
+    variants = payload.get("variants") or []
+    if variants:
+        return sum(int(variant.get("quantity") or 0) for variant in variants)
+    return int(payload.get("quantity") or 0)
+
+
+def catalog_upload_priority(payload: Dict[str, Any]) -> int:
+    return 0 if catalog_total_quantity(payload) > 0 else 1
 
 
 def merge_quantity(

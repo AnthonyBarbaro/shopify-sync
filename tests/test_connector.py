@@ -10,7 +10,13 @@ from app.db import ShopRecord
 from app.inventory import InventorySyncService
 from app.models import InventoryLevelSnapshot, VariantMapping
 from app.pos_archive import save_uploaded_archive
-from windows_connector.connector import adjustment_key, flatten_quantities, merge_quantity
+from windows_connector.connector import (
+    adjustment_key,
+    catalog_total_quantity,
+    catalog_upload_priority,
+    flatten_quantities,
+    merge_quantity,
+)
 
 
 class QuantityMergeTests(unittest.TestCase):
@@ -74,6 +80,36 @@ class QuantityMergeTests(unittest.TestCase):
         first = adjustment_key("shopify", "ABC", 1, 10, 9, 10, 10, 9)
         later = adjustment_key("shopify", "ABC", 3, 10, 9, 10, 10, 9)
         self.assertNotEqual(first, later)
+
+
+class CatalogUploadPriorityTests(unittest.TestCase):
+    def test_stocked_products_sort_before_zero_stock_products(self):
+        products = [
+            {"sku": "ZERO-1", "quantity": 0},
+            {"sku": "STOCK-1", "quantity": 3},
+            {"sku": "ZERO-2", "quantity": 0},
+            {"sku": "STOCK-2", "quantity": 1},
+        ]
+
+        products.sort(key=catalog_upload_priority)
+
+        self.assertEqual(
+            [product["sku"] for product in products],
+            ["STOCK-1", "STOCK-2", "ZERO-1", "ZERO-2"],
+        )
+
+    def test_matrix_priority_uses_combined_variant_quantity(self):
+        matrix = {
+            "sku": "MATRIX",
+            "quantity": 0,
+            "variants": [
+                {"sku": "MATRIX. 1 1", "quantity": 0},
+                {"sku": "MATRIX. 1 2", "quantity": 2},
+            ],
+        }
+
+        self.assertEqual(catalog_total_quantity(matrix), 2)
+        self.assertEqual(catalog_upload_priority(matrix), 0)
 
 
 class DatabaseRetentionTests(unittest.TestCase):

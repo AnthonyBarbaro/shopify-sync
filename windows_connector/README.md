@@ -6,7 +6,8 @@ three minutes but sends no ZIP archives to Railway.
 ## Sync behavior
 
 1. On its first successful run, it uploads product and SKU details. New in-stock Shopify products
-   default to draft, while zero-quantity products are archived.
+   default to draft, while zero-quantity products are archived. All in-stock products are sent
+   before zero-stock products, preserving their original POS order within each group.
 2. It records a small local baseline for every SKU and matrix variant.
 3. Initial descriptions are empty and the generated product name is included as a tag. Later runs
    send inventory deltas only, so product titles, prices, tags, descriptions, and images are not
