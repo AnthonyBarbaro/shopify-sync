@@ -48,12 +48,13 @@ SHOPIFY_CLIENT_ID=your_client_id
 SHOPIFY_CLIENT_SECRET=your_client_secret
 SHOPIFY_API_VERSION=2026-01
 APP_BASE_URL=https://your-domain.example
-APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations
+APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations,read_orders
 APP_SESSION_SECRET=replace_with_a_long_random_secret
 POS_SECRET_ENCRYPTION_SECRET=replace_with_a_second_long_random_secret
 DATABASE_PATH=inventory_sync.sqlite3
 FEED_EVENT_RETENTION_ROWS=2000
 REQUEST_LOG_RETENTION_ROWS=1000
+ORDER_EVENT_RETENTION_ROWS=2000
 ```
 
 Feed and request history is automatically pruned to these limits so recurring connector traffic
@@ -66,6 +67,15 @@ The unattended connector treats catalog data as a one-time import: zero-quantity
 archived, descriptions start empty, and the generated product name is added as a tag. After a base
 SKU is successfully imported, recurring connector traffic uses inventory-only endpoints so Shopify
 edits to titles, descriptions, prices, tags, images, and other merchandising fields are preserved.
+
+With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
+queue until the Windows connector writes them to `C:\ashpsdat\shopify-order.db`. The local database
+is isolated from the POS FoxPro tables and contains normalized order and line-item rows for printing
+or a later vendor-tested POS import; payment/card data and raw webhook payloads are not retained.
+After adding `read_orders` to an existing Railway `APP_SCOPES` value, run the Shopify install flow
+again so the store grants the new scope. Depending on the app's Shopify distribution and protected
+customer data approval, customer contact and shipping fields can be redacted while order and SKU
+fields still sync.
 
 ## Local Run
 

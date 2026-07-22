@@ -32,6 +32,19 @@ Windows keeps only:
 Railway receives JSON inventory changes, not DBF archives. The server separately caps its feed and
 request history using `FEED_EVENT_RETENTION_ROWS` and `REQUEST_LOG_RETENTION_ROWS`.
 
+## Shopify order inbox
+
+When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete
+events before each inventory cycle and writes them transactionally to
+`C:\ashpsdat\shopify-order.db` by default. This separate SQLite database contains an `orders` table
+and an `order_items` table, and never modifies the POS FoxPro order tables. It stores fulfillment
+details needed for a picking ticket but excludes billing addresses, card data, payment credentials,
+and raw webhook payloads. Railway deletes a queued change only after the local transaction succeeds.
+
+New orders have `print_status=PENDING`; a printing integration can mark them `PRINTED` and set
+`printed_at`. The file is an order inbox for the bridge and does not appear in the native POS Orders
+tab without a separately tested POS import.
+
 ## Install
 
 1. Copy `connector.env.example` to `connector.env`.

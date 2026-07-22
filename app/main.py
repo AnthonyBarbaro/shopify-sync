@@ -83,6 +83,7 @@ db = DatabaseStore(
     settings.credential_encryption_secret,
     feed_event_retention_rows=settings.feed_event_retention_rows,
     request_log_retention_rows=settings.request_log_retention_rows,
+    order_event_retention_rows=settings.order_event_retention_rows,
 )
 session_manager = AppSessionManager(settings)
 shopify_client = ShopifyClient(settings)
@@ -126,6 +127,17 @@ def ensure_inventory_webhook(shop: ShopRecord) -> None:
     )
 
 
+def ensure_order_webhooks(shop: ShopRecord) -> None:
+    run_with_shop_retry(
+        shop,
+        lambda active_shop: shopify_client.ensure_order_webhooks(
+            active_shop.shop_domain,
+            active_shop.access_token,
+            f"{settings.normalized_app_base_url}/webhooks/orders",
+        ),
+    )
+
+
 @app.on_event("startup")
 async def ensure_connector_webhooks_on_startup() -> None:
     for shop in db.list_shops():
@@ -134,6 +146,13 @@ async def ensure_connector_webhooks_on_startup() -> None:
         except Exception as exc:
             logger.warning(
                 "inventory_webhook_registration_failed %s",
+                safe_json_dumps({"shop": shop.shop_domain, "message": str(exc)}),
+            )
+        try:
+            ensure_order_webhooks(shop)
+        except Exception as exc:
+            logger.warning(
+                "order_webhook_registration_failed %s",
                 safe_json_dumps({"shop": shop.shop_domain, "message": str(exc)}),
             )
 
@@ -1206,6 +1225,101 @@ def verify_webhook_request(request: Request, body: bytes) -> str:
     return validate_shop_domain(shop_domain)
 
 
+def _compact_order_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed by the local order inbox and picking tickets."""
+
+    def address(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        allowed = (
+            "first_name",
+            "last_name",
+            "name",
+            "company",
+            "address1",
+            "address2",
+            "city",
+            "province",
+            "province_code",
+            "country",
+            "country_code",
+            "zip",
+            "phone",
+        )
+        return {key: value.get(key) for key in allowed if value.get(key) not in (None, "")}
+
+    line_items = []
+    for item in payload.get("line_items") or []:
+        if not isinstance(item, dict):
+            continue
+        line_items.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "id",
+                    "variant_id",
+                    "sku",
+                    "title",
+                    "variant_title",
+                    "quantity",
+                    "current_quantity",
+                    "price",
+                    "total_discount",
+                    "grams",
+                    "requires_shipping",
+                    "fulfillment_status",
+                )
+                if item.get(key) is not None
+            }
+        )
+
+    shipping_lines = []
+    for item in payload.get("shipping_lines") or []:
+        if not isinstance(item, dict):
+            continue
+        shipping_lines.append(
+            {
+                key: item.get(key)
+                for key in ("id", "code", "title", "price", "discounted_price")
+                if item.get(key) is not None
+            }
+        )
+
+    customer = payload.get("customer") if isinstance(payload.get("customer"), dict) else {}
+    shipping_price_set = payload.get("current_shipping_price_set") or payload.get("total_shipping_price_set") or {}
+    shop_money = shipping_price_set.get("shop_money") if isinstance(shipping_price_set, dict) else {}
+    compact = {
+        "id": payload.get("id"),
+        "admin_graphql_api_id": payload.get("admin_graphql_api_id"),
+        "name": payload.get("name"),
+        "order_number": payload.get("order_number"),
+        "confirmation_number": payload.get("confirmation_number"),
+        "created_at": payload.get("created_at"),
+        "updated_at": payload.get("updated_at"),
+        "processed_at": payload.get("processed_at"),
+        "cancelled_at": payload.get("cancelled_at"),
+        "closed_at": payload.get("closed_at"),
+        "financial_status": payload.get("financial_status"),
+        "fulfillment_status": payload.get("fulfillment_status"),
+        "currency": payload.get("currency"),
+        "subtotal_price": payload.get("current_subtotal_price") or payload.get("subtotal_price"),
+        "total_discounts": payload.get("current_total_discounts") or payload.get("total_discounts"),
+        "shipping_price": (shop_money or {}).get("amount") if isinstance(shop_money, dict) else None,
+        "total_tax": payload.get("current_total_tax") or payload.get("total_tax"),
+        "total_price": payload.get("current_total_price") or payload.get("total_price"),
+        "email": payload.get("contact_email") or payload.get("email"),
+        "phone": payload.get("phone") or customer.get("phone"),
+        "customer_first_name": customer.get("first_name"),
+        "customer_last_name": customer.get("last_name"),
+        "note": payload.get("note"),
+        "tags": payload.get("tags"),
+        "shipping_address": address(payload.get("shipping_address")),
+        "line_items": line_items,
+        "shipping_lines": shipping_lines,
+    }
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
 @app.exception_handler(AppError)
 async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
     logger.error(
@@ -1335,6 +1449,13 @@ async def auth_callback(request: Request) -> RedirectResponse:
     except Exception as exc:
         logger.warning(
             "inventory_webhook_registration_failed %s",
+            safe_json_dumps({"shop": saved_shop.shop_domain, "message": str(exc)}),
+        )
+    try:
+        ensure_order_webhooks(saved_shop)
+    except Exception as exc:
+        logger.warning(
+            "order_webhook_registration_failed %s",
             safe_json_dumps({"shop": saved_shop.shop_domain, "message": str(exc)}),
         )
 
@@ -2455,6 +2576,55 @@ async def reconcile_catalog_products(
     return JSONResponse(result)
 
 
+@app.get("/sync/orders/changes", response_model=None)
+@app.get("/wc-api/v3/orders/changes", response_model=None, include_in_schema=False)
+async def connector_order_changes(
+    limit: int = 250,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    rows = db.list_order_changes(shop_domain=shop.shop_domain, limit=limit)
+    return JSONResponse(
+        {
+            "shop": shop.shop_domain,
+            "total": len(rows),
+            "items": [
+                {
+                    "id": row.id,
+                    "version": row.version,
+                    "shopify_order_id": row.shopify_order_id,
+                    "order_name": row.order_name,
+                    "event_topic": row.event_topic,
+                    "order": json.loads(row.payload),
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ],
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
+@app.post("/sync/orders/changes/ack", response_model=None)
+@app.post("/wc-api/v3/orders/changes/ack", response_model=None, include_in_schema=False)
+async def acknowledge_connector_order_changes(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_changes = raw_payload.get("changes") if isinstance(raw_payload, dict) else None
+    if not isinstance(raw_changes, list):
+        raise SyncProcessingError(
+            "Order acknowledgements require a changes array.",
+            code="invalid_order_change_ack",
+        )
+    changes: list[tuple[int, int]] = []
+    for raw_change in raw_changes[:1000]:
+        if isinstance(raw_change, dict):
+            changes.append((int(raw_change.get("id")), int(raw_change.get("version"))))
+    deleted = db.acknowledge_order_changes(shop_domain=shop.shop_domain, changes=changes)
+    return JSONResponse({"acknowledged": deleted, "requested": len(changes), "timestamp": utc_now_iso()})
+
+
 @app.get("/sync/inventory", response_model=None)
 @app.get("/wc-api/v3/inventory", response_model=None, include_in_schema=False)
 @app.get("/wp-json/wc/v3/inventory", response_model=None, include_in_schema=False)
@@ -2794,6 +2964,35 @@ async def woo_compat_fallback(
     )
 
 
+@app.post("/webhooks/orders")
+async def orders_webhook(request: Request) -> JSONResponse:
+    body = await request.body()
+    shop_domain = verify_webhook_request(request, body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SyncProcessingError("Order webhook body is not valid JSON.", code="invalid_order_webhook") from exc
+    if not isinstance(payload, dict):
+        raise SyncProcessingError("Order webhook body must be an object.", code="invalid_order_webhook")
+
+    order_id = payload.get("id")
+    if order_id in (None, ""):
+        return JSONResponse({"status": "ignored", "reason": "missing_order_id"})
+    if db.get_shop(shop_domain) is None:
+        return JSONResponse({"status": "ignored", "reason": "shop_not_installed"})
+
+    topic = (request.headers.get("x-shopify-topic") or "orders/updated").strip().lower()
+    compact = _compact_order_payload(payload)
+    db.upsert_order_change(
+        shop_domain=shop_domain,
+        shopify_order_id=str(order_id),
+        order_name=_string_or_none(payload.get("name")),
+        event_topic=topic,
+        payload=json.dumps(compact, separators=(",", ":"), sort_keys=True),
+    )
+    return JSONResponse({"status": "queued", "order_id": str(order_id)})
+
+
 @app.post("/webhooks/inventory-levels-update")
 async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
     body = await request.body()
@@ -2863,6 +3062,21 @@ async def app_uninstalled_webhook(request: Request) -> JSONResponse:
 async def compliance_webhooks(request: Request) -> JSONResponse:
     body = await request.body()
     shop_domain = verify_webhook_request(request, body)
+    if request.url.path.endswith("/customers/redact") and db.get_shop(shop_domain) is not None:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
+        for order_id in payload.get("orders_to_redact") or []:
+            db.upsert_order_change(
+                shop_domain=shop_domain,
+                shopify_order_id=str(order_id),
+                order_name=None,
+                event_topic="customers/redact",
+                payload=json.dumps({"id": order_id, "redacted": True}, separators=(",", ":")),
+            )
+    elif request.url.path.endswith("/shop/redact"):
+        db.mark_shop_uninstalled(shop_domain)
     logger.info(
         "compliance_webhook %s",
         safe_json_dumps({"shop": shop_domain, "path": request.url.path, "timestamp": utc_now_iso()}),

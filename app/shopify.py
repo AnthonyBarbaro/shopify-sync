@@ -198,6 +198,75 @@ class ShopifyClient:
                 {"uri": uri, "user_errors": user_errors},
             )
 
+    def ensure_order_webhooks(
+        self,
+        shop_domain: str,
+        access_token: str,
+        uri: str,
+    ) -> None:
+        topics = ["ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_CANCELLED", "ORDERS_DELETE"]
+        query = """
+        query OrderWebhookSubscriptions($topics: [WebhookSubscriptionTopic!], $uri: String) {
+          webhookSubscriptions(first: 25, topics: $topics, uri: $uri) {
+            nodes {
+              id
+              topic
+              uri
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"topics": topics, "uri": uri},
+            operation_name="OrderWebhookSubscriptions",
+        )
+        existing = {
+            node.get("topic")
+            for node in payload["data"]["webhookSubscriptions"]["nodes"]
+            if node.get("uri") == uri
+        }
+        mutation = """
+        mutation CreateOrderWebhook(
+          $topic: WebhookSubscriptionTopic!,
+          $webhookSubscription: WebhookSubscriptionInput!
+        ) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+            webhookSubscription {
+              id
+              topic
+              uri
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        for topic in topics:
+            if topic in existing:
+                continue
+            created = self.graphql(
+                shop_domain,
+                access_token,
+                mutation,
+                {
+                    "topic": topic,
+                    "webhookSubscription": {"uri": uri, "format": "JSON"},
+                },
+                operation_name="CreateOrderWebhook",
+            )
+            result = created["data"]["webhookSubscriptionCreate"]
+            user_errors = result.get("userErrors") or []
+            if user_errors:
+                raise ShopifyAPIError(
+                    "Shopify rejected an order webhook subscription.",
+                    {"topic": topic, "uri": uri, "user_errors": user_errors},
+                )
+
     def ensure_customer_custom_id_definition(
         self,
         shop_domain: str,

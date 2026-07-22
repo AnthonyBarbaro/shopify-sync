@@ -28,6 +28,7 @@ class Settings:
     shopify_bulk_max_workers: int = 4
     feed_event_retention_rows: int = 2000
     request_log_retention_rows: int = 1000
+    order_event_retention_rows: int = 2000
     shopify_location_id: Optional[str] = None
 
     @property
@@ -63,7 +64,7 @@ def get_settings() -> Settings:
         ).strip(),
         app_scopes=(
             os.getenv("APP_SCOPES")
-            or "read_products,write_products,read_inventory,write_inventory,read_locations,read_customers,write_customers"
+            or "read_products,write_products,read_inventory,write_inventory,read_locations,read_customers,write_customers,read_orders"
         ).strip(),
         database_path=(os.getenv("DATABASE_PATH") or "inventory_sync.sqlite3").strip(),
         shopify_api_version=(os.getenv("SHOPIFY_API_VERSION") or "2026-01").strip(),
@@ -78,6 +79,10 @@ def get_settings() -> Settings:
         request_log_retention_rows=max(
             100,
             int((os.getenv("REQUEST_LOG_RETENTION_ROWS") or "1000").strip()),
+        ),
+        order_event_retention_rows=max(
+            100,
+            int((os.getenv("ORDER_EVENT_RETENTION_ROWS") or "2000").strip()),
         ),
         shopify_location_id=(os.getenv("SHOPIFY_LOCATION_ID") or "").strip() or None,
     )

@@ -1,4 +1,5 @@
 import io
+import sqlite3
 import tempfile
 import unittest
 import zipfile
@@ -16,6 +17,7 @@ from windows_connector.connector import (
     catalog_upload_priority,
     flatten_quantities,
     merge_quantity,
+    upsert_order_changes,
 )
 
 
@@ -201,6 +203,118 @@ class DatabaseRetentionTests(unittest.TestCase):
                 ),
                 1,
             )
+
+    def test_order_change_ack_does_not_delete_a_newer_webhook(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(
+                str(Path(temporary_directory) / "sync.sqlite3"),
+                "test-secret",
+                order_event_retention_rows=100,
+            )
+            store.upsert_order_change(
+                shop_domain="example.myshopify.com",
+                shopify_order_id="1001",
+                order_name="#1001",
+                event_topic="orders/create",
+                payload='{"id":1001}',
+            )
+            first = store.list_order_changes(shop_domain="example.myshopify.com")[0]
+            store.upsert_order_change(
+                shop_domain="example.myshopify.com",
+                shopify_order_id="1001",
+                order_name="#1001",
+                event_topic="orders/updated",
+                payload='{"id":1001,"total_price":"42.00"}',
+            )
+
+            self.assertEqual(
+                store.acknowledge_order_changes(
+                    shop_domain="example.myshopify.com",
+                    changes=[(first.id, first.version)],
+                ),
+                0,
+            )
+            latest = store.list_order_changes(shop_domain="example.myshopify.com")[0]
+            self.assertEqual(latest.version, 2)
+            self.assertEqual(latest.event_topic, "orders/updated")
+
+
+class LocalOrderInboxTests(unittest.TestCase):
+    def test_order_and_lines_are_upserted_without_changing_print_status(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "shopify-order.db"
+            base_change = {
+                "id": 1,
+                "version": 1,
+                "shopify_order_id": "1001",
+                "order_name": "#1001",
+                "event_topic": "orders/create",
+                "order": {
+                    "id": 1001,
+                    "name": "#1001",
+                    "created_at": "2026-07-22T12:00:00-07:00",
+                    "financial_status": "paid",
+                    "currency": "USD",
+                    "total_price": "42.00",
+                    "customer_first_name": "Ada",
+                    "customer_last_name": "Lovelace",
+                    "shipping_address": {
+                        "name": "Ada Lovelace",
+                        "address1": "123 Main St",
+                        "city": "Los Angeles",
+                        "province_code": "CA",
+                        "zip": "90001",
+                    },
+                    "line_items": [
+                        {"id": 501, "sku": "ABC", "title": "Shirt", "quantity": 2, "price": "21.00"}
+                    ],
+                },
+            }
+            upsert_order_changes(database_path, [base_change], retention_rows=100)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "UPDATE orders SET print_status='PRINTED', printed_at='2026-07-22T12:01:00-07:00'"
+                )
+                connection.commit()
+
+            updated_change = {
+                **base_change,
+                "version": 2,
+                "event_topic": "orders/updated",
+                "order": {
+                    **base_change["order"],
+                    "updated_at": "2026-07-22T12:02:00-07:00",
+                    "total_price": "45.00",
+                },
+            }
+            upsert_order_changes(database_path, [updated_change], retention_rows=100)
+
+            with sqlite3.connect(database_path) as connection:
+                connection.row_factory = sqlite3.Row
+                order = connection.execute("SELECT * FROM orders").fetchone()
+                items = connection.execute("SELECT * FROM order_items").fetchall()
+            self.assertEqual(order["total_price"], "45.00")
+            self.assertEqual(order["print_status"], "PRINTED")
+            self.assertEqual(order["source_version"], 2)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["sku"], "ABC")
+
+            upsert_order_changes(
+                database_path,
+                [
+                    {
+                        "id": 2,
+                        "version": 3,
+                        "shopify_order_id": "1001",
+                        "event_topic": "orders/delete",
+                        "order": {"id": 1001},
+                    }
+                ],
+                retention_rows=100,
+            )
+            with sqlite3.connect(database_path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM order_items").fetchone()[0], 0)
 
 
 class InventoryAdjustmentTests(unittest.TestCase):

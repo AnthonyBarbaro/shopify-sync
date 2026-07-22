@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -65,6 +66,11 @@ class Connector:
         self.workers = env_int("CONNECTOR_WORKERS", 2, minimum=1, maximum=4)
         self.timeout = env_int("CONNECTOR_TIMEOUT_SECONDS", 300, minimum=30, maximum=1800)
         self.initial_catalog_upload = env_bool("INITIAL_CATALOG_UPLOAD", True)
+        self.order_sync_enabled = env_bool("ORDER_SYNC_ENABLED", True)
+        self.order_db_path = Path(
+            os.getenv("SHOPIFY_ORDER_DB_PATH") or (self.dbf_dir / "shopify-order.db")
+        ).expanduser().resolve()
+        self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 10000, minimum=100, maximum=100000)
         self.writeback_mode = (os.getenv("POS_WRITEBACK_MODE") or "disabled").strip().lower()
         if self.writeback_mode not in {"disabled", "dry-run", "vfp-oledb"}:
             raise ValueError("POS_WRITEBACK_MODE must be disabled, dry-run, or vfp-oledb")
@@ -125,6 +131,9 @@ class Connector:
         state = load_state(self.state_path)
         if not self.dry_run:
             self._retry_pending(state)
+
+        if self.order_sync_enabled:
+            self._sync_order_inbox()
 
         prepared_products, stats = dbf_pos_sync.load_products(self._reader_args())
         payloads = [prepared.payload for prepared in prepared_products]
@@ -326,6 +335,44 @@ class Connector:
         response.raise_for_status()
         return list(response.json().get("items") or [])
 
+    def _sync_order_inbox(self) -> None:
+        try:
+            response = self.session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
+            response.raise_for_status()
+            changes = list(response.json().get("items") or [])
+            if not changes:
+                return
+            if self.dry_run:
+                self.logger.info("order_inbox_dry_run changes=%s path=%s", len(changes), self.order_db_path)
+                return
+            upsert_order_changes(
+                self.order_db_path,
+                changes,
+                retention_rows=self.order_retention_rows,
+            )
+            payload = {
+                "changes": [
+                    {"id": int(change["id"]), "version": int(change["version"])}
+                    for change in changes
+                ]
+            }
+            ack = self.session.post(
+                f"{self.base_url}/sync/orders/changes/ack",
+                json=payload,
+                timeout=self.timeout,
+            )
+            ack.raise_for_status()
+            self.logger.info(
+                "order_inbox_updated changes=%s acknowledged=%s path=%s",
+                len(changes),
+                int(ack.json().get("acknowledged") or 0),
+                self.order_db_path,
+            )
+        except Exception:
+            # Order intake must not prevent inventory reconciliation. Railway keeps
+            # unacknowledged changes for a later retry.
+            self.logger.exception("order_inbox_sync_failed")
+
     def _acknowledge_inventory_changes(self, changes: List[Dict[str, Any]]) -> None:
         payload = {
             "changes": [
@@ -439,6 +486,246 @@ def catalog_total_quantity(payload: Dict[str, Any]) -> int:
 
 def catalog_upload_priority(payload: Dict[str, Any]) -> int:
     return 0 if catalog_total_quantity(payload) > 0 else 1
+
+
+def upsert_order_changes(path: Path, changes: List[Dict[str, Any]], *, retention_rows: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                shopify_order_id TEXT PRIMARY KEY,
+                order_name TEXT,
+                order_number TEXT,
+                confirmation_number TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                processed_at TEXT,
+                cancelled_at TEXT,
+                closed_at TEXT,
+                financial_status TEXT,
+                fulfillment_status TEXT,
+                currency TEXT,
+                subtotal_price TEXT,
+                total_discounts TEXT,
+                shipping_price TEXT,
+                total_tax TEXT,
+                total_price TEXT,
+                customer_name TEXT,
+                email TEXT,
+                phone TEXT,
+                shipping_name TEXT,
+                shipping_company TEXT,
+                shipping_address1 TEXT,
+                shipping_address2 TEXT,
+                shipping_city TEXT,
+                shipping_province TEXT,
+                shipping_province_code TEXT,
+                shipping_country TEXT,
+                shipping_country_code TEXT,
+                shipping_zip TEXT,
+                shipping_phone TEXT,
+                shipping_method TEXT,
+                note TEXT,
+                tags TEXT,
+                source_event TEXT NOT NULL,
+                source_version INTEGER NOT NULL,
+                print_status TEXT NOT NULL DEFAULT 'PENDING',
+                printed_at TEXT,
+                synced_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS order_items (
+                shopify_order_id TEXT NOT NULL,
+                line_key TEXT NOT NULL,
+                shopify_line_item_id TEXT,
+                variant_id TEXT,
+                sku TEXT,
+                title TEXT,
+                variant_title TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                current_quantity INTEGER,
+                price TEXT,
+                total_discount TEXT,
+                grams INTEGER,
+                requires_shipping INTEGER,
+                fulfillment_status TEXT,
+                PRIMARY KEY(shopify_order_id, line_key),
+                FOREIGN KEY(shopify_order_id) REFERENCES orders(shopify_order_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_print_status ON orders(print_status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_order_items_sku ON order_items(sku);
+            """
+        )
+        with connection:
+            for change in changes:
+                order = change.get("order") or {}
+                order_id = str(change.get("shopify_order_id") or order.get("id") or "").strip()
+                if not order_id:
+                    raise ValueError("Order change is missing shopify_order_id")
+                if change.get("event_topic") in {"orders/delete", "customers/redact"} or order.get("redacted"):
+                    connection.execute("DELETE FROM orders WHERE shopify_order_id = ?", (order_id,))
+                    continue
+                address = order.get("shipping_address") or {}
+                customer_name = " ".join(
+                    part
+                    for part in (
+                        str(order.get("customer_first_name") or "").strip(),
+                        str(order.get("customer_last_name") or "").strip(),
+                    )
+                    if part
+                )
+                shipping_name = str(address.get("name") or "").strip() or " ".join(
+                    part
+                    for part in (
+                        str(address.get("first_name") or "").strip(),
+                        str(address.get("last_name") or "").strip(),
+                    )
+                    if part
+                )
+                shipping_method = ", ".join(
+                    str(line.get("title") or line.get("code") or "").strip()
+                    for line in (order.get("shipping_lines") or [])
+                    if str(line.get("title") or line.get("code") or "").strip()
+                )
+                connection.execute(
+                    """
+                    INSERT INTO orders (
+                        shopify_order_id, order_name, order_number, confirmation_number,
+                        created_at, updated_at, processed_at, cancelled_at, closed_at,
+                        financial_status, fulfillment_status, currency, subtotal_price,
+                        total_discounts, shipping_price, total_tax, total_price,
+                        customer_name, email, phone, shipping_name, shipping_company,
+                        shipping_address1, shipping_address2, shipping_city, shipping_province,
+                        shipping_province_code, shipping_country, shipping_country_code,
+                        shipping_zip, shipping_phone, shipping_method, note, tags,
+                        source_event, source_version, print_status, synced_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', datetime('now')
+                    )
+                    ON CONFLICT(shopify_order_id) DO UPDATE SET
+                        order_name=excluded.order_name,
+                        order_number=excluded.order_number,
+                        confirmation_number=excluded.confirmation_number,
+                        created_at=excluded.created_at,
+                        updated_at=excluded.updated_at,
+                        processed_at=excluded.processed_at,
+                        cancelled_at=excluded.cancelled_at,
+                        closed_at=excluded.closed_at,
+                        financial_status=excluded.financial_status,
+                        fulfillment_status=excluded.fulfillment_status,
+                        currency=excluded.currency,
+                        subtotal_price=excluded.subtotal_price,
+                        total_discounts=excluded.total_discounts,
+                        shipping_price=excluded.shipping_price,
+                        total_tax=excluded.total_tax,
+                        total_price=excluded.total_price,
+                        customer_name=excluded.customer_name,
+                        email=excluded.email,
+                        phone=excluded.phone,
+                        shipping_name=excluded.shipping_name,
+                        shipping_company=excluded.shipping_company,
+                        shipping_address1=excluded.shipping_address1,
+                        shipping_address2=excluded.shipping_address2,
+                        shipping_city=excluded.shipping_city,
+                        shipping_province=excluded.shipping_province,
+                        shipping_province_code=excluded.shipping_province_code,
+                        shipping_country=excluded.shipping_country,
+                        shipping_country_code=excluded.shipping_country_code,
+                        shipping_zip=excluded.shipping_zip,
+                        shipping_phone=excluded.shipping_phone,
+                        shipping_method=excluded.shipping_method,
+                        note=excluded.note,
+                        tags=excluded.tags,
+                        source_event=excluded.source_event,
+                        source_version=excluded.source_version,
+                        synced_at=excluded.synced_at
+                    """,
+                    (
+                        order_id,
+                        order.get("name") or change.get("order_name"),
+                        str(order.get("order_number") or "") or None,
+                        order.get("confirmation_number"),
+                        order.get("created_at"),
+                        order.get("updated_at"),
+                        order.get("processed_at"),
+                        order.get("cancelled_at"),
+                        order.get("closed_at"),
+                        order.get("financial_status"),
+                        order.get("fulfillment_status"),
+                        order.get("currency"),
+                        order.get("subtotal_price"),
+                        order.get("total_discounts"),
+                        order.get("shipping_price"),
+                        order.get("total_tax"),
+                        order.get("total_price"),
+                        customer_name or None,
+                        order.get("email"),
+                        order.get("phone"),
+                        shipping_name or None,
+                        address.get("company"),
+                        address.get("address1"),
+                        address.get("address2"),
+                        address.get("city"),
+                        address.get("province"),
+                        address.get("province_code"),
+                        address.get("country"),
+                        address.get("country_code"),
+                        address.get("zip"),
+                        address.get("phone"),
+                        shipping_method or None,
+                        order.get("note"),
+                        order.get("tags"),
+                        change.get("event_topic") or "orders/updated",
+                        int(change.get("version") or 1),
+                    ),
+                )
+                connection.execute("DELETE FROM order_items WHERE shopify_order_id = ?", (order_id,))
+                for index, item in enumerate(order.get("line_items") or [], start=1):
+                    line_id = str(item.get("id") or "").strip()
+                    line_key = line_id or f"line-{index}"
+                    connection.execute(
+                        """
+                        INSERT INTO order_items (
+                            shopify_order_id, line_key, shopify_line_item_id, variant_id, sku,
+                            title, variant_title, quantity, current_quantity, price, total_discount,
+                            grams, requires_shipping, fulfillment_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            order_id,
+                            line_key,
+                            line_id or None,
+                            str(item.get("variant_id") or "") or None,
+                            str(item.get("sku") or "").strip() or None,
+                            item.get("title"),
+                            item.get("variant_title"),
+                            int(item.get("quantity") or 0),
+                            int(item["current_quantity"]) if item.get("current_quantity") is not None else None,
+                            item.get("price"),
+                            item.get("total_discount"),
+                            int(item["grams"]) if item.get("grams") is not None else None,
+                            int(bool(item["requires_shipping"])) if item.get("requires_shipping") is not None else None,
+                            item.get("fulfillment_status"),
+                        ),
+                    )
+            connection.execute(
+                """
+                DELETE FROM orders
+                WHERE shopify_order_id IN (
+                    SELECT shopify_order_id
+                    FROM orders
+                    ORDER BY COALESCE(created_at, synced_at) DESC, shopify_order_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (max(100, int(retention_rows)),),
+            )
+    finally:
+        connection.close()
 
 
 def merge_quantity(

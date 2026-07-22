@@ -93,6 +93,18 @@ class InventoryChangeRow:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class OrderChangeRow:
+    id: int
+    shop_domain: str
+    shopify_order_id: str
+    order_name: Optional[str]
+    event_topic: str
+    payload: str
+    version: int
+    updated_at: str
+
+
 class DatabaseStore:
     def __init__(
         self,
@@ -101,6 +113,7 @@ class DatabaseStore:
         *,
         feed_event_retention_rows: int = 2000,
         request_log_retention_rows: int = 1000,
+        order_event_retention_rows: int = 2000,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,6 +122,7 @@ class DatabaseStore:
         self._fernet = _build_fernet(encryption_secret)
         self.feed_event_retention_rows = max(100, int(feed_event_retention_rows))
         self.request_log_retention_rows = max(100, int(request_log_retention_rows))
+        self.order_event_retention_rows = max(100, int(order_event_retention_rows))
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -160,6 +174,22 @@ class DatabaseStore:
                     version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL,
                     UNIQUE(shop_domain, inventory_item_id, location_id),
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    shopify_order_id TEXT NOT NULL,
+                    order_name TEXT,
+                    event_topic TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(shop_domain, shopify_order_id),
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
                 )
                 """
@@ -235,12 +265,22 @@ class DatabaseStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_inventory_changes_shop_id ON inventory_changes(shop_domain, id)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_order_changes_shop_id ON order_changes(shop_domain, id)"
+            )
             for row in connection.execute("SELECT DISTINCT shop_domain FROM feed_events").fetchall():
                 self._trim_shop_rows(
                     connection,
                     table_name="feed_events",
                     shop_domain=row["shop_domain"],
                     limit=self.feed_event_retention_rows,
+                )
+            for row in connection.execute("SELECT DISTINCT shop_domain FROM order_changes").fetchall():
+                self._trim_shop_rows(
+                    connection,
+                    table_name="order_changes",
+                    shop_domain=row["shop_domain"],
+                    limit=self.order_event_retention_rows,
                 )
             self._trim_global_rows(
                 connection,
@@ -630,7 +670,7 @@ class DatabaseStore:
         shop_domain: str,
         limit: int,
     ) -> None:
-        if table_name not in {"feed_events"}:
+        if table_name not in {"feed_events", "order_changes"}:
             raise ValueError(f"Unsupported retention table: {table_name}")
         connection.execute(
             f"""
@@ -897,6 +937,93 @@ class DatabaseStore:
             connection.commit()
         return deleted
 
+    def upsert_order_change(
+        self,
+        *,
+        shop_domain: str,
+        shopify_order_id: str,
+        order_name: Optional[str],
+        event_topic: str,
+        payload: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO order_changes (
+                    shop_domain, shopify_order_id, order_name, event_topic, payload, version, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(shop_domain, shopify_order_id) DO UPDATE SET
+                    order_name=excluded.order_name,
+                    event_topic=excluded.event_topic,
+                    payload=excluded.payload,
+                    version=order_changes.version + 1,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    shop_domain,
+                    shopify_order_id,
+                    order_name,
+                    event_topic,
+                    payload,
+                    utc_now_iso(),
+                ),
+            )
+            self._trim_shop_rows(
+                connection,
+                table_name="order_changes",
+                shop_domain=shop_domain,
+                limit=self.order_event_retention_rows,
+            )
+            connection.commit()
+
+    def list_order_changes(self, *, shop_domain: str, limit: int = 250) -> list[OrderChangeRow]:
+        safe_limit = max(1, min(int(limit), 1000))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM order_changes
+                WHERE shop_domain = ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (shop_domain, safe_limit),
+            ).fetchall()
+        return [
+            OrderChangeRow(
+                id=int(row["id"]),
+                shop_domain=row["shop_domain"],
+                shopify_order_id=row["shopify_order_id"],
+                order_name=row["order_name"],
+                event_topic=row["event_topic"],
+                payload=row["payload"],
+                version=int(row["version"]),
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    def acknowledge_order_changes(
+        self,
+        *,
+        shop_domain: str,
+        changes: list[tuple[int, int]],
+    ) -> int:
+        deleted = 0
+        with self._connect() as connection:
+            for change_id, version in changes:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM order_changes
+                    WHERE shop_domain = ? AND id = ? AND version = ?
+                    """,
+                    (shop_domain, int(change_id), int(version)),
+                )
+                deleted += max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        return deleted
+
     def mark_shop_uninstalled(self, shop_domain: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -913,6 +1040,10 @@ class DatabaseStore:
             )
             connection.execute(
                 "DELETE FROM inventory_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM order_changes WHERE shop_domain = ?",
                 (shop_domain,),
             )
             connection.execute(
