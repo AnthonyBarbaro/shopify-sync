@@ -58,7 +58,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $taskPrincipal `
-    -Description "Reads POS DBF inventory every three minutes and reconciles it with Shopify." `
+    -Description "Processes POS sales/edit events every three minutes and runs a nightly full inventory reconciliation." `
     -Force | Out-Null
 
 if ($StartNow) {

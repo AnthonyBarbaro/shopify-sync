@@ -6,11 +6,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +31,8 @@ import dbf_pos_sync  # noqa: E402
 
 
 STATE_VERSION = 1
+POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
+MATRIX_VARIANT_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 
 
 def parse_cli() -> argparse.Namespace:
@@ -62,6 +67,7 @@ class Connector:
         self.api_key = self._required("SHOPIFY_SYNC_API_KEY")
         self.api_secret = self._required("SHOPIFY_SYNC_API_SECRET")
         self.interval_seconds = env_int("SYNC_INTERVAL_SECONDS", 180, minimum=30, maximum=86400)
+        self.nightly_full_sync_hour = env_int("NIGHTLY_FULL_SYNC_HOUR", 0, minimum=0, maximum=23)
         self.batch_size = env_int("CONNECTOR_BATCH_SIZE", 25, minimum=1, maximum=100)
         self.workers = env_int("CONNECTOR_WORKERS", 2, minimum=1, maximum=4)
         self.timeout = env_int("CONNECTOR_TIMEOUT_SECONDS", 300, minimum=30, maximum=1800)
@@ -129,29 +135,76 @@ class Connector:
 
     def run_cycle(self) -> None:
         state = load_state(self.state_path)
+        now = datetime.now()
         if not self.dry_run:
             self._retry_pending(state)
 
         if self.order_sync_enabled:
             self._sync_order_inbox()
 
-        prepared_products, stats = dbf_pos_sync.load_products(self._reader_args())
-        payloads = [prepared.payload for prepared in prepared_products]
-        # Python's sort is stable, so products keep their POS order within each
-        # group while every stocked product is uploaded before zero-stock rows.
-        payloads.sort(key=catalog_upload_priority)
+        inventory_changes = self._fetch_inventory_changes()
+        event_skus, event_file_reset = self._collect_pos_event_skus(state)
+        sku_bases: Dict[str, str] = state.setdefault("sku_bases", {})
+        shopify_skus = {
+            sku_bases.get(
+                str(change.get("sku") or "").strip(),
+                base_sku(str(change.get("sku") or "").strip()),
+            )
+            for change in inventory_changes
+            if str(change.get("sku") or "").strip()
+        }
+        affected_base_skus = event_skus | shopify_skus
+
+        catalog_incomplete = not bool(state.get("catalog_complete"))
+        nightly_due = nightly_full_sync_due(
+            state.get("last_full_reconcile_date"),
+            now=now,
+            hour=self.nightly_full_sync_hour,
+        )
+        full_reconcile = catalog_incomplete or nightly_due or event_file_reset
+        if full_reconcile:
+            read_mode = "initial" if catalog_incomplete else "nightly"
+        elif affected_base_skus:
+            read_mode = "events"
+        else:
+            read_mode = "idle"
+
+        payloads: List[Dict[str, Any]] = []
+        skipped_non_sellable = 0
+        if full_reconcile:
+            prepared_products, stats = dbf_pos_sync.load_products(self._reader_args())
+            payloads = [prepared.payload for prepared in prepared_products]
+            skipped_non_sellable = stats.skipped_non_sellable
+            # Python's sort is stable, so products keep their POS order within each
+            # group while every stocked product is uploaded before zero-stock rows.
+            payloads.sort(key=catalog_upload_priority)
+
         payload_by_base = {str(payload["sku"]): payload for payload in payloads}
-        local_quantities = flatten_quantities(payloads)
+        discovered_sku_bases = sku_base_mapping(payloads)
+        if full_reconcile:
+            state["sku_bases"] = discovered_sku_bases
+        else:
+            sku_bases.update(discovered_sku_bases)
+        if full_reconcile:
+            local_quantities = flatten_quantities(payloads)
+        else:
+            local_quantities = read_targeted_pos_quantities(
+                self.dbf_dir,
+                affected_base_skus,
+                sku_bases=sku_bases,
+            )
         self.logger.info(
-            "pos_read products=%s quantities=%s skipped_non_sellable=%s",
-            len(payloads),
+            "pos_read mode=%s requested_skus=%s products=%s quantities=%s skipped_non_sellable=%s",
+            read_mode,
+            len(affected_base_skus),
+            len(payloads) if full_reconcile else len(affected_base_skus),
             len(local_quantities),
-            stats.skipped_non_sellable,
+            skipped_non_sellable,
         )
 
         known_products = set(state.get("catalog_products") or [])
         new_base_skus = [sku for sku in payload_by_base if sku not in known_products]
-        if new_base_skus and self.initial_catalog_upload:
+        if catalog_incomplete and new_base_skus and self.initial_catalog_upload:
             new_payloads = [payload_by_base[sku] for sku in new_base_skus]
             if self.dry_run:
                 self.logger.info("catalog_upload_dry_run products=%s", len(new_payloads))
@@ -174,12 +227,14 @@ class Connector:
                     len(succeeded),
                     len(payload_by_base) - len(known_products),
                 )
-        elif new_base_skus and not self.initial_catalog_upload:
+        elif catalog_incomplete and new_base_skus and not self.initial_catalog_upload:
             known_products.update(new_base_skus)
             state["catalog_products"] = sorted(known_products, key=str.casefold)
+            state["catalog_complete"] = True
+        elif catalog_incomplete and not new_base_skus:
+            state["catalog_complete"] = True
 
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
-        inventory_changes = self._fetch_inventory_changes()
         remote_quantities = {
             sku: int(entry.get("shop_seen") or 0)
             for sku, entry in entries.items()
@@ -260,6 +315,8 @@ class Connector:
             )
             return
 
+        if full_reconcile:
+            state["last_full_reconcile_date"] = now.date().isoformat()
         save_state(self.state_path, state)
         if planned_shop:
             self._apply_shopify_adjustments(state, planned_shop)
@@ -284,14 +341,14 @@ class Connector:
             len(planned_pos),
         )
 
-    def _reader_args(self) -> SimpleNamespace:
+    def _reader_args(self, skus: Optional[Iterable[str]] = None) -> SimpleNamespace:
         return SimpleNamespace(
             dbf_dir=str(self.dbf_dir),
             recursive=True,
             matrix_variants=True,
             quantity_source="item",
             itemmqty_cell=None,
-            sku=[],
+            sku=sorted(set(skus or []), key=str.casefold),
             skip_non_sellable=True,
             skip_zero_price=False,
             skip_zero_quantity=False,
@@ -309,6 +366,50 @@ class Connector:
             in_stock_status="active",
             zero_quantity_status="archived",
         )
+
+    def _collect_pos_event_skus(self, state: Dict[str, Any]) -> tuple[set[str], bool]:
+        cursors: Dict[str, int] = state.setdefault("event_cursors", {})
+        affected: set[str] = set()
+        force_full_reconcile = False
+        for filename in POS_EVENT_FILES:
+            path = dbf_pos_sync.find_dbf_file(self.dbf_dir, filename, recursive=True)
+            if path is None:
+                self.logger.warning("pos_event_file_missing file=%s", filename)
+                continue
+
+            previous_cursor = cursors.get(filename)
+            if previous_cursor is None:
+                record_count = dbf_record_count(path)
+                cursors[filename] = record_count
+                self.logger.info("pos_event_cursor_initialized file=%s records=%s", filename, record_count)
+                continue
+
+            rows, record_count, was_reset = read_appended_dbf_rows(path, int(previous_cursor))
+            cursors[filename] = record_count
+            if was_reset:
+                # A packed/replaced master event table may no longer preserve record
+                # positions. The nightly-style full read is safer than replaying its
+                # entire history as if every old row were a new sale.
+                force_full_reconcile = True
+                self.logger.warning(
+                    "pos_event_file_reset file=%s previous_records=%s current_records=%s",
+                    filename,
+                    previous_cursor,
+                    record_count,
+                )
+                continue
+            for row in rows:
+                sku = str(row.get("SKU") or "").strip()
+                if sku:
+                    affected.add(base_sku(sku))
+            if rows:
+                self.logger.info(
+                    "pos_events_read file=%s new_records=%s affected_skus=%s",
+                    filename,
+                    len(rows),
+                    len({base_sku(str(row.get('SKU') or '').strip()) for row in rows if row.get('SKU')}),
+                )
+        return affected, force_full_reconcile
 
     def _upload_catalog(self, payloads: List[Dict[str, Any]], *, state: Dict[str, Any]) -> set[str]:
         succeeded: set[str] = set()
@@ -459,6 +560,247 @@ class Connector:
             entry["pos_seen"] = int(action["expected_quantity"]) + int(action["delta"])
             entry.pop("pending_pos", None)
         save_state(self.state_path, state)
+
+
+def base_sku(sku: str) -> str:
+    normalized = str(sku or "").strip()
+    match = MATRIX_VARIANT_SKU.match(normalized)
+    return match.group(1).strip() if match else normalized
+
+
+def nightly_full_sync_due(last_date: Any, *, now: datetime, hour: int) -> bool:
+    if now.hour < max(0, min(23, int(hour))):
+        return False
+    return str(last_date or "") != now.date().isoformat()
+
+
+def dbf_record_count(path: Path) -> int:
+    with path.open("rb") as handle:
+        header = handle.read(32)
+    if len(header) != 32:
+        raise ValueError(f"{path} is not a valid DBF file.")
+    return struct.unpack("<I", header[4:8])[0]
+
+
+def read_appended_dbf_rows(
+    path: Path,
+    start_record: int,
+    *,
+    encoding: str = "latin1",
+) -> tuple[List[Dict[str, Any]], int, bool]:
+    """Read only physical DBF records appended after a saved record position."""
+    with path.open("rb") as handle:
+        header = handle.read(32)
+        if len(header) != 32:
+            raise ValueError(f"{path} is not a valid DBF file.")
+        record_count = struct.unpack("<I", header[4:8])[0]
+        header_length = struct.unpack("<H", header[8:10])[0]
+        record_length = struct.unpack("<H", header[10:12])[0]
+        if record_length < 2:
+            raise ValueError(f"{path} has an invalid DBF record length.")
+
+        fields: List[Any] = []
+        while True:
+            descriptor = handle.read(32)
+            if not descriptor:
+                raise ValueError(f"{path} ended before the DBF field list was complete.")
+            if descriptor[0] == 0x0D:
+                break
+            fields.append(
+                dbf_pos_sync.DBFField(
+                    name=descriptor[:11].split(b"\x00", 1)[0].decode("ascii", "ignore"),
+                    field_type=chr(descriptor[11]),
+                    length=descriptor[16],
+                    decimals=descriptor[17],
+                )
+            )
+
+        cursor = max(0, int(start_record))
+        if record_count < cursor:
+            return [], record_count, True
+
+        rows: List[Dict[str, Any]] = []
+        handle.seek(header_length + (cursor * record_length))
+        for record_index in range(cursor, record_count):
+            record = handle.read(record_length)
+            if len(record) != record_length:
+                # Do not advance beyond a record that the POS is still writing.
+                break
+            cursor = record_index + 1
+            if record[0] == 0x2A:
+                continue
+            row: Dict[str, Any] = {}
+            offset = 1
+            for field in fields:
+                raw_value = record[offset : offset + field.length]
+                offset += field.length
+                row[field.name] = dbf_pos_sync._parse_dbf_value(raw_value, field, encoding=encoding)
+            rows.append(row)
+        return rows, cursor, False
+
+
+def iter_selected_dbf_rows(
+    path: Path,
+    key_values: set[str],
+    *,
+    selected_fields: set[str],
+    key_field: str = "SKU",
+    encoding: str = "latin1",
+) -> Iterable[Dict[str, Any]]:
+    """Scan a DBF but decode only selected fields for matching keys."""
+    with path.open("rb") as handle:
+        header = handle.read(32)
+        if len(header) != 32:
+            raise ValueError(f"{path} is not a valid DBF file.")
+        record_count = struct.unpack("<I", header[4:8])[0]
+        header_length = struct.unpack("<H", header[8:10])[0]
+        record_length = struct.unpack("<H", header[10:12])[0]
+
+        fields: List[tuple[Any, int]] = []
+        offset = 1
+        while True:
+            descriptor = handle.read(32)
+            if not descriptor:
+                raise ValueError(f"{path} ended before the DBF field list was complete.")
+            if descriptor[0] == 0x0D:
+                break
+            field = dbf_pos_sync.DBFField(
+                name=descriptor[:11].split(b"\x00", 1)[0].decode("ascii", "ignore"),
+                field_type=chr(descriptor[11]),
+                length=descriptor[16],
+                decimals=descriptor[17],
+            )
+            fields.append((field, offset))
+            offset += field.length
+
+        field_lookup = {field.name.upper(): (field, offset) for field, offset in fields}
+        key_definition = field_lookup.get(key_field.upper())
+        if key_definition is None:
+            raise ValueError(f"{path} does not contain the DBF key field {key_field}.")
+        key_descriptor, key_offset = key_definition
+        wanted_fields = {
+            name.upper(): field_lookup[name.upper()]
+            for name in selected_fields | {key_field}
+            if name.upper() in field_lookup
+        }
+
+        handle.seek(header_length)
+        for _ in range(record_count):
+            record = handle.read(record_length)
+            if len(record) != record_length:
+                break
+            if record[0] == 0x2A:
+                continue
+            raw_key = record[key_offset : key_offset + key_descriptor.length]
+            key = raw_key.decode(encoding, "ignore").strip()
+            if key not in key_values:
+                continue
+            row: Dict[str, Any] = {}
+            for _, (field, field_offset) in wanted_fields.items():
+                raw_value = record[field_offset : field_offset + field.length]
+                row[field.name] = dbf_pos_sync._parse_dbf_value(raw_value, field, encoding=encoding)
+            yield row
+
+
+def sku_base_mapping(payloads: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for payload in payloads:
+        product_sku = str(payload.get("sku") or "").strip()
+        if not product_sku:
+            continue
+        mapping[product_sku] = product_sku
+        for variant in payload.get("variants") or []:
+            variant_sku = str(variant.get("sku") or "").strip()
+            if variant_sku:
+                mapping[variant_sku] = product_sku
+    return mapping
+
+
+def read_targeted_pos_quantities(
+    dbf_dir: Path,
+    base_skus: Iterable[str],
+    *,
+    sku_bases: Dict[str, str],
+) -> Dict[str, int]:
+    """Read current quantities only, without rebuilding catalog metadata."""
+    targets = {str(sku).strip() for sku in base_skus if str(sku).strip()}
+    if not targets:
+        return {}
+
+    variants_by_base: Dict[str, set[str]] = {sku: set() for sku in targets}
+    for variant_sku, product_sku in sku_bases.items():
+        if product_sku in targets and variant_sku != product_sku:
+            variants_by_base[product_sku].add(variant_sku)
+
+    quantities: Dict[str, int] = {}
+    item_path = dbf_pos_sync.find_dbf_file(dbf_dir, "Item.dbf", recursive=True)
+    if item_path is None:
+        raise FileNotFoundError(f"Expected Item.dbf in {dbf_dir}")
+    for row in iter_selected_dbf_rows(item_path, targets, selected_fields={"SKU", "QTY"}):
+        sku = str(row.get("SKU") or "").strip()
+        if sku not in targets or variants_by_base.get(sku):
+            continue
+        quantity = dbf_pos_sync.decimal_to_quantity(dbf_pos_sync.decimal_or_none(row.get("QTY")))
+        quantities[sku] = int(quantity or 0)
+
+    matrix_targets = {sku for sku, variants in variants_by_base.items() if variants}
+    if not matrix_targets:
+        return quantities
+    quantity_path = dbf_pos_sync.find_dbf_file(dbf_dir, "Itemmqty.dbf", recursive=True)
+    if quantity_path is None:
+        raise FileNotFoundError(f"Expected Itemmqty.dbf in {dbf_dir} for matrix inventory")
+
+    # Start known matrix variants at zero so a removed/cleared quantity row cannot
+    # leave stale stock online. Existing variants are the only rows eligible for an
+    # unattended quantity update; new product structure remains a first-import job.
+    for sku in matrix_targets:
+        for variant_sku in variants_by_base[sku]:
+            quantities[variant_sku] = 0
+
+    for row in iter_selected_dbf_rows(
+        quantity_path,
+        matrix_targets,
+        selected_fields={"SKU", "CELL", "BARCODE", "QTY"},
+    ):
+        product_sku = str(row.get("SKU") or "").strip()
+        if product_sku not in matrix_targets:
+            continue
+        variant_sku = matrix_variant_sku_for_row(
+            product_sku,
+            row,
+            known_variants=variants_by_base[product_sku],
+        )
+        if not variant_sku:
+            continue
+        quantity = dbf_pos_sync.decimal_to_quantity(dbf_pos_sync.decimal_or_none(row.get("QTY")))
+        quantities[variant_sku] = int(quantity or 0)
+    return quantities
+
+
+def matrix_variant_sku_for_row(
+    product_sku: str,
+    row: Dict[str, Any],
+    *,
+    known_variants: set[str],
+) -> Optional[str]:
+    barcode = str(row.get("BARCODE") or "").strip()
+    if barcode in known_variants:
+        return barcode
+
+    cell = str(row.get("CELL") or "").strip()
+    coordinates = re.findall(r"\d+", cell)
+    if len(coordinates) == 2:
+        candidate = f"{product_sku}. {int(coordinates[0])} {int(coordinates[1])}"
+        if candidate in known_variants:
+            return candidate
+
+    compact_cell = "".join(coordinates)
+    compact_matches = []
+    for variant_sku in known_variants:
+        match = MATRIX_VARIANT_SKU.match(variant_sku)
+        if match and "".join(re.findall(r"\d+", variant_sku[len(match.group(1)) :])) == compact_cell:
+            compact_matches.append(variant_sku)
+    return compact_matches[0] if len(compact_matches) == 1 else None
 
 
 def flatten_quantities(payloads: Iterable[Dict[str, Any]]) -> Dict[str, int]:
@@ -771,10 +1113,19 @@ def load_state(path: Path) -> Dict[str, Any]:
             if isinstance(data, dict) and int(data.get("version") or 0) == STATE_VERSION:
                 data.setdefault("catalog_products", [])
                 data.setdefault("quantities", {})
+                data.setdefault("event_cursors", {})
+                data.setdefault("sku_bases", {})
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-    return {"version": STATE_VERSION, "catalog_complete": False, "catalog_products": [], "quantities": {}}
+    return {
+        "version": STATE_VERSION,
+        "catalog_complete": False,
+        "catalog_products": [],
+        "quantities": {},
+        "event_cursors": {},
+        "sku_bases": {},
+    }
 
 
 def save_state(path: Path, state: Dict[str, Any]) -> None:

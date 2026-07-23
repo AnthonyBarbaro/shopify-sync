@@ -1,7 +1,7 @@
 # Windows POS Inventory Connector
 
-This connector runs continuously on the Windows POS computer. It reads the live product DBFs every
-three minutes but sends no ZIP archives to Railway.
+This connector runs continuously on the Windows POS computer. It checks the live POS event tables
+every three minutes but sends no DBF files or ZIP archives to Railway.
 
 ## Sync behavior
 
@@ -12,11 +12,16 @@ three minutes but sends no ZIP archives to Railway.
 3. Initial descriptions are empty and the generated product name is included as a tag. Later runs
    send inventory deltas only, so product titles, prices, tags, descriptions, and images are not
    repeatedly overwritten.
-4. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
+4. Every three minutes it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
+   Those rows identify affected base SKUs; the connector then rereads their authoritative current
+   quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
+5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation.
+   If the computer was off at midnight, the first later cycle that day performs the missed pass.
+6. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
    changed quantities; it does not scan the entire Shopify catalog.
-5. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are
+7. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are
    preserved.
-6. Shopify adjustments use idempotency keys. POS writes use compare-before-update checks so a sale at
+8. Shopify adjustments use idempotency keys. POS writes use compare-before-update checks so a sale at
    the register cannot be silently overwritten.
 
 The connector intentionally does not archive Shopify products during unattended runs.
@@ -29,8 +34,10 @@ Windows keeps only:
 - a 5 MB rotating log with three backups by default;
 - the small Python virtual environment created by the installer.
 
-Railway receives JSON inventory changes, not DBF archives. The server separately caps its feed and
-request history using `FEED_EVENT_RETENTION_ROWS` and `REQUEST_LOG_RETENTION_ROWS`.
+Railway receives only small JSON inventory adjustments, never sales/edit history or DBF archives.
+Its inventory-change queue keeps only the latest unprocessed value and deletes it after the Windows
+connector acknowledges it. The server separately caps its feed and request history using
+`FEED_EVENT_RETENTION_ROWS` and `REQUEST_LOG_RETENTION_ROWS`.
 
 ## Shopify order inbox
 

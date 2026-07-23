@@ -168,9 +168,10 @@ Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SK
 ## Windows Connector
 
 The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
-It starts with Windows, uploads product details only for first-run or newly discovered SKUs, and then
-reconciles quantity deltas every three minutes. It sends JSON changes rather than DBF ZIP archives and
-keeps only bounded state and rotating logs on the host computer.
+It starts with Windows, uploads product details only during the initial catalog import, processes new
+`invdtl.dbf` and `editvoid.dbf` events every three minutes, and runs one full quantity reconciliation
+after local midnight. It sends JSON changes rather than DBF ZIP archives and keeps only bounded state
+and rotating logs on the host computer.
 
 Exports:
 

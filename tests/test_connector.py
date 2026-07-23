@@ -1,8 +1,10 @@
 import io
 import sqlite3
+import struct
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,10 +15,17 @@ from app.models import InventoryLevelSnapshot, VariantMapping
 from app.pos_archive import save_uploaded_archive
 from windows_connector.connector import (
     adjustment_key,
+    base_sku,
     catalog_total_quantity,
     catalog_upload_priority,
+    dbf_record_count,
     flatten_quantities,
+    iter_selected_dbf_rows,
+    matrix_variant_sku_for_row,
     merge_quantity,
+    nightly_full_sync_due,
+    read_appended_dbf_rows,
+    sku_base_mapping,
     upsert_order_changes,
 )
 
@@ -112,6 +121,108 @@ class CatalogUploadPriorityTests(unittest.TestCase):
 
         self.assertEqual(catalog_total_quantity(matrix), 2)
         self.assertEqual(catalog_upload_priority(matrix), 0)
+
+
+class IncrementalPosEventTests(unittest.TestCase):
+    @staticmethod
+    def _write_event_dbf(path: Path, records):
+        fields = [("SKU", "C", 12), ("ITEM", "C", 1)]
+        header_length = 32 + (32 * len(fields)) + 1
+        record_length = 1 + sum(field[2] for field in fields)
+        header = bytearray(32)
+        header[0] = 0x03
+        header[4:8] = struct.pack("<I", len(records))
+        header[8:10] = struct.pack("<H", header_length)
+        header[10:12] = struct.pack("<H", record_length)
+        payload = bytearray(header)
+        for name, field_type, length in fields:
+            descriptor = bytearray(32)
+            descriptor[: len(name)] = name.encode("ascii")
+            descriptor[11] = ord(field_type)
+            descriptor[16] = length
+            payload.extend(descriptor)
+        payload.append(0x0D)
+        for deleted, sku, item in records:
+            payload.extend(b"*" if deleted else b" ")
+            payload.extend(str(sku).encode("latin1")[:12].ljust(12, b" "))
+            payload.extend(str(item).encode("latin1")[:1].ljust(1, b" "))
+        payload.append(0x1A)
+        path.write_bytes(payload)
+
+    def test_reads_only_new_physical_records_and_skips_deleted_rows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "invdtl.dbf"
+            self._write_event_dbf(
+                path,
+                [
+                    (False, "OLD", "R"),
+                    (True, "DELETED", "R"),
+                    (False, "NEW", "R"),
+                ],
+            )
+
+            rows, cursor, was_reset = read_appended_dbf_rows(path, 1)
+
+            self.assertEqual([row["SKU"] for row in rows], ["NEW"])
+            self.assertEqual(cursor, 3)
+            self.assertFalse(was_reset)
+            self.assertEqual(dbf_record_count(path), 3)
+            self.assertEqual(
+                list(iter_selected_dbf_rows(path, {"NEW"}, selected_fields={"SKU", "ITEM"})),
+                [{"SKU": "NEW", "ITEM": "R"}],
+            )
+
+    def test_a_shorter_repacked_event_file_forces_full_reconcile(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "editvoid.dbf"
+            self._write_event_dbf(path, [(False, "ABC", "Q")])
+
+            rows, cursor, was_reset = read_appended_dbf_rows(path, 20)
+
+            self.assertEqual(rows, [])
+            self.assertEqual(cursor, 1)
+            self.assertTrue(was_reset)
+
+    def test_matrix_variants_map_back_to_the_product_sku(self):
+        payloads = [
+            {
+                "sku": "21741",
+                "variants": [
+                    {"sku": "21741. 1 1"},
+                    {"sku": "CUSTOM-BARCODE"},
+                ],
+            },
+            {"sku": "ABC"},
+        ]
+
+        self.assertEqual(base_sku("21741. 1 2"), "21741")
+        self.assertEqual(base_sku("ABC"), "ABC")
+        self.assertEqual(
+            matrix_variant_sku_for_row(
+                "21741",
+                {"CELL": "110", "BARCODE": None},
+                known_variants={"21741. 1 9", "21741. 1 10", "21741. 2 10"},
+            ),
+            "21741. 1 10",
+        )
+        self.assertEqual(
+            sku_base_mapping(payloads),
+            {
+                "21741": "21741",
+                "21741. 1 1": "21741",
+                "CUSTOM-BARCODE": "21741",
+                "ABC": "ABC",
+            },
+        )
+
+    def test_full_sync_runs_once_after_the_configured_local_hour(self):
+        before_midnight = datetime(2026, 7, 22, 23, 59)
+        after_midnight = datetime(2026, 7, 23, 0, 1)
+
+        self.assertFalse(nightly_full_sync_due("2026-07-22", now=before_midnight, hour=0))
+        self.assertTrue(nightly_full_sync_due("2026-07-22", now=after_midnight, hour=0))
+        self.assertFalse(nightly_full_sync_due("2026-07-23", now=after_midnight, hour=0))
+        self.assertFalse(nightly_full_sync_due("2026-07-22", now=after_midnight, hour=2))
 
 
 class DatabaseRetentionTests(unittest.TestCase):
