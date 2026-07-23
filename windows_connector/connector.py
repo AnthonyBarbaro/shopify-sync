@@ -77,7 +77,7 @@ class Connector:
         self.order_db_path = Path(
             os.getenv("SHOPIFY_ORDER_DB_PATH") or (self.dbf_dir / "shopify-orders.db")
         ).expanduser().resolve()
-        self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 10000, minimum=100, maximum=100000)
+        self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 250, minimum=100, maximum=500)
         self.order_database_initialized = False
         self.order_bridge_status_checked = False
         self.last_order_poll_monotonic = 0.0

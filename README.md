@@ -52,13 +52,18 @@ APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_loca
 APP_SESSION_SECRET=replace_with_a_long_random_secret
 POS_SECRET_ENCRYPTION_SECRET=replace_with_a_second_long_random_secret
 DATABASE_PATH=inventory_sync.sqlite3
-FEED_EVENT_RETENTION_ROWS=2000
-REQUEST_LOG_RETENTION_ROWS=1000
-ORDER_EVENT_RETENTION_ROWS=2000
+FEED_EVENT_RETENTION_ROWS=500
+REQUEST_LOG_RETENTION_ROWS=500
+ORDER_EVENT_RETENTION_ROWS=250
+RECENT_ORDER_RETENTION_ROWS=50
 ```
 
 Feed and request history is automatically pruned to these limits so recurring connector traffic
 cannot grow the Railway SQLite volume without bound.
+
+Full order payloads are a temporary delivery queue capped at 500 rows even if an older environment
+setting is higher. Railway separately keeps only 50 small order summaries for the dashboard, and
+the Windows `shopify-orders.db` inbox defaults to 250 orders with a hard maximum of 500.
 
 Legacy POS ZIP uploads retain only the product/inventory DBFs and delete the ZIP after extraction.
 The unattended Windows connector does not upload DBF files at all.

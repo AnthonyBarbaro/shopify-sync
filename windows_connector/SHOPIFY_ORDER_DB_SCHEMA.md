@@ -78,5 +78,5 @@ The database intentionally excludes card numbers, CVV, payment credentials, auth
 billing transactions, and raw Shopify webhook bodies. Customer contact/address fields require the
 appropriate Shopify protected-customer-data approval; Shopify can omit them when access is unavailable.
 
-The local inbox retains the newest `ORDER_DB_RETENTION_ROWS` orders (10,000 by default). Related details
+The local inbox retains the newest `ORDER_DB_RETENTION_ROWS` orders (250 by default). Related details
 are removed automatically through the foreign key when an old header is pruned.

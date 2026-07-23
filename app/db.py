@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -105,6 +106,19 @@ class OrderChangeRow:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class RecentOrderRow:
+    shopify_order_id: str
+    order_name: Optional[str]
+    total_price: Optional[str]
+    currency: Optional[str]
+    financial_status: Optional[str]
+    fulfillment_status: Optional[str]
+    order_created_at: Optional[str]
+    received_at: str
+    delivery_status: str
+
+
 class DatabaseStore:
     def __init__(
         self,
@@ -113,7 +127,8 @@ class DatabaseStore:
         *,
         feed_event_retention_rows: int = 2000,
         request_log_retention_rows: int = 1000,
-        order_event_retention_rows: int = 2000,
+        order_event_retention_rows: int = 250,
+        recent_order_retention_rows: int = 50,
     ) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,7 +137,8 @@ class DatabaseStore:
         self._fernet = _build_fernet(encryption_secret)
         self.feed_event_retention_rows = max(100, int(feed_event_retention_rows))
         self.request_log_retention_rows = max(100, int(request_log_retention_rows))
-        self.order_event_retention_rows = max(100, int(order_event_retention_rows))
+        self.order_event_retention_rows = max(25, min(500, int(order_event_retention_rows)))
+        self.recent_order_retention_rows = max(10, min(250, int(recent_order_retention_rows)))
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -190,6 +206,35 @@ class DatabaseStore:
                     version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL,
                     UNIQUE(shop_domain, shopify_order_id),
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recent_order_summaries (
+                    shop_domain TEXT NOT NULL,
+                    shopify_order_id TEXT NOT NULL,
+                    order_name TEXT,
+                    total_price TEXT,
+                    currency TEXT,
+                    financial_status TEXT,
+                    fulfillment_status TEXT,
+                    order_created_at TEXT,
+                    received_at TEXT NOT NULL,
+                    PRIMARY KEY(shop_domain, shopify_order_id),
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connector_heartbeats (
+                    shop_domain TEXT PRIMARY KEY,
+                    last_seen_at TEXT NOT NULL,
+                    last_inventory_poll_at TEXT,
+                    last_order_poll_at TEXT,
+                    last_catalog_sync_at TEXT,
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
                 )
                 """
@@ -268,6 +313,10 @@ class DatabaseStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_order_changes_shop_id ON order_changes(shop_domain, id)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recent_orders_shop_received "
+                "ON recent_order_summaries(shop_domain, received_at DESC)"
+            )
             for row in connection.execute("SELECT DISTINCT shop_domain FROM feed_events").fetchall():
                 self._trim_shop_rows(
                     connection,
@@ -281,6 +330,47 @@ class DatabaseStore:
                     table_name="order_changes",
                     shop_domain=row["shop_domain"],
                     limit=self.order_event_retention_rows,
+                )
+            for row in connection.execute(
+                """
+                SELECT shop_domain, shopify_order_id, order_name, payload, updated_at
+                FROM order_changes
+                ORDER BY id DESC
+                """
+            ).fetchall():
+                try:
+                    payload = json.loads(row["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO recent_order_summaries (
+                        shop_domain, shopify_order_id, order_name, total_price, currency,
+                        financial_status, fulfillment_status, order_created_at, received_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["shop_domain"],
+                        row["shopify_order_id"],
+                        row["order_name"],
+                        payload.get("total_price"),
+                        payload.get("currency"),
+                        payload.get("financial_status"),
+                        payload.get("fulfillment_status"),
+                        payload.get("created_at"),
+                        row["updated_at"],
+                    ),
+                )
+            for row in connection.execute(
+                "SELECT DISTINCT shop_domain FROM recent_order_summaries"
+            ).fetchall():
+                self._trim_shop_rows(
+                    connection,
+                    table_name="recent_order_summaries",
+                    shop_domain=row["shop_domain"],
+                    limit=self.recent_order_retention_rows,
+                    order_column="received_at",
                 )
             self._trim_global_rows(
                 connection,
@@ -674,20 +764,27 @@ class DatabaseStore:
         table_name: str,
         shop_domain: str,
         limit: int,
+        order_column: str = "id",
     ) -> None:
-        if table_name not in {"feed_events", "order_changes"}:
+        allowed = {
+            "feed_events": "id",
+            "order_changes": "id",
+            "recent_order_summaries": "received_at",
+        }
+        if table_name not in allowed or order_column != allowed[table_name]:
             raise ValueError(f"Unsupported retention table: {table_name}")
+        row_key = "id" if order_column == "id" else "rowid"
         connection.execute(
             f"""
             DELETE FROM {table_name}
             WHERE shop_domain = ?
-              AND id <= COALESCE((
-                  SELECT id
+              AND {row_key} IN (
+                  SELECT {row_key}
                   FROM {table_name}
                   WHERE shop_domain = ?
-                  ORDER BY id DESC
-                  LIMIT 1 OFFSET ?
-              ), -1)
+                  ORDER BY {order_column} DESC, {row_key} DESC
+                  LIMIT -1 OFFSET ?
+              )
             """,
             (shop_domain, shop_domain, limit),
         )
@@ -1020,6 +1117,152 @@ class DatabaseStore:
             ).fetchone()
         return int(row["count"]) if row else 0
 
+    def inventory_change_count(self, *, shop_domain: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM inventory_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def record_connector_heartbeat(self, *, shop_domain: str, channel: str) -> None:
+        now = utc_now_iso()
+        column = {
+            "inventory": "last_inventory_poll_at",
+            "orders": "last_order_poll_at",
+            "catalog": "last_catalog_sync_at",
+        }.get(channel)
+        if column is None:
+            raise ValueError(f"Unsupported heartbeat channel: {channel}")
+        with self._connect() as connection:
+            connection.execute(
+                f"""
+                INSERT INTO connector_heartbeats (shop_domain, last_seen_at, {column})
+                VALUES (?, ?, ?)
+                ON CONFLICT(shop_domain) DO UPDATE SET
+                    last_seen_at=excluded.last_seen_at,
+                    {column}=excluded.{column}
+                """,
+                (shop_domain, now, now),
+            )
+            connection.commit()
+
+    def get_connector_heartbeat(self, *, shop_domain: str) -> dict[str, Optional[str]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM connector_heartbeats WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        if row is None:
+            return {
+                "last_seen_at": None,
+                "last_inventory_poll_at": None,
+                "last_order_poll_at": None,
+                "last_catalog_sync_at": None,
+            }
+        return {
+            "last_seen_at": row["last_seen_at"],
+            "last_inventory_poll_at": row["last_inventory_poll_at"],
+            "last_order_poll_at": row["last_order_poll_at"],
+            "last_catalog_sync_at": row["last_catalog_sync_at"],
+        }
+
+    def upsert_recent_order_summary(
+        self,
+        *,
+        shop_domain: str,
+        shopify_order_id: str,
+        order_name: Optional[str],
+        total_price: Optional[str],
+        currency: Optional[str],
+        financial_status: Optional[str],
+        fulfillment_status: Optional[str],
+        order_created_at: Optional[str],
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO recent_order_summaries (
+                    shop_domain, shopify_order_id, order_name, total_price, currency,
+                    financial_status, fulfillment_status, order_created_at, received_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(shop_domain, shopify_order_id) DO UPDATE SET
+                    order_name=excluded.order_name,
+                    total_price=excluded.total_price,
+                    currency=excluded.currency,
+                    financial_status=excluded.financial_status,
+                    fulfillment_status=excluded.fulfillment_status,
+                    order_created_at=excluded.order_created_at,
+                    received_at=excluded.received_at
+                """,
+                (
+                    shop_domain,
+                    shopify_order_id,
+                    order_name,
+                    total_price,
+                    currency,
+                    financial_status,
+                    fulfillment_status,
+                    order_created_at,
+                    now,
+                ),
+            )
+            self._trim_shop_rows(
+                connection,
+                table_name="recent_order_summaries",
+                shop_domain=shop_domain,
+                limit=self.recent_order_retention_rows,
+                order_column="received_at",
+            )
+            connection.commit()
+
+    def list_recent_order_summaries(
+        self,
+        *,
+        shop_domain: str,
+        limit: int = 20,
+    ) -> list[RecentOrderRow]:
+        safe_limit = max(1, min(int(limit), 50))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    recent.shopify_order_id,
+                    recent.order_name,
+                    recent.total_price,
+                    recent.currency,
+                    recent.financial_status,
+                    recent.fulfillment_status,
+                    recent.order_created_at,
+                    recent.received_at,
+                    CASE WHEN queued.id IS NULL THEN 'sent_to_pos' ELSE 'queued' END AS delivery_status
+                FROM recent_order_summaries AS recent
+                LEFT JOIN order_changes AS queued
+                  ON queued.shop_domain = recent.shop_domain
+                 AND queued.shopify_order_id = recent.shopify_order_id
+                WHERE recent.shop_domain = ?
+                ORDER BY recent.received_at DESC
+                LIMIT ?
+                """,
+                (shop_domain, safe_limit),
+            ).fetchall()
+        return [
+            RecentOrderRow(
+                shopify_order_id=row["shopify_order_id"],
+                order_name=row["order_name"],
+                total_price=row["total_price"],
+                currency=row["currency"],
+                financial_status=row["financial_status"],
+                fulfillment_status=row["fulfillment_status"],
+                order_created_at=row["order_created_at"],
+                received_at=row["received_at"],
+                delivery_status=row["delivery_status"],
+            )
+            for row in rows
+        ]
+
     def acknowledge_order_changes(
         self,
         *,
@@ -1060,6 +1303,14 @@ class DatabaseStore:
             )
             connection.execute(
                 "DELETE FROM order_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM recent_order_summaries WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM connector_heartbeats WHERE shop_domain = ?",
                 (shop_domain,),
             )
             connection.execute(

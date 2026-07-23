@@ -26,9 +26,10 @@ class Settings:
     shopify_retry_backoff_seconds: float = 1.0
     shopify_sku_cache_ttl_seconds: int = 15 * 60
     shopify_bulk_max_workers: int = 4
-    feed_event_retention_rows: int = 2000
-    request_log_retention_rows: int = 1000
-    order_event_retention_rows: int = 2000
+    feed_event_retention_rows: int = 500
+    request_log_retention_rows: int = 500
+    order_event_retention_rows: int = 250
+    recent_order_retention_rows: int = 50
     shopify_location_id: Optional[str] = None
 
     @property
@@ -74,15 +75,19 @@ def get_settings() -> Settings:
         ),
         feed_event_retention_rows=max(
             100,
-            int((os.getenv("FEED_EVENT_RETENTION_ROWS") or "2000").strip()),
+            int((os.getenv("FEED_EVENT_RETENTION_ROWS") or "500").strip()),
         ),
         request_log_retention_rows=max(
             100,
-            int((os.getenv("REQUEST_LOG_RETENTION_ROWS") or "1000").strip()),
+            int((os.getenv("REQUEST_LOG_RETENTION_ROWS") or "500").strip()),
         ),
         order_event_retention_rows=max(
-            100,
-            int((os.getenv("ORDER_EVENT_RETENTION_ROWS") or "2000").strip()),
+            25,
+            min(500, int((os.getenv("ORDER_EVENT_RETENTION_ROWS") or "250").strip())),
+        ),
+        recent_order_retention_rows=max(
+            10,
+            min(250, int((os.getenv("RECENT_ORDER_RETENTION_ROWS") or "50").strip())),
         ),
         shopify_location_id=(os.getenv("SHOPIFY_LOCATION_ID") or "").strip() or None,
     )

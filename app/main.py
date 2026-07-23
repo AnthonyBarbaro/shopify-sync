@@ -84,6 +84,7 @@ db = DatabaseStore(
     feed_event_retention_rows=settings.feed_event_retention_rows,
     request_log_retention_rows=settings.request_log_retention_rows,
     order_event_retention_rows=settings.order_event_retention_rows,
+    recent_order_retention_rows=settings.recent_order_retention_rows,
 )
 session_manager = AppSessionManager(settings)
 shopify_client = ShopifyClient(settings)
@@ -1485,6 +1486,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 
 
 @app.get("/app", include_in_schema=False)
+@app.get("/app/orders", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
 @app.get("/app/pos-archive", include_in_schema=False)
@@ -1570,6 +1572,67 @@ async def ui_config(request: Request) -> UiConfigResponse:
         app_base_url=resolve_base_url(request),
         location_override=settings.shopify_location_id,
         timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/bridge-status", response_model=None)
+async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    heartbeat = db.get_connector_heartbeat(shop_domain=shop.shop_domain)
+    active_after = utc_now() - timedelta(minutes=8)
+
+    def is_active(value: str | None) -> bool:
+        if not value:
+            return False
+        try:
+            return parse_iso_datetime(value) >= active_after
+        except (TypeError, ValueError):
+            return False
+
+    scopes = {scope.strip() for scope in str(shop.scope or "").split(",") if scope.strip()}
+    recent_orders = db.list_recent_order_summaries(
+        shop_domain=shop.shop_domain,
+        limit=max(1, min(order_limit, 25)),
+    )
+    return JSONResponse(
+        {
+            "shop": shop.shop_domain,
+            "connector": {
+                "active": is_active(heartbeat["last_seen_at"]),
+                "last_seen_at": heartbeat["last_seen_at"],
+            },
+            "inventory": {
+                "active": is_active(heartbeat["last_seen_at"]),
+                "last_poll_at": heartbeat["last_inventory_poll_at"],
+                "last_catalog_sync_at": heartbeat["last_catalog_sync_at"],
+                "queued_changes": db.inventory_change_count(shop_domain=shop.shop_domain),
+            },
+            "orders": {
+                "active": is_active(heartbeat["last_order_poll_at"]),
+                "authorized": "read_orders" in scopes,
+                "last_poll_at": heartbeat["last_order_poll_at"],
+                "queued_orders": db.order_change_count(shop_domain=shop.shop_domain),
+                "recent": [
+                    {
+                        "shopify_order_id": row.shopify_order_id,
+                        "order_name": row.order_name,
+                        "total_price": row.total_price,
+                        "currency": row.currency,
+                        "financial_status": row.financial_status,
+                        "fulfillment_status": row.fulfillment_status,
+                        "order_created_at": row.order_created_at,
+                        "received_at": row.received_at,
+                        "delivery_status": row.delivery_status,
+                    }
+                    for row in recent_orders
+                ],
+            },
+            "storage": {
+                "recent_order_limit": settings.recent_order_retention_rows,
+                "stores_order_details": False,
+            },
+            "timestamp": utc_now_iso(),
+        }
     )
 
 
@@ -2164,6 +2227,7 @@ async def _handle_external_single_sync(request: Request, shop: ShopRecord) -> Sy
 
 
 async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> BulkSyncResponse | JSONResponse:
+    db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="catalog")
     raw_payload = await parse_external_request_payload(request)
     source = _feed_source_for_path(request.url.path)
 
@@ -2599,6 +2663,7 @@ async def connector_order_changes(
     limit: int = 250,
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
+    db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="orders")
     rows = db.list_order_changes(shop_domain=shop.shop_domain, limit=limit)
     return JSONResponse(
         {
@@ -2698,6 +2763,7 @@ async def connector_inventory_changes(
     limit: int = 5000,
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
+    db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="inventory")
     rows = db.list_inventory_changes(shop_domain=shop.shop_domain, limit=limit)
     return JSONResponse(
         {
@@ -3035,6 +3101,18 @@ async def orders_webhook(request: Request) -> JSONResponse:
         order_name=_string_or_none(payload.get("name")),
         event_topic=topic,
         payload=json.dumps(compact, separators=(",", ":"), sort_keys=True),
+    )
+    db.upsert_recent_order_summary(
+        shop_domain=shop_domain,
+        shopify_order_id=str(order_id),
+        order_name=_string_or_none(payload.get("name")),
+        total_price=_string_or_none(
+            payload.get("current_total_price") or payload.get("total_price")
+        ),
+        currency=_string_or_none(payload.get("currency")),
+        financial_status=_string_or_none(payload.get("financial_status")),
+        fulfillment_status=_string_or_none(payload.get("fulfillment_status")),
+        order_created_at=_string_or_none(payload.get("created_at")),
     )
     logger.info(
         "order_webhook_queued %s",

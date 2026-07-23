@@ -422,6 +422,70 @@ class DatabaseRetentionTests(unittest.TestCase):
             self.assertEqual(latest.version, 2)
             self.assertEqual(latest.event_topic, "orders/updated")
 
+    def test_recent_order_summaries_are_small_bounded_and_show_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(
+                str(Path(temporary_directory) / "sync.sqlite3"),
+                "test-secret",
+                recent_order_retention_rows=10,
+            )
+            for index in range(12):
+                order_id = str(1000 + index)
+                store.upsert_order_change(
+                    shop_domain="example.myshopify.com",
+                    shopify_order_id=order_id,
+                    order_name=f"#{order_id}",
+                    event_topic="orders/create",
+                    payload=f'{{"id":{order_id}}}',
+                )
+                store.upsert_recent_order_summary(
+                    shop_domain="example.myshopify.com",
+                    shopify_order_id=order_id,
+                    order_name=f"#{order_id}",
+                    total_price="42.00",
+                    currency="USD",
+                    financial_status="paid",
+                    fulfillment_status=None,
+                    order_created_at="2026-07-23T12:00:00+00:00",
+                )
+
+            recent = store.list_recent_order_summaries(
+                shop_domain="example.myshopify.com",
+                limit=20,
+            )
+            self.assertEqual(len(recent), 10)
+            self.assertEqual(recent[0].delivery_status, "queued")
+            queued = store.list_order_changes(shop_domain="example.myshopify.com")
+            store.acknowledge_order_changes(
+                shop_domain="example.myshopify.com",
+                changes=[(queued[-1].id, queued[-1].version)],
+            )
+            recent = store.list_recent_order_summaries(
+                shop_domain="example.myshopify.com",
+                limit=20,
+            )
+            delivered = next(row for row in recent if row.shopify_order_id == queued[-1].shopify_order_id)
+            self.assertEqual(delivered.delivery_status, "sent_to_pos")
+
+    def test_connector_heartbeat_uses_one_row_per_shop(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(str(Path(temporary_directory) / "sync.sqlite3"), "test-secret")
+            store.record_connector_heartbeat(
+                shop_domain="example.myshopify.com",
+                channel="inventory",
+            )
+            store.record_connector_heartbeat(
+                shop_domain="example.myshopify.com",
+                channel="orders",
+            )
+            heartbeat = store.get_connector_heartbeat(shop_domain="example.myshopify.com")
+            self.assertIsNotNone(heartbeat["last_seen_at"])
+            self.assertIsNotNone(heartbeat["last_inventory_poll_at"])
+            self.assertIsNotNone(heartbeat["last_order_poll_at"])
+            with sqlite3.connect(store.database_path) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM connector_heartbeats").fetchone()[0]
+            self.assertEqual(count, 1)
+
 
 class LocalOrderInboxTests(unittest.TestCase):
     def test_empty_sync_creates_header_and_detail_schema(self):

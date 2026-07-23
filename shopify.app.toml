@@ -1,0 +1,18 @@
+client_id = "080ad44db7efcd3e8ed0cc2b44ccd926"
+name = "POS Bridge"
+application_url = "https://shopify-sync-production-905f.up.railway.app/app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-01"
+
+[access_scopes]
+scopes = "read_products,write_products,read_inventory,write_inventory,read_locations,read_customers,write_customers,read_orders"
+
+[auth]
+redirect_urls = [
+  "https://shopify-sync-production-905f.up.railway.app/auth/callback"
+]
