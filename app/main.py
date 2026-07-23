@@ -2621,6 +2621,35 @@ async def connector_order_changes(
     )
 
 
+@app.get("/sync/orders/status", response_model=None)
+async def connector_order_status(
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    scopes = {
+        scope.strip()
+        for scope in str(shop.scope or "").split(",")
+        if scope.strip()
+    }
+    webhook_status = "ok"
+    webhook_error = None
+    try:
+        ensure_order_webhooks(shop)
+    except Exception as exc:
+        webhook_status = "error"
+        webhook_error = str(exc)
+    return JSONResponse(
+        {
+            "shop": shop.shop_domain,
+            "read_orders_authorized": "read_orders" in scopes,
+            "authorized_scopes": sorted(scopes),
+            "webhook_status": webhook_status,
+            "webhook_error": webhook_error,
+            "queued_orders": db.order_change_count(shop_domain=shop.shop_domain),
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
 @app.post("/sync/orders/changes/ack", response_model=None)
 @app.post("/wc-api/v3/orders/changes/ack", response_model=None, include_in_schema=False)
 async def acknowledge_connector_order_changes(
@@ -3006,6 +3035,17 @@ async def orders_webhook(request: Request) -> JSONResponse:
         order_name=_string_or_none(payload.get("name")),
         event_topic=topic,
         payload=json.dumps(compact, separators=(",", ":"), sort_keys=True),
+    )
+    logger.info(
+        "order_webhook_queued %s",
+        safe_json_dumps(
+            {
+                "shop": shop_domain,
+                "order_id": str(order_id),
+                "order_name": _string_or_none(payload.get("name")),
+                "topic": topic,
+            }
+        ),
     )
     return JSONResponse({"status": "queued", "order_id": str(order_id)})
 

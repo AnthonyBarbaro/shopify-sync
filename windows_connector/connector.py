@@ -79,6 +79,8 @@ class Connector:
         ).expanduser().resolve()
         self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 10000, minimum=100, maximum=100000)
         self.order_database_initialized = False
+        self.order_bridge_status_checked = False
+        self.last_order_poll_monotonic = 0.0
         self.writeback_mode = (os.getenv("POS_WRITEBACK_MODE") or "disabled").strip().lower()
         if self.writeback_mode not in {"disabled", "dry-run", "vfp-oledb"}:
             raise ValueError("POS_WRITEBACK_MODE must be disabled, dry-run, or vfp-oledb")
@@ -426,6 +428,8 @@ class Connector:
         succeeded: set[str] = set()
         known_products = set(state.get("catalog_products") or [])
         endpoint = f"{self.base_url}/wc-api/v3/products/batch"
+        total_products = len(payloads)
+        processed_products = 0
         for chunk in chunks(payloads, self.batch_size):
             response = self.session.post(endpoint, json=chunk, timeout=self.timeout)
             if response.status_code >= 400:
@@ -447,6 +451,18 @@ class Connector:
                     self.logger.error("catalog_product_failed sku=%s message=%s", payload.get("sku"), result.get("message"))
             state["catalog_products"] = sorted(known_products, key=str.casefold)
             save_state(self.state_path, state)
+            processed_products += len(chunk)
+            self.logger.info(
+                "catalog_upload_progress processed=%s total=%s succeeded=%s",
+                processed_products,
+                total_products,
+                len(succeeded),
+            )
+            if (
+                self.order_sync_enabled
+                and time.monotonic() - self.last_order_poll_monotonic >= self.interval_seconds
+            ):
+                self._sync_order_inbox()
         return succeeded
 
     def _fetch_inventory_changes(self) -> List[Dict[str, Any]]:
@@ -465,9 +481,29 @@ class Connector:
                     retention_rows=self.order_retention_rows,
                 )
                 self.order_database_initialized = True
+            if not self.order_bridge_status_checked:
+                try:
+                    status_response = self.session.get(
+                        f"{self.base_url}/sync/orders/status",
+                        timeout=self.timeout,
+                    )
+                    status_response.raise_for_status()
+                    status = status_response.json()
+                    self.logger.info(
+                        "order_bridge_status read_orders=%s webhooks=%s queued=%s error=%s",
+                        status.get("read_orders_authorized"),
+                        status.get("webhook_status"),
+                        status.get("queued_orders"),
+                        status.get("webhook_error"),
+                    )
+                except Exception:
+                    self.logger.exception("order_bridge_status_failed")
+                finally:
+                    self.order_bridge_status_checked = True
             response = self.session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
             response.raise_for_status()
             changes = list(response.json().get("items") or [])
+            self.logger.info("order_inbox_checked changes=%s path=%s", len(changes), self.order_db_path)
             if not changes:
                 return
             if self.dry_run:
@@ -500,6 +536,8 @@ class Connector:
             # Order intake must not prevent inventory reconciliation. Railway keeps
             # unacknowledged changes for a later retry.
             self.logger.exception("order_inbox_sync_failed")
+        finally:
+            self.last_order_poll_monotonic = time.monotonic()
 
     def _acknowledge_inventory_changes(self, changes: List[Dict[str, Any]]) -> None:
         payload = {

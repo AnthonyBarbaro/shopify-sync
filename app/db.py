@@ -1012,6 +1012,14 @@ class DatabaseStore:
             for row in rows
         ]
 
+    def order_change_count(self, *, shop_domain: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM order_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
     def acknowledge_order_changes(
         self,
         *,

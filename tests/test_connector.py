@@ -401,6 +401,7 @@ class DatabaseRetentionTests(unittest.TestCase):
                 event_topic="orders/create",
                 payload='{"id":1001}',
             )
+            self.assertEqual(store.order_change_count(shop_domain="example.myshopify.com"), 1)
             first = store.list_order_changes(shop_domain="example.myshopify.com")[0]
             store.upsert_order_change(
                 shop_domain="example.myshopify.com",
