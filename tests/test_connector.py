@@ -351,9 +351,32 @@ class DatabaseRetentionTests(unittest.TestCase):
 
 
 class LocalOrderInboxTests(unittest.TestCase):
+    def test_empty_sync_creates_header_and_detail_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "shopify-orders.db"
+
+            upsert_order_changes(database_path, [], retention_rows=100)
+
+            with sqlite3.connect(database_path) as connection:
+                objects = dict(
+                    connection.execute(
+                        "SELECT name, type FROM sqlite_master WHERE name IN "
+                        "('orders', 'order_items', 'order_header', 'order_detail')"
+                    ).fetchall()
+                )
+            self.assertEqual(
+                objects,
+                {
+                    "orders": "table",
+                    "order_items": "table",
+                    "order_header": "view",
+                    "order_detail": "view",
+                },
+            )
+
     def test_order_and_lines_are_upserted_without_changing_print_status(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database_path = Path(temporary_directory) / "shopify-order.db"
+            database_path = Path(temporary_directory) / "shopify-orders.db"
             base_change = {
                 "id": 1,
                 "version": 1,
@@ -366,9 +389,22 @@ class LocalOrderInboxTests(unittest.TestCase):
                     "created_at": "2026-07-22T12:00:00-07:00",
                     "financial_status": "paid",
                     "currency": "USD",
+                    "subtotal_price": "42.00",
+                    "total_discounts": "2.00",
+                    "shipping_price": "8.00",
+                    "total_tax": "4.00",
                     "total_price": "42.00",
                     "customer_first_name": "Ada",
                     "customer_last_name": "Lovelace",
+                    "email": "ada@example.com",
+                    "phone": "+15555550100",
+                    "billing_address": {
+                        "name": "Ada Lovelace",
+                        "address1": "456 Billing Ave",
+                        "city": "Los Angeles",
+                        "province_code": "CA",
+                        "zip": "90002",
+                    },
                     "shipping_address": {
                         "name": "Ada Lovelace",
                         "address1": "123 Main St",
@@ -377,7 +413,18 @@ class LocalOrderInboxTests(unittest.TestCase):
                         "zip": "90001",
                     },
                     "line_items": [
-                        {"id": 501, "sku": "ABC", "title": "Shirt", "quantity": 2, "price": "21.00"}
+                        {
+                            "id": 501,
+                            "product_id": 601,
+                            "variant_id": 701,
+                            "sku": "ABC",
+                            "title": "Shirt",
+                            "variant_title": "Blue / Medium",
+                            "quantity": 2,
+                            "price": "21.00",
+                            "total_discount": "2.00",
+                            "tax_lines": [{"price": "3.20"}],
+                        }
                     ],
                 },
             }
@@ -404,11 +451,23 @@ class LocalOrderInboxTests(unittest.TestCase):
                 connection.row_factory = sqlite3.Row
                 order = connection.execute("SELECT * FROM orders").fetchone()
                 items = connection.execute("SELECT * FROM order_items").fetchall()
+                header = connection.execute("SELECT * FROM order_header").fetchone()
+                detail = connection.execute("SELECT * FROM order_detail").fetchone()
             self.assertEqual(order["total_price"], "45.00")
             self.assertEqual(order["print_status"], "PRINTED")
+            self.assertEqual(order["import_status"], "PENDING")
             self.assertEqual(order["source_version"], 2)
+            self.assertEqual(order["billing_address1"], "456 Billing Ave")
+            self.assertEqual(order["shipping_address1"], "123 Main St")
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["sku"], "ABC")
+            self.assertEqual(items[0]["line_total"], "40.00")
+            self.assertEqual(items[0]["line_tax"], "3.20")
+            self.assertEqual(header["invoice_no"], "#1001")
+            self.assertEqual(header["email"], "ada@example.com")
+            self.assertEqual(header["shipping"], "8.00")
+            self.assertEqual(detail["qty"], 2)
+            self.assertEqual(detail["extension"], "40.00")
 
             upsert_order_changes(
                 database_path,

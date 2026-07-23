@@ -69,8 +69,8 @@ SKU is successfully imported, recurring connector traffic uses inventory-only en
 edits to titles, descriptions, prices, tags, images, and other merchandising fields are preserved.
 
 With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
-queue until the Windows connector writes them to `C:\ashpsdat\shopify-order.db`. The local database
-is isolated from the POS FoxPro tables and contains normalized order and line-item rows for printing
+queue until the Windows connector writes them to `C:\ashpsdat\shopify-orders.db`. The local database
+is isolated from the POS FoxPro tables and contains normalized order header/detail rows for printing
 or a later vendor-tested POS import; payment/card data and raw webhook payloads are not retained.
 After adding `read_orders` to an existing Railway `APP_SCOPES` value, run the Shopify install flow
 again so the store grants the new scope. Depending on the app's Shopify distribution and protected

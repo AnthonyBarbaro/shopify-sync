@@ -43,14 +43,30 @@ connector acknowledges it. The server separately caps its feed and request histo
 
 When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete
 events before each inventory cycle and writes them transactionally to
-`C:\ashpsdat\shopify-order.db` by default. This separate SQLite database contains an `orders` table
-and an `order_items` table, and never modifies the POS FoxPro order tables. It stores fulfillment
-details needed for a picking ticket but excludes billing addresses, card data, payment credentials,
-and raw webhook payloads. Railway deletes a queued change only after the local transaction succeeds.
+`C:\ashpsdat\shopify-orders.db` by default. This separate SQLite database mirrors the useful shape of
+the POS `Ordhdr.dbf` and `Orddtl.dbf` files but never modifies or copies those FoxPro tables.
+An existing `SHOPIFY_ORDER_DB_PATH=C:\ashpsdat\shopify-order.db` setting remains supported and will
+be migrated in place; change the setting only if the POS developer requires the plural filename.
+
+The source tables are `orders` and `order_items`. For the POS integration, the database also exposes:
+
+- `order_header`: order/invoice identifiers, customer name, email, phone, billing address, shipping
+  address, shipping method and charge, subtotal, discount, tax, total, fulfillment/financial state,
+  printing state, and POS import state;
+- `order_detail`: line number, SKU, quantity, unit price, line discount, line tax, extension, product
+  description, variant description, vendor, and fulfillment state.
+
+These two read-only views do not duplicate data. The POS integration can update `orders.import_status`,
+`orders.imported_at`, `orders.pos_order_number`, and `orders.import_error` after attempting an import.
+Card numbers, CVV values, payment credentials, authorization data, and raw webhook payloads are never
+written to this database. Railway deletes a queued change only after the local transaction succeeds.
 
 New orders have `print_status=PENDING`; a printing integration can mark them `PRINTED` and set
 `printed_at`. The file is an order inbox for the bridge and does not appear in the native POS Orders
 tab without a separately tested POS import.
+
+The POS developer handoff, field list, and import queries are in
+[`SHOPIFY_ORDER_DB_SCHEMA.md`](SHOPIFY_ORDER_DB_SCHEMA.md).
 
 ## Install
 
