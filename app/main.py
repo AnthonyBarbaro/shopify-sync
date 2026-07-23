@@ -91,6 +91,7 @@ shopify_client = ShopifyClient(settings)
 activity_store = SyncActivityStore(limit=400)
 inventory_service = InventorySyncService(shopify_client, settings, activity_store)
 woo_nonce_store = WooNonceStore()
+granted_scope_cache: dict[str, tuple[float, set[str]]] = {}
 
 app = FastAPI(
     title="Shopify Inventory Sync",
@@ -478,6 +479,37 @@ def run_with_shop_retry(shop: ShopRecord, operation: Callable[[ShopRecord], T]) 
             raise
         refreshed_shop = ensure_fresh_shop(active_shop, force_refresh=True)
         return operation(refreshed_shop)
+
+
+def get_granted_access_scopes(shop: ShopRecord) -> set[str]:
+    cached = granted_scope_cache.get(shop.shop_domain)
+    if cached and cached[0] > time.monotonic():
+        return set(cached[1])
+
+    stored = {
+        scope.strip()
+        for scope in str(shop.scope or "").split(",")
+        if scope.strip()
+    }
+    try:
+        granted = run_with_shop_retry(
+            shop,
+            lambda active_shop: shopify_client.get_access_scopes(
+                active_shop.shop_domain,
+                active_shop.access_token,
+            ),
+        )
+    except Exception:
+        logger.exception("granted_scope_refresh_failed shop=%s", shop.shop_domain)
+        granted = stored
+    else:
+        db.update_shop_scope(
+            shop_domain=shop.shop_domain,
+            scope=",".join(sorted(granted)),
+        )
+
+    granted_scope_cache[shop.shop_domain] = (time.monotonic() + 300, set(granted))
+    return set(granted)
 
 
 def require_pos_shop(
@@ -1589,7 +1621,7 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         except (TypeError, ValueError):
             return False
 
-    scopes = {scope.strip() for scope in str(shop.scope or "").split(",") if scope.strip()}
+    scopes = get_granted_access_scopes(shop)
     recent_orders = db.list_recent_order_summaries(
         shop_domain=shop.shop_domain,
         limit=max(1, min(order_limit, 25)),
@@ -2690,11 +2722,7 @@ async def connector_order_changes(
 async def connector_order_status(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
-    scopes = {
-        scope.strip()
-        for scope in str(shop.scope or "").split(",")
-        if scope.strip()
-    }
+    scopes = get_granted_access_scopes(shop)
     webhook_status = "ok"
     webhook_error = None
     try:

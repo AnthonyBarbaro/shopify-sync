@@ -14,6 +14,7 @@ from app.db import ShopRecord
 from app.inventory import InventorySyncService
 from app.models import InventoryLevelSnapshot, VariantMapping
 from app.pos_archive import save_uploaded_archive
+from app.shopify import ShopifyClient
 from windows_connector.connector import (
     adjustment_key,
     base_sku,
@@ -485,6 +486,28 @@ class DatabaseRetentionTests(unittest.TestCase):
             with sqlite3.connect(store.database_path) as connection:
                 count = connection.execute("SELECT COUNT(*) FROM connector_heartbeats").fetchone()[0]
             self.assertEqual(count, 1)
+
+
+class ShopifyScopeTests(unittest.TestCase):
+    def test_live_access_scopes_are_read_from_current_app_installation(self):
+        client = ShopifyClient(SimpleNamespace())
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "currentAppInstallation": {
+                        "accessScopes": [
+                            {"handle": "read_products"},
+                            {"handle": "read_orders"},
+                        ]
+                    }
+                }
+            },
+        ):
+            scopes = client.get_access_scopes("example.myshopify.com", "token")
+
+        self.assertEqual(scopes, {"read_products", "read_orders"})
 
 
 class LocalOrderInboxTests(unittest.TestCase):

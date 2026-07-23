@@ -29,6 +29,29 @@ class ShopifyClient:
         self._location_cache: Dict[str, Tuple[str, str]] = {}
         self._location_lock = Lock()
 
+    def get_access_scopes(self, shop_domain: str, access_token: str) -> set[str]:
+        query = """
+        query CurrentAppAccessScopes {
+          currentAppInstallation {
+            accessScopes {
+              handle
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            operation_name="CurrentAppAccessScopes",
+        )
+        installation = payload.get("data", {}).get("currentAppInstallation") or {}
+        return {
+            str(scope.get("handle")).strip()
+            for scope in installation.get("accessScopes") or []
+            if isinstance(scope, dict) and str(scope.get("handle") or "").strip()
+        }
+
     def get_products(self, shop_domain: str, access_token: str) -> List[Dict[str, Any]]:
         query = """
         query GetProducts($first: Int!, $after: String) {

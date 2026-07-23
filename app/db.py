@@ -466,6 +466,14 @@ class DatabaseStore:
             ).fetchone()
         return self._row_to_shop(row)
 
+    def update_shop_scope(self, *, shop_domain: str, scope: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE shops SET scope = ?, updated_at = ? WHERE shop_domain = ?",
+                (scope, utc_now_iso(), shop_domain),
+            )
+            connection.commit()
+
     def shop_count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(
