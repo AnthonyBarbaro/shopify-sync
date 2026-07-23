@@ -175,7 +175,16 @@ class Connector:
         skipped_non_sellable = 0
         if full_reconcile:
             prepared_products, stats = dbf_pos_sync.load_products(self._reader_args())
-            payloads = [prepared.payload for prepared in prepared_products]
+            for prepared in prepared_products:
+                invalid_field = negative_catalog_money_field(prepared.payload)
+                if invalid_field:
+                    self.logger.warning(
+                        "catalog_product_skipped_negative_money sku=%s field=%s",
+                        prepared.payload.get("sku"),
+                        invalid_field,
+                    )
+                    continue
+                payloads.append(prepared.payload)
             skipped_non_sellable = stats.skipped_non_sellable
             # Python's sort is stable, so products keep their POS order within each
             # group while every stocked product is uploaded before zero-stock rows.
@@ -846,6 +855,19 @@ def catalog_total_quantity(payload: Dict[str, Any]) -> int:
 
 def catalog_upload_priority(payload: Dict[str, Any]) -> int:
     return 0 if catalog_total_quantity(payload) > 0 else 1
+
+
+def negative_catalog_money_field(payload: Dict[str, Any]) -> Optional[str]:
+    for field in ("price", "compare_at_price", "cost"):
+        value = payload.get(field)
+        if value is not None and float(value) < 0:
+            return field
+    for index, variant in enumerate(payload.get("variants") or [], start=1):
+        for field in ("price", "compare_at_price", "cost"):
+            value = variant.get(field)
+            if value is not None and float(value) < 0:
+                return f"variants[{index}].{field}"
+    return None
 
 
 def ensure_local_order_schema(connection: sqlite3.Connection) -> None:

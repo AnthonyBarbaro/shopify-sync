@@ -2180,7 +2180,17 @@ async def _handle_external_bulk_sync(request: Request, shop: ShopRecord) -> Bulk
         )
 
     raw_items = _extract_external_bulk_items(raw_payload)
-    normalized_items = [normalize_external_product_payload(item) for item in raw_items]
+    normalized_items = []
+    for index, item in enumerate(raw_items):
+        try:
+            normalized_items.append(normalize_external_product_payload(item))
+        except Exception as exc:
+            sku = item.get("sku") if isinstance(item, dict) else None
+            raise SyncProcessingError(
+                "A product in the bulk request is invalid.",
+                {"index": index, "sku": sku, "reason": str(exc)},
+                code="invalid_bulk_product",
+            ) from exc
     try:
         worker_header = (request.headers.get("X-Sync-Workers") or "1").strip()
         try:

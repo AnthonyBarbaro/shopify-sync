@@ -24,6 +24,7 @@ from windows_connector.connector import (
     iter_selected_dbf_rows,
     matrix_variant_sku_for_row,
     merge_quantity,
+    negative_catalog_money_field,
     nightly_full_sync_due,
     read_appended_dbf_rows,
     sku_base_mapping,
@@ -95,6 +96,19 @@ class QuantityMergeTests(unittest.TestCase):
 
 
 class CatalogUploadPriorityTests(unittest.TestCase):
+    def test_negative_price_products_are_not_eligible_for_shopify_upload(self):
+        self.assertEqual(
+            negative_catalog_money_field({"sku": "TLCP", "price": -100.0}),
+            "price",
+        )
+        self.assertEqual(
+            negative_catalog_money_field(
+                {"sku": "MATRIX", "variants": [{"price": 20.0}, {"cost": -1.0}]}
+            ),
+            "variants[2].cost",
+        )
+        self.assertIsNone(negative_catalog_money_field({"sku": "ABC", "price": 0.0}))
+
     def test_stocked_products_sort_before_zero_stock_products(self):
         products = [
             {"sku": "ZERO-1", "quantity": 0},
