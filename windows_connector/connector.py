@@ -419,6 +419,13 @@ class Connector:
         endpoint = f"{self.base_url}/wc-api/v3/products/batch"
         for chunk in chunks(payloads, self.batch_size):
             response = self.session.post(endpoint, json=chunk, timeout=self.timeout)
+            if response.status_code >= 400:
+                self.logger.error(
+                    "catalog_batch_http_error status=%s skus=%s response=%s",
+                    response.status_code,
+                    ",".join(str(payload.get("sku") or "") for payload in chunk),
+                    response.text[:2000],
+                )
             response.raise_for_status()
             body = response.json()
             results = body.get("results") or []

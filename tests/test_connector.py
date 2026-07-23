@@ -7,6 +7,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from app.db import DatabaseStore
 from app.db import ShopRecord
@@ -265,6 +266,63 @@ class DatabaseRetentionTests(unittest.TestCase):
 
             self.assertEqual(store.feed_event_count("example.myshopify.com"), 100)
             self.assertEqual(store.request_log_count(), 100)
+
+    def test_optional_activity_logging_is_bounded_and_non_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(
+                str(Path(temporary_directory) / "sync.sqlite3"),
+                "test-secret",
+            )
+            store.record_feed_event(
+                shop_domain="example.myshopify.com",
+                source="test",
+                endpoint="/sync/bulk",
+                method="POST",
+                sku="ABC",
+                title="Product",
+                success=True,
+                message="ok",
+                product_id="1",
+                variant_id="2",
+                request_payload="x" * 10000,
+                normalized_payload="y" * 10000,
+            )
+            with sqlite3.connect(store.database_path) as connection:
+                lengths = connection.execute(
+                    "SELECT length(request_payload), length(normalized_payload) FROM feed_events"
+                ).fetchone()
+            self.assertEqual(lengths, (4000, 4000))
+
+            with mock.patch.object(store.logger, "exception"), mock.patch.object(
+                store, "_connect", side_effect=sqlite3.OperationalError("database is full")
+            ):
+                store.record_feed_event(
+                    shop_domain="example.myshopify.com",
+                    source="test",
+                    endpoint="/sync/bulk",
+                    method="POST",
+                    sku="ABC",
+                    title="Product",
+                    success=True,
+                    message="ok",
+                    product_id="1",
+                    variant_id="2",
+                    request_payload="{}",
+                    normalized_payload=None,
+                )
+                store.record_request_log(
+                    shop_domain="example.myshopify.com",
+                    api_key_preview="key",
+                    method="POST",
+                    path="/sync/bulk",
+                    query_string=None,
+                    status_code=200,
+                    route_path="/sync/bulk",
+                    request_body="{}",
+                    user_agent="test",
+                    source_ip="127.0.0.1",
+                    duration_ms=1,
+                )
 
     def test_inventory_change_ack_does_not_delete_a_newer_webhook(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

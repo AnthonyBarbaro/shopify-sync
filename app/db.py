@@ -618,49 +618,54 @@ class DatabaseStore:
         request_payload: str,
         normalized_payload: Optional[str],
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO feed_events (
-                    shop_domain,
-                    source,
-                    endpoint,
-                    method,
-                    sku,
-                    title,
-                    success,
-                    message,
-                    product_id,
-                    variant_id,
-                    request_payload,
-                    normalized_payload,
-                    received_at
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO feed_events (
+                        shop_domain,
+                        source,
+                        endpoint,
+                        method,
+                        sku,
+                        title,
+                        success,
+                        message,
+                        product_id,
+                        variant_id,
+                        request_payload,
+                        normalized_payload,
+                        received_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        shop_domain,
+                        source,
+                        endpoint,
+                        method.upper(),
+                        sku,
+                        title,
+                        1 if success else 0,
+                        message,
+                        product_id,
+                        variant_id,
+                        (request_payload or "")[:4000],
+                        normalized_payload[:4000] if normalized_payload else None,
+                        utc_now_iso(),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    shop_domain,
-                    source,
-                    endpoint,
-                    method.upper(),
-                    sku,
-                    title,
-                    1 if success else 0,
-                    message,
-                    product_id,
-                    variant_id,
-                    request_payload,
-                    normalized_payload,
-                    utc_now_iso(),
-                ),
-            )
-            self._trim_shop_rows(
-                connection,
-                table_name="feed_events",
-                shop_domain=shop_domain,
-                limit=self.feed_event_retention_rows,
-            )
-            connection.commit()
+                self._trim_shop_rows(
+                    connection,
+                    table_name="feed_events",
+                    shop_domain=shop_domain,
+                    limit=self.feed_event_retention_rows,
+                )
+                connection.commit()
+        except sqlite3.Error:
+            # Activity history is optional telemetry. A full, locked, or unhealthy
+            # log database must never turn a completed Shopify sync into HTTP 500.
+            self.logger.exception("feed_event_log_failed endpoint=%s sku=%s", endpoint, sku)
 
     @staticmethod
     def _trim_shop_rows(
@@ -724,46 +729,49 @@ class DatabaseStore:
         source_ip: Optional[str],
         duration_ms: int,
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO request_logs (
-                    shop_domain,
-                    api_key_preview,
-                    method,
-                    path,
-                    query_string,
-                    status_code,
-                    route_path,
-                    request_body,
-                    user_agent,
-                    source_ip,
-                    duration_ms,
-                    created_at
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO request_logs (
+                        shop_domain,
+                        api_key_preview,
+                        method,
+                        path,
+                        query_string,
+                        status_code,
+                        route_path,
+                        request_body,
+                        user_agent,
+                        source_ip,
+                        duration_ms,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        shop_domain,
+                        api_key_preview,
+                        method.upper(),
+                        path,
+                        query_string,
+                        int(status_code),
+                        route_path,
+                        request_body[:4000] if request_body else None,
+                        user_agent,
+                        source_ip,
+                        int(duration_ms),
+                        utc_now_iso(),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    shop_domain,
-                    api_key_preview,
-                    method.upper(),
-                    path,
-                    query_string,
-                    int(status_code),
-                    route_path,
-                    request_body,
-                    user_agent,
-                    source_ip,
-                    int(duration_ms),
-                    utc_now_iso(),
-                ),
-            )
-            self._trim_global_rows(
-                connection,
-                table_name="request_logs",
-                limit=self.request_log_retention_rows,
-            )
-            connection.commit()
+                self._trim_global_rows(
+                    connection,
+                    table_name="request_logs",
+                    limit=self.request_log_retention_rows,
+                )
+                connection.commit()
+        except sqlite3.Error:
+            self.logger.exception("request_log_failed method=%s path=%s", method, path)
 
     def list_feed_events(self, shop_domain: str, *, limit: int = 50) -> list[FeedEventRow]:
         safe_limit = max(1, min(limit, 500))

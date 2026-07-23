@@ -2020,7 +2020,10 @@ def _feed_source_for_path(path: str) -> str:
 
 
 def _serialize_payload(value: Any) -> str:
-    return json.dumps(value, default=str, sort_keys=True)
+    # Activity history is diagnostic only; never retain entire catalog/matrix
+    # payloads on the Railway volume.
+    serialized = json.dumps(value, default=str, sort_keys=True)
+    return _truncate_text(serialized, limit=4000) or "{}"
 
 
 def _build_woo_product_list(items: list[Any]) -> list[dict[str, Any]]:
