@@ -1089,6 +1089,17 @@ def _unique_matrix_header_values(headers: List[str], *, fallback_prefix: str) ->
     return values
 
 
+def matrix_option_name(headers: List[str], *, default: str) -> str:
+    normalized = {
+        normalize_spaces(header).upper()
+        for header in headers
+        if normalize_spaces(header)
+    }
+    if normalized == {"S", "R", "L"}:
+        return "Length"
+    return default
+
+
 def build_matrix_variants(
     *,
     sku: str,
@@ -1099,14 +1110,16 @@ def build_matrix_variants(
 ) -> List[Dict[str, Any]]:
     row_values = _unique_matrix_header_values(definition.row_headers, fallback_prefix="Row")
     column_values = _unique_matrix_header_values(definition.column_headers, fallback_prefix="Column")
+    row_option_name = matrix_option_name(definition.row_headers, default="Color")
+    column_option_name = matrix_option_name(definition.column_headers, default="Size")
     use_rows = len(row_values) > 1
     use_columns = len(column_values) > 1
     single_option: Optional[tuple[str, str]] = None
     if not use_rows and not use_columns:
         if definition.column_headers[0].strip():
-            single_option = ("Size", column_values[0])
+            single_option = (column_option_name, column_values[0])
         elif definition.row_headers[0].strip():
-            single_option = ("Color", row_values[0])
+            single_option = (row_option_name, row_values[0])
         else:
             single_option = ("Title", "Default Title")
 
@@ -1116,9 +1129,9 @@ def build_matrix_variants(
         column_number = int(cell["column"])
         option_values: Dict[str, str] = {}
         if use_columns:
-            option_values["Size"] = column_values[column_number - 1]
+            option_values[column_option_name] = column_values[column_number - 1]
         if use_rows:
-            option_values["Color"] = row_values[row_number - 1]
+            option_values[row_option_name] = row_values[row_number - 1]
         if single_option:
             option_values[single_option[0]] = single_option[1]
 
@@ -2774,6 +2787,7 @@ def write_matrix_variant_audit(path: Path, payloads: List[Dict[str, Any]]) -> in
         "barcode",
         "size",
         "color",
+        "length",
         "option_title",
         "pos_cell",
         "quantity",
@@ -2795,6 +2809,7 @@ def write_matrix_variant_audit(path: Path, payloads: List[Dict[str, Any]]) -> in
                         "barcode": variant.get("barcode") or "",
                         "size": options.get("Size") or "",
                         "color": options.get("Color") or "",
+                        "length": options.get("Length") or "",
                         "option_title": options.get("Title") or "",
                         "pos_cell": variant.get("pos_cell") or "",
                         "quantity": variant.get("quantity") if variant.get("quantity") is not None else "",

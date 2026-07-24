@@ -109,7 +109,7 @@ Before enabling live write-back:
 
 1. Make a POS backup.
 2. Point the connector at a copied DBF folder.
-3. Verify non-matrix and size/color matrix test SKUs.
+3. Verify non-matrix and size/color/length matrix test SKUs.
 4. Confirm quantities and indexes in Cash Register Express.
 5. Then switch the production config to `vfp-oledb`.
 
@@ -117,6 +117,11 @@ Direct DBF write-back updates inventory quantities only. It does not create a PO
 financial transaction for an online Shopify order.
 
 ## Operations
+
+To update the Windows runtime, open `windows_connector\update_connector.bat` as Administrator. The
+updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_sync.py`, plus the small
+supporting PowerShell files. It preserves `connector.env`, connector state, logs, POS DBFs, and the
+local Shopify order database.
 
 Start or stop the task:
 

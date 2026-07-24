@@ -2689,6 +2689,81 @@ async def reconcile_catalog_products(
     return JSONResponse(result)
 
 
+@app.post("/sync/catalog/matrix-options/repair", response_model=None)
+@app.post(
+    "/wc-api/v3/products/matrix-options/repair",
+    response_model=None,
+    include_in_schema=False,
+)
+async def repair_catalog_matrix_options(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else None
+    if not isinstance(raw_items, list):
+        raise SyncProcessingError(
+            "Matrix option repair requires an items array.",
+            code="invalid_matrix_repair_payload",
+        )
+    if len(raw_items) > 100:
+        raise SyncProcessingError(
+            "Matrix option repair is limited to 100 products per request.",
+            {"count": len(raw_items)},
+            code="too_many_matrix_repairs",
+        )
+
+    results: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            results.append(
+                {
+                    "base_sku": "",
+                    "status": "failed",
+                    "message": "Matrix repair item must be an object.",
+                }
+            )
+            continue
+        base_sku = _string_or_none(raw_item.get("base_sku")) or ""
+        raw_variant_skus = raw_item.get("variant_skus") or []
+        variant_skus = [
+            str(sku).strip()
+            for sku in raw_variant_skus[:100]
+            if str(sku or "").strip()
+        ] if isinstance(raw_variant_skus, list) else []
+        try:
+            result = run_with_shop_retry(
+                shop,
+                lambda active_shop, base_sku=base_sku, variant_skus=variant_skus:
+                    inventory_service.repair_matrix_length_option(
+                        base_sku=base_sku,
+                        variant_skus=variant_skus,
+                        shop=active_shop,
+                    ),
+            )
+        except Exception as exc:
+            result = {
+                "base_sku": base_sku,
+                "status": "failed",
+                "message": str(exc),
+            }
+        results.append(result)
+
+    updated = sum(result.get("status") == "updated" for result in results)
+    already_correct = sum(result.get("status") == "already_correct" for result in results)
+    failed = sum(result.get("status") == "failed" for result in results)
+    return JSONResponse(
+        {
+            "total": len(results),
+            "updated": updated,
+            "already_correct": already_correct,
+            "failed": failed,
+            "results": results,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
 @app.get("/sync/orders/changes", response_model=None)
 @app.get("/wc-api/v3/orders/changes", response_model=None, include_in_schema=False)
 async def connector_order_changes(

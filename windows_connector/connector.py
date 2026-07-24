@@ -32,6 +32,7 @@ import dbf_pos_sync  # noqa: E402
 
 
 STATE_VERSION = 1
+MATRIX_OPTION_SCHEMA_VERSION = 2
 POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
 MATRIX_VARIANT_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 
@@ -160,14 +161,28 @@ class Connector:
         affected_base_skus = event_skus | shopify_skus
 
         catalog_incomplete = not bool(state.get("catalog_complete"))
+        matrix_option_repair_due = (
+            int(state.get("matrix_option_schema_version") or 0)
+            < MATRIX_OPTION_SCHEMA_VERSION
+        )
         nightly_due = nightly_full_sync_due(
             state.get("last_full_reconcile_date"),
             now=now,
             hour=self.nightly_full_sync_hour,
         )
-        full_reconcile = catalog_incomplete or nightly_due or event_file_reset
+        full_reconcile = (
+            catalog_incomplete
+            or nightly_due
+            or event_file_reset
+            or matrix_option_repair_due
+        )
         if full_reconcile:
-            read_mode = "initial" if catalog_incomplete else "nightly"
+            if catalog_incomplete:
+                read_mode = "initial"
+            elif matrix_option_repair_due:
+                read_mode = "matrix-option-repair"
+            else:
+                read_mode = "nightly"
         elif affected_base_skus:
             read_mode = "events"
         else:
@@ -246,6 +261,25 @@ class Connector:
             state["catalog_complete"] = True
         elif catalog_incomplete and not new_base_skus:
             state["catalog_complete"] = True
+
+        if matrix_option_repair_due:
+            repair_items = matrix_length_repair_candidates(payloads)
+            if self.dry_run:
+                self.logger.info(
+                    "matrix_option_repair_dry_run candidates=%s",
+                    len(repair_items),
+                )
+            else:
+                repair_summary = self._repair_matrix_options(repair_items)
+                state["matrix_option_schema_version"] = MATRIX_OPTION_SCHEMA_VERSION
+                save_state(self.state_path, state)
+                self.logger.info(
+                    "matrix_option_repair_complete candidates=%s updated=%s already_correct=%s failed=%s",
+                    len(repair_items),
+                    repair_summary["updated"],
+                    repair_summary["already_correct"],
+                    repair_summary["failed"],
+                )
 
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
         remote_quantities = {
@@ -469,6 +503,43 @@ class Connector:
         response = self.session.get(f"{self.base_url}/sync/inventory/changes?limit=5000", timeout=self.timeout)
         response.raise_for_status()
         return list(response.json().get("items") or [])
+
+    def _repair_matrix_options(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
+        summary = {"updated": 0, "already_correct": 0, "failed": 0}
+        endpoint = f"{self.base_url}/sync/catalog/matrix-options/repair"
+        processed = 0
+        for chunk in chunks(items, min(self.batch_size, 100)):
+            response = self.session.post(
+                endpoint,
+                json={"items": chunk},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            summary["updated"] += int(body.get("updated") or 0)
+            summary["already_correct"] += int(body.get("already_correct") or 0)
+            summary["failed"] += int(body.get("failed") or 0)
+            processed += len(chunk)
+            self.logger.info(
+                "matrix_option_repair_progress processed=%s total=%s updated=%s",
+                processed,
+                len(items),
+                summary["updated"],
+            )
+            for result in body.get("results") or []:
+                if result.get("status") in {"failed", "not_found", "not_applicable"}:
+                    self.logger.warning(
+                        "matrix_option_repair_skipped sku=%s status=%s message=%s",
+                        result.get("base_sku"),
+                        result.get("status"),
+                        result.get("message"),
+                    )
+            if (
+                self.order_sync_enabled
+                and time.monotonic() - self.last_order_poll_monotonic >= self.interval_seconds
+            ):
+                self._sync_order_inbox()
+        return summary
 
     def _sync_order_inbox(self) -> None:
         try:
@@ -1360,6 +1431,34 @@ def merge_quantity(
 def adjustment_key(system: str, sku: str, *values: int) -> str:
     raw = "|".join([system, sku, *(str(value) for value in values)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def matrix_length_repair_candidates(
+    payloads: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for payload in payloads:
+        variants = payload.get("variants") or []
+        if not any(
+            "Length" in (variant.get("option_values") or {})
+            for variant in variants
+            if isinstance(variant, dict)
+        ):
+            continue
+        base_sku_value = str(payload.get("sku") or "").strip()
+        variant_skus = [
+            str(variant.get("sku") or "").strip()
+            for variant in variants
+            if isinstance(variant, dict) and str(variant.get("sku") or "").strip()
+        ]
+        if base_sku_value or variant_skus:
+            candidates.append(
+                {
+                    "base_sku": base_sku_value,
+                    "variant_skus": variant_skus[:10],
+                }
+            )
+    return candidates
 
 
 def chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:

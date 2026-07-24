@@ -501,6 +501,42 @@ class ShopifyClient:
         self._set_cached_variant(shop_domain, mapping)
         return mapping
 
+    def get_product_options_by_sku(
+        self,
+        shop_domain: str,
+        access_token: str,
+        sku: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_sku = sku.strip()
+        if not normalized_sku:
+            return None
+        query = """
+        query ProductOptionsByVariantSku($query: String!) {
+          productVariants(first: 1, query: $query) {
+            nodes {
+              product {
+                id
+                options {
+                  id
+                  name
+                  position
+                  values
+                }
+              }
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"query": _build_sku_search_query(normalized_sku)},
+            operation_name="ProductOptionsByVariantSku",
+        )
+        nodes = payload["data"]["productVariants"]["nodes"]
+        return (nodes[0] or {}).get("product") if nodes else None
+
     def get_product_by_handle(
         self,
         shop_domain: str,
@@ -590,6 +626,12 @@ class ShopifyClient:
               vendor
               productType
               updatedAt
+              options {
+                id
+                name
+                position
+                values
+              }
               media(first: 10) {
                 nodes {
                   alt
@@ -641,6 +683,68 @@ class ShopifyClient:
         )
         node = payload["data"]["node"]
         return node if node else None
+
+    def rename_product_option(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        product_id: str,
+        option_id: str,
+        name: str,
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation RenameProductOption($productId: ID!, $option: OptionUpdateInput!) {
+          productOptionUpdate(productId: $productId, option: $option) {
+            product {
+              id
+              options {
+                id
+                name
+                position
+                values
+              }
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            mutation,
+            {
+                "productId": normalize_gid("Product", product_id),
+                "option": {
+                    "id": normalize_gid("ProductOption", option_id),
+                    "name": name,
+                },
+            },
+            operation_name="RenameProductOption",
+        )
+        result = payload["data"]["productOptionUpdate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors:
+            raise ShopifyAPIError(
+                "Shopify rejected the product option rename.",
+                {
+                    "product_id": product_id,
+                    "option_id": option_id,
+                    "name": name,
+                    "user_errors": user_errors,
+                },
+            )
+        product = result.get("product")
+        if not product:
+            raise ShopifyAPIError(
+                "Shopify did not return the product after renaming its option.",
+                {"product_id": product_id, "option_id": option_id, "name": name},
+            )
+        return product
 
     def get_primary_location_id(self, shop_domain: str, access_token: str) -> str:
         if self.settings.shopify_location_id:

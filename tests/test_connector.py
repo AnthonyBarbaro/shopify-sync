@@ -24,6 +24,7 @@ from windows_connector.connector import (
     flatten_quantities,
     iter_selected_dbf_rows,
     matrix_variant_sku_for_row,
+    matrix_length_repair_candidates,
     merge_quantity,
     negative_catalog_money_field,
     nightly_full_sync_due,
@@ -137,6 +138,44 @@ class CatalogUploadPriorityTests(unittest.TestCase):
 
         self.assertEqual(catalog_total_quantity(matrix), 2)
         self.assertEqual(catalog_upload_priority(matrix), 0)
+
+    def test_matrix_length_repair_candidates_include_variant_skus(self):
+        candidates = matrix_length_repair_candidates(
+            [
+                {
+                    "sku": "PANTS",
+                    "variants": [
+                        {
+                            "sku": "PANTS. 1 1",
+                            "option_values": {"Size": "34", "Length": "S"},
+                        },
+                        {
+                            "sku": "PANTS. 2 1",
+                            "option_values": {"Size": "34", "Length": "R"},
+                        },
+                    ],
+                },
+                {
+                    "sku": "SHIRT",
+                    "variants": [
+                        {
+                            "sku": "SHIRT. 1 1",
+                            "option_values": {"Size": "M", "Color": "Blue"},
+                        }
+                    ],
+                },
+            ]
+        )
+
+        self.assertEqual(
+            candidates,
+            [
+                {
+                    "base_sku": "PANTS",
+                    "variant_skus": ["PANTS. 1 1", "PANTS. 2 1"],
+                }
+            ],
+        )
 
 
 class IncrementalPosEventTests(unittest.TestCase):

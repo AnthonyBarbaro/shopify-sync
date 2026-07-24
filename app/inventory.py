@@ -790,6 +790,96 @@ class InventorySyncService:
             },
         )
 
+    def repair_matrix_length_option(
+        self,
+        *,
+        base_sku: str,
+        variant_skus: List[str],
+        shop: ShopRecord,
+    ) -> Dict[str, Any]:
+        lookup_skus = []
+        for sku in [*variant_skus, base_sku]:
+            normalized = str(sku or "").strip()
+            if normalized and normalized not in lookup_skus:
+                lookup_skus.append(normalized)
+        if not lookup_skus:
+            raise SyncProcessingError(
+                "A base SKU or variant SKU is required for matrix repair.",
+                code="matrix_repair_sku_required",
+            )
+
+        product: Optional[Dict[str, Any]] = None
+        for sku in lookup_skus:
+            product = self.shopify_client.get_product_options_by_sku(
+                shop.shop_domain,
+                shop.access_token,
+                sku,
+            )
+            if product is not None:
+                break
+        if product is None:
+            return {
+                "base_sku": base_sku,
+                "status": "not_found",
+                "message": "No Shopify product was found for the POS matrix SKUs.",
+            }
+        product_id = str(product.get("id") or "")
+
+        def option_values(option: Dict[str, Any]) -> set[str]:
+            return {
+                str(value).strip().upper()
+                for value in option.get("values") or []
+                if str(value or "").strip()
+            }
+
+        options = product.get("options") or []
+        for option in options:
+            if str(option.get("name") or "").strip().casefold() == "length":
+                return {
+                    "base_sku": base_sku,
+                    "product_id": product_id,
+                    "status": "already_correct",
+                    "message": "The matrix option is already named Length.",
+                }
+
+        color_option = next(
+            (
+                option
+                for option in options
+                if str(option.get("name") or "").strip().casefold() == "color"
+                and option_values(option) == {"S", "R", "L"}
+            ),
+            None,
+        )
+        if color_option is None:
+            return {
+                "base_sku": base_sku,
+                "product_id": product_id,
+                "status": "not_applicable",
+                "message": "No Color option with exactly S, R, and L was found.",
+            }
+
+        updated = self.shopify_client.rename_product_option(
+            shop.shop_domain,
+            shop.access_token,
+            product_id=product_id,
+            option_id=str(color_option["id"]),
+            name="Length",
+        )
+        return {
+            "base_sku": base_sku,
+            "product_id": product_id,
+            "status": "updated",
+            "message": "Renamed the S/R/L matrix option from Color to Length.",
+            "options": [
+                {
+                    "name": option.get("name"),
+                    "values": option.get("values") or [],
+                }
+                for option in updated.get("options") or []
+            ],
+        }
+
     def _find_existing_mapping(self, shop: ShopRecord, payload: ProductSyncRequest) -> Optional[VariantMapping]:
         if payload.external_id:
             product = self.shopify_client.get_product_by_id(

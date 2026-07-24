@@ -55,6 +55,40 @@ class MatrixPayloadTests(unittest.TestCase):
         )
         self.assertEqual(dbf_pos_sync.format_matrix_barcode("21741", 1, 10), "21741. 1 10")
 
+    def test_short_regular_long_rows_are_length_not_color(self):
+        definition = dbf_pos_sync.MatrixDefinition(
+            row_headers=["S", "R", "L"],
+            column_headers=["34", "36"],
+            cells=[
+                {"row": 1, "column": 1, "cell": "1 1", "quantity": 1},
+                {"row": 2, "column": 1, "cell": "2 1", "quantity": 2},
+                {"row": 3, "column": 2, "cell": "3 2", "quantity": 3},
+            ],
+        )
+
+        variants = dbf_pos_sync.build_matrix_variants(
+            sku="PANTS",
+            definition=definition,
+            price=Decimal("100.00"),
+            compare_at_price=None,
+            cost=Decimal("40.00"),
+        )
+
+        self.assertEqual(variants[0]["option_values"], {"Size": "34", "Length": "S"})
+        self.assertEqual(variants[1]["option_values"], {"Size": "34", "Length": "R"})
+        self.assertEqual(variants[2]["option_values"], {"Size": "36", "Length": "L"})
+        self.assertNotIn("Color", variants[0]["option_values"])
+
+    def test_short_regular_long_columns_are_also_length(self):
+        self.assertEqual(
+            dbf_pos_sync.matrix_option_name(["S", "R", "L"], default="Size"),
+            "Length",
+        )
+        self.assertEqual(
+            dbf_pos_sync.matrix_option_name(["Black", "Navy"], default="Color"),
+            "Color",
+        )
+
 
 class MatrixShopifyInputTests(unittest.TestCase):
     def setUp(self):
@@ -195,6 +229,62 @@ class MatrixShopifyInputTests(unittest.TestCase):
         self.assertEqual(result.details["matrix_variant_count"], 2)
         self.assertEqual(client.product_set_input["variants"][0]["id"], "gid://shopify/ProductVariant/100")
         self.assertEqual(client.product_set_input["variants"][0]["barcode"], "21741. 1 1")
+
+    def test_existing_srl_color_option_is_renamed_without_product_field_updates(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.rename = None
+
+            def get_product_options_by_sku(self, shop_domain, access_token, sku):
+                if sku != "PANTS. 1 1":
+                    return None
+                return {
+                    "id": "gid://shopify/Product/99",
+                    "options": [
+                        {"id": "gid://shopify/ProductOption/1", "name": "Size", "values": ["34", "36"]},
+                        {"id": "gid://shopify/ProductOption/2", "name": "Color", "values": ["S", "R", "L"]},
+                    ],
+                }
+
+            def rename_product_option(
+                self,
+                shop_domain,
+                access_token,
+                *,
+                product_id,
+                option_id,
+                name,
+            ):
+                self.rename = {
+                    "product_id": product_id,
+                    "option_id": option_id,
+                    "name": name,
+                }
+                return {
+                    "id": product_id,
+                    "options": [
+                        {"name": "Size", "values": ["34", "36"]},
+                        {"name": "Length", "values": ["S", "R", "L"]},
+                    ],
+                }
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(client, None, None)
+        result = service.repair_matrix_length_option(
+            base_sku="PANTS",
+            variant_skus=["PANTS. 1 1"],
+            shop=ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+        )
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(
+            client.rename,
+            {
+                "product_id": "gid://shopify/Product/99",
+                "option_id": "gid://shopify/ProductOption/2",
+                "name": "Length",
+            },
+        )
 
 
 class BulkWorkerTests(unittest.TestCase):
