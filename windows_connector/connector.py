@@ -149,6 +149,13 @@ class Connector:
 
         inventory_changes = self._fetch_inventory_changes()
         event_skus, event_file_reset = self._collect_pos_event_skus(state)
+        known_products = set(state.get("catalog_products") or [])
+        new_numeric_skus: set[str] = set()
+        if state.get("catalog_complete"):
+            new_numeric_skus = self._collect_new_numeric_product_skus(
+                state,
+                known_products=known_products,
+            )
         sku_bases: Dict[str, str] = state.setdefault("sku_bases", {})
         shopify_skus = {
             sku_bases.get(
@@ -158,7 +165,7 @@ class Connector:
             for change in inventory_changes
             if str(change.get("sku") or "").strip()
         }
-        affected_base_skus = event_skus | shopify_skus
+        affected_base_skus = event_skus | shopify_skus | new_numeric_skus
 
         catalog_incomplete = not bool(state.get("catalog_complete"))
         matrix_option_repair_due = (
@@ -184,7 +191,7 @@ class Connector:
             else:
                 read_mode = "nightly"
         elif affected_base_skus:
-            read_mode = "events"
+            read_mode = "new-products" if new_numeric_skus else "events"
         else:
             read_mode = "idle"
 
@@ -205,6 +212,22 @@ class Connector:
             skipped_non_sellable = stats.skipped_non_sellable
             # Python's sort is stable, so products keep their POS order within each
             # group while every stocked product is uploaded before zero-stock rows.
+            payloads.sort(key=catalog_upload_priority)
+        elif new_numeric_skus:
+            prepared_products, stats = dbf_pos_sync.load_products(
+                self._reader_args(new_numeric_skus)
+            )
+            for prepared in prepared_products:
+                invalid_field = negative_catalog_money_field(prepared.payload)
+                if invalid_field:
+                    self.logger.warning(
+                        "new_product_skipped_negative_money sku=%s field=%s",
+                        prepared.payload.get("sku"),
+                        invalid_field,
+                    )
+                    continue
+                payloads.append(prepared.payload)
+            skipped_non_sellable = stats.skipped_non_sellable
             payloads.sort(key=catalog_upload_priority)
 
         payload_by_base = {str(payload["sku"]): payload for payload in payloads}
@@ -230,18 +253,22 @@ class Connector:
             skipped_non_sellable,
         )
 
-        known_products = set(state.get("catalog_products") or [])
         new_base_skus = [sku for sku in payload_by_base if sku not in known_products]
-        if catalog_incomplete and new_base_skus and self.initial_catalog_upload:
+        if new_base_skus and self.initial_catalog_upload:
             new_payloads = [payload_by_base[sku] for sku in new_base_skus]
             if self.dry_run:
-                self.logger.info("catalog_upload_dry_run products=%s", len(new_payloads))
+                self.logger.info(
+                    "catalog_upload_dry_run mode=%s products=%s",
+                    "initial" if catalog_incomplete else "new-products",
+                    len(new_payloads),
+                )
             else:
                 succeeded = self._upload_catalog(new_payloads, state=state)
                 known_products.update(succeeded)
                 state["catalog_products"] = sorted(known_products, key=str.casefold)
-                state["catalog_complete"] = len(known_products) == len(payload_by_base)
-                if state["catalog_complete"]:
+                if catalog_incomplete:
+                    state["catalog_complete"] = len(known_products) >= len(payload_by_base)
+                if catalog_incomplete and state["catalog_complete"]:
                     quantity_entries = state.setdefault("quantities", {})
                     for sku, quantity in local_quantities.items():
                         quantity_entries.setdefault(
@@ -250,10 +277,11 @@ class Connector:
                         )
                 save_state(self.state_path, state)
                 self.logger.info(
-                    "catalog_upload_complete attempted=%s succeeded=%s remaining=%s",
+                    "catalog_upload_complete mode=%s attempted=%s succeeded=%s remaining=%s",
+                    "initial" if catalog_incomplete else "new-products",
                     len(new_payloads),
                     len(succeeded),
-                    len(payload_by_base) - len(known_products),
+                    max(0, len(new_payloads) - len(succeeded)),
                 )
         elif catalog_incomplete and new_base_skus and not self.initial_catalog_upload:
             known_products.update(new_base_skus)
@@ -413,6 +441,42 @@ class Connector:
             in_stock_status="active",
             zero_quantity_status="archived",
         )
+
+    def _collect_new_numeric_product_skus(
+        self,
+        state: Dict[str, Any],
+        *,
+        known_products: set[str],
+    ) -> set[str]:
+        item_path = dbf_pos_sync.find_dbf_file(
+            self.dbf_dir,
+            "Item.dbf",
+            recursive=True,
+        )
+        if item_path is None:
+            self.logger.warning("new_product_scan_missing file=Item.dbf")
+            return set()
+
+        item_skus = [
+            str(row.get("SKU") or "").strip()
+            for row in dbf_pos_sync.iter_dbf_rows(item_path)
+            if str(row.get("SKU") or "").strip()
+        ]
+        candidates, high_water, digit_width = numeric_sku_increases(
+            item_skus,
+            known_products=known_products,
+            high_water=state.get("numeric_sku_high_water"),
+            digit_width=state.get("numeric_sku_digit_width"),
+        )
+        state["numeric_sku_high_water"] = high_water
+        state["numeric_sku_digit_width"] = digit_width
+        if candidates:
+            self.logger.info(
+                "new_numeric_products_detected new_high=%s skus=%s",
+                high_water,
+                ",".join(sorted(candidates, key=int)),
+            )
+        return candidates
 
     def _collect_pos_event_skus(self, state: Dict[str, Any]) -> tuple[set[str], bool]:
         cursors: Dict[str, int] = state.setdefault("event_cursors", {})
@@ -702,6 +766,44 @@ def base_sku(sku: str) -> str:
     normalized = str(sku or "").strip()
     match = MATRIX_VARIANT_SKU.match(normalized)
     return match.group(1).strip() if match else normalized
+
+
+def numeric_sku_increases(
+    item_skus: Iterable[str],
+    *,
+    known_products: set[str],
+    high_water: Any = None,
+    digit_width: Any = None,
+) -> tuple[set[str], int, int]:
+    numeric_skus = [
+        str(sku).strip()
+        for sku in item_skus
+        if str(sku).strip().isdigit()
+    ]
+    if not numeric_skus:
+        return set(), int(high_water or 0), int(digit_width or 0)
+
+    width = int(digit_width or len(numeric_skus[-1]))
+    sequence_skus = [sku for sku in numeric_skus if len(sku) == width]
+    if not sequence_skus:
+        return set(), int(high_water or 0), width
+
+    known_sequence_values = [
+        int(str(sku).strip())
+        for sku in known_products
+        if str(sku).strip().isdigit() and len(str(sku).strip()) == width
+    ]
+    previous_high = int(high_water) if high_water not in (None, "") else max(
+        known_sequence_values,
+        default=0,
+    )
+    observed_high = max(int(sku) for sku in sequence_skus)
+    candidates = {
+        sku
+        for sku in sequence_skus
+        if int(sku) > previous_high and sku not in known_products
+    }
+    return candidates, max(previous_high, observed_high), width
 
 
 def nightly_full_sync_due(last_date: Any, *, now: datetime, hour: int) -> bool:

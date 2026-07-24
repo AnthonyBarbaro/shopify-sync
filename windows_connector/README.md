@@ -15,8 +15,12 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
 4. Every three minutes it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
    Those rows identify affected base SKUs; the connector then rereads their authoritative current
    quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
+   It also checks the current numeric SKU sequence in `Item.dbf`. A SKU above the saved five-digit
+   high-water mark is uploaded once as a new product, normally within the next three-minute cycle.
 5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation.
    If the computer was off at midnight, the first later cycle that day performs the missed pass.
+   This full scan also catches new alphanumeric or out-of-sequence SKUs that the numeric fast path
+   cannot identify.
 6. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
    changed quantities; it does not scan the entire Shopify catalog.
 7. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are

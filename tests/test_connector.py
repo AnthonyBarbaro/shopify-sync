@@ -28,6 +28,7 @@ from windows_connector.connector import (
     merge_quantity,
     negative_catalog_money_field,
     nightly_full_sync_due,
+    numeric_sku_increases,
     read_appended_dbf_rows,
     sku_base_mapping,
     upsert_order_changes,
@@ -176,6 +177,28 @@ class CatalogUploadPriorityTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_numeric_sku_high_water_ignores_legacy_six_digit_skus(self):
+        candidates, high_water, digit_width = numeric_sku_increases(
+            ["120312", "132223", "22289", "22290", "22301"],
+            known_products={"120312", "132223", "22289", "22290"},
+        )
+
+        self.assertEqual(digit_width, 5)
+        self.assertEqual(high_water, 22301)
+        self.assertEqual(candidates, {"22301"})
+
+    def test_numeric_sku_high_water_returns_only_later_unknown_skus(self):
+        candidates, high_water, digit_width = numeric_sku_increases(
+            ["22290", "22291", "22292", "22301"],
+            known_products={"22290", "22291"},
+            high_water=22291,
+            digit_width=5,
+        )
+
+        self.assertEqual(candidates, {"22292", "22301"})
+        self.assertEqual(high_water, 22301)
+        self.assertEqual(digit_width, 5)
 
 
 class IncrementalPosEventTests(unittest.TestCase):
