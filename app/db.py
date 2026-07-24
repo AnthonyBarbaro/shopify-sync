@@ -119,6 +119,17 @@ class RecentOrderRow:
     delivery_status: str
 
 
+@dataclass(frozen=True)
+class RecentPriceChangeRow:
+    source_sku: str
+    old_price: Optional[str]
+    new_price: str
+    target_count: int
+    success: bool
+    message: str
+    changed_at: str
+
+
 class DatabaseStore:
     def __init__(
         self,
@@ -241,6 +252,22 @@ class DatabaseStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS recent_price_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    source_sku TEXT NOT NULL,
+                    old_price TEXT,
+                    new_price TEXT NOT NULL,
+                    target_count INTEGER NOT NULL,
+                    success INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pos_credentials (
                     shop_domain TEXT PRIMARY KEY,
                     api_key TEXT UNIQUE NOT NULL,
@@ -317,6 +344,10 @@ class DatabaseStore:
                 "CREATE INDEX IF NOT EXISTS idx_recent_orders_shop_received "
                 "ON recent_order_summaries(shop_domain, received_at DESC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recent_prices_shop_changed "
+                "ON recent_price_changes(shop_domain, changed_at DESC)"
+            )
             for row in connection.execute("SELECT DISTINCT shop_domain FROM feed_events").fetchall():
                 self._trim_shop_rows(
                     connection,
@@ -371,6 +402,16 @@ class DatabaseStore:
                     shop_domain=row["shop_domain"],
                     limit=self.recent_order_retention_rows,
                     order_column="received_at",
+                )
+            for row in connection.execute(
+                "SELECT DISTINCT shop_domain FROM recent_price_changes"
+            ).fetchall():
+                self._trim_shop_rows(
+                    connection,
+                    table_name="recent_price_changes",
+                    shop_domain=row["shop_domain"],
+                    limit=50,
+                    order_column="changed_at",
                 )
             self._trim_global_rows(
                 connection,
@@ -778,6 +819,7 @@ class DatabaseStore:
             "feed_events": "id",
             "order_changes": "id",
             "recent_order_summaries": "received_at",
+            "recent_price_changes": "changed_at",
         }
         if table_name not in allowed or order_column != allowed[table_name]:
             raise ValueError(f"Unsupported retention table: {table_name}")
@@ -1267,6 +1309,83 @@ class DatabaseStore:
                 order_created_at=row["order_created_at"],
                 received_at=row["received_at"],
                 delivery_status=row["delivery_status"],
+            )
+            for row in rows
+        ]
+
+    def record_recent_price_change(
+        self,
+        *,
+        shop_domain: str,
+        source_sku: str,
+        old_price: Optional[str],
+        new_price: str,
+        target_count: int,
+        success: bool,
+        message: str,
+    ) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO recent_price_changes (
+                        shop_domain, source_sku, old_price, new_price,
+                        target_count, success, message, changed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        shop_domain,
+                        source_sku,
+                        old_price,
+                        new_price,
+                        int(target_count),
+                        1 if success else 0,
+                        message[:500],
+                        utc_now_iso(),
+                    ),
+                )
+                self._trim_shop_rows(
+                    connection,
+                    table_name="recent_price_changes",
+                    shop_domain=shop_domain,
+                    limit=50,
+                    order_column="changed_at",
+                )
+                connection.commit()
+        except sqlite3.Error:
+            # Dashboard history is optional; it must never turn a completed Shopify
+            # price update into a connector failure.
+            self.logger.exception("recent_price_change_log_failed sku=%s", source_sku)
+
+    def list_recent_price_changes(
+        self,
+        *,
+        shop_domain: str,
+        limit: int = 10,
+    ) -> list[RecentPriceChangeRow]:
+        safe_limit = max(1, min(int(limit), 50))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT source_sku, old_price, new_price, target_count,
+                       success, message, changed_at
+                FROM recent_price_changes
+                WHERE shop_domain = ?
+                ORDER BY changed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (shop_domain, safe_limit),
+            ).fetchall()
+        return [
+            RecentPriceChangeRow(
+                source_sku=row["source_sku"],
+                old_price=row["old_price"],
+                new_price=row["new_price"],
+                target_count=int(row["target_count"]),
+                success=bool(row["success"]),
+                message=row["message"],
+                changed_at=row["changed_at"],
             )
             for row in rows
         ]

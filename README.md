@@ -70,8 +70,9 @@ The unattended Windows connector does not upload DBF files at all.
 
 The unattended connector treats catalog data as a one-time import: zero-quantity products are
 archived, descriptions start empty, and the generated product name is added as a tag. After a base
-SKU is successfully imported, recurring connector traffic uses inventory-only endpoints so Shopify
-edits to titles, descriptions, prices, tags, images, and other merchandising fields are preserved.
+SKU is successfully imported, recurring connector traffic uses inventory and price-only endpoints.
+Shopify edits to titles, descriptions, tags, images, and other merchandising fields are preserved;
+a price changes only when `pricechg.dbf` records a newer POS price.
 
 With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
 queue until the Windows connector writes them to `C:\ashpsdat\shopify-orders.db`. The local database

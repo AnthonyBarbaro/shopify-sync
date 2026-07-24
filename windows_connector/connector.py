@@ -74,6 +74,7 @@ class Connector:
         self.workers = env_int("CONNECTOR_WORKERS", 2, minimum=1, maximum=4)
         self.timeout = env_int("CONNECTOR_TIMEOUT_SECONDS", 300, minimum=30, maximum=1800)
         self.initial_catalog_upload = env_bool("INITIAL_CATALOG_UPLOAD", True)
+        self.price_sync_enabled = env_bool("PRICE_SYNC_ENABLED", True)
         self.order_sync_enabled = env_bool("ORDER_SYNC_ENABLED", True)
         self.order_db_path = Path(
             os.getenv("SHOPIFY_ORDER_DB_PATH") or (self.dbf_dir / "shopify-orders.db")
@@ -119,10 +120,11 @@ class Connector:
 
     def run_forever(self, *, once: bool = False) -> int:
         self.logger.info(
-            "connector_started dbf_dir=%s interval=%ss writeback=%s dry_run=%s",
+            "connector_started dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
             self.dbf_dir,
             self.interval_seconds,
             self.writeback_mode,
+            self.price_sync_enabled,
             self.dry_run,
         )
         while True:
@@ -308,6 +310,9 @@ class Connector:
                     repair_summary["already_correct"],
                     repair_summary["failed"],
                 )
+
+        if self.price_sync_enabled:
+            self._sync_pos_price_changes(state)
 
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
         remote_quantities = {
@@ -605,6 +610,97 @@ class Connector:
                 self._sync_order_inbox()
         return summary
 
+    def _sync_pos_price_changes(self, state: Dict[str, Any]) -> None:
+        current_snapshot = read_pos_price_snapshot(self.dbf_dir)
+        previous_snapshot = state.get("price_snapshot")
+        if not isinstance(previous_snapshot, dict):
+            state["price_snapshot"] = current_snapshot
+            if not self.dry_run:
+                save_state(self.state_path, state)
+            self.logger.info(
+                "price_tracker_initialized rows=%s historical_changes_replayed=0",
+                len(current_snapshot),
+            )
+            return
+
+        changes = detect_price_changes(
+            previous_snapshot,
+            current_snapshot,
+            sku_bases=state.get("sku_bases") or {},
+        )
+        if not changes:
+            # Keep the snapshot aligned if the POS purges old price-change rows.
+            state["price_snapshot"] = current_snapshot
+            return
+
+        self.logger.info(
+            "price_changes_detected changes=%s source_skus=%s",
+            len(changes),
+            ",".join(change["source_sku"] for change in changes),
+        )
+        if self.dry_run:
+            for change in changes:
+                self.logger.info(
+                    "price_change_dry_run sku=%s old_price=%s new_price=%s targets=%s",
+                    change["source_sku"],
+                    change["old_price"],
+                    change["new_price"],
+                    ",".join(change["target_skus"]),
+                )
+            return
+
+        results: List[Dict[str, Any]] = []
+        for chunk in chunks(changes, min(self.batch_size, 100)):
+            try:
+                response = self.session.post(
+                    f"{self.base_url}/sync/prices",
+                    json={"changes": chunk},
+                    timeout=self.timeout,
+                )
+                if response.status_code >= 400:
+                    self.logger.error(
+                        "price_sync_http_error status=%s response=%s",
+                        response.status_code,
+                        response.text[:2000],
+                    )
+                response.raise_for_status()
+                results.extend(response.json().get("results") or [])
+            except Exception:
+                # Price tracking must not interrupt inventory or order processing.
+                # Missing results retain the old baseline and retry next cycle.
+                self.logger.exception("price_sync_chunk_failed changes=%s", len(chunk))
+
+        results_by_sku = {
+            str(result.get("source_sku") or "").strip(): result
+            for result in results
+        }
+        retry_snapshot = dict(current_snapshot)
+        for change in changes:
+            source_sku = change["source_sku"]
+            result = results_by_sku.get(source_sku) or {}
+            if result.get("success"):
+                self.logger.info(
+                    "price_change_applied sku=%s old_price=%s new_price=%s targets=%s",
+                    source_sku,
+                    change["old_price"],
+                    change["new_price"],
+                    len(change["target_skus"]),
+                )
+                continue
+            if source_sku in previous_snapshot:
+                retry_snapshot[source_sku] = previous_snapshot[source_sku]
+            else:
+                retry_snapshot.pop(source_sku, None)
+            self.logger.error(
+                "price_change_failed sku=%s old_price=%s new_price=%s message=%s",
+                source_sku,
+                change["old_price"],
+                change["new_price"],
+                result.get("message") or "No result returned.",
+            )
+        state["price_snapshot"] = retry_snapshot
+        save_state(self.state_path, state)
+
     def _sync_order_inbox(self) -> None:
         try:
             if not self.dry_run and not self.order_database_initialized:
@@ -766,6 +862,65 @@ def base_sku(sku: str) -> str:
     normalized = str(sku or "").strip()
     match = MATRIX_VARIANT_SKU.match(normalized)
     return match.group(1).strip() if match else normalized
+
+
+def read_pos_price_snapshot(dbf_dir: Path) -> Dict[str, str]:
+    snapshot: Dict[str, str] = {}
+    for sku, row in dbf_pos_sync.build_price_change_lookup(
+        dbf_dir,
+        recursive=True,
+    ).items():
+        normalized_sku = str(sku or "").strip()
+        price = money_text(row.get("PRICE"))
+        if not normalized_sku or price is None:
+            continue
+        try:
+            if Decimal(price) < 0:
+                continue
+        except InvalidOperation:
+            continue
+        snapshot[normalized_sku] = price
+    return snapshot
+
+
+def detect_price_changes(
+    previous_snapshot: Dict[str, Any],
+    current_snapshot: Dict[str, Any],
+    *,
+    sku_bases: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    changes: List[Dict[str, Any]] = []
+    for source_sku in sorted(current_snapshot, key=str.casefold):
+        new_price = money_text(current_snapshot[source_sku])
+        old_price = money_text(previous_snapshot.get(source_sku))
+        if new_price is None or old_price == new_price:
+            continue
+
+        if MATRIX_VARIANT_SKU.match(source_sku):
+            target_skus = [source_sku]
+        else:
+            target_skus = sorted(
+                {
+                    variant_sku
+                    for variant_sku, product_sku in sku_bases.items()
+                    if product_sku == source_sku
+                    and variant_sku != source_sku
+                    and MATRIX_VARIANT_SKU.match(variant_sku)
+                },
+                key=str.casefold,
+            )
+            if not target_skus:
+                target_skus = [source_sku]
+
+        changes.append(
+            {
+                "source_sku": source_sku,
+                "target_skus": target_skus,
+                "old_price": old_price,
+                "new_price": new_price,
+            }
+        )
+    return changes
 
 
 def numeric_sku_increases(

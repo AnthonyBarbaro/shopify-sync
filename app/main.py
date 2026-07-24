@@ -1626,6 +1626,10 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         shop_domain=shop.shop_domain,
         limit=max(1, min(order_limit, 25)),
     )
+    recent_prices = db.list_recent_price_changes(
+        shop_domain=shop.shop_domain,
+        limit=10,
+    )
     return JSONResponse(
         {
             "shop": shop.shop_domain,
@@ -1659,8 +1663,23 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
                     for row in recent_orders
                 ],
             },
+            "prices": {
+                "recent": [
+                    {
+                        "source_sku": row.source_sku,
+                        "old_price": row.old_price,
+                        "new_price": row.new_price,
+                        "target_count": row.target_count,
+                        "success": row.success,
+                        "message": row.message,
+                        "changed_at": row.changed_at,
+                    }
+                    for row in recent_prices
+                ],
+            },
             "storage": {
                 "recent_order_limit": settings.recent_order_retention_rows,
+                "recent_price_limit": 50,
                 "stores_order_details": False,
             },
             "timestamp": utc_now_iso(),
@@ -2854,6 +2873,149 @@ async def connector_inventory_snapshot(
             "shop": shop.shop_domain,
             "total": len(items),
             "items": items,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
+@app.post("/sync/prices", response_model=None)
+@app.post("/wc-api/v3/prices", response_model=None, include_in_schema=False)
+async def connector_price_changes(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_changes = raw_payload.get("changes") if isinstance(raw_payload, dict) else None
+    if not isinstance(raw_changes, list) or not raw_changes:
+        raise SyncProcessingError(
+            "Price sync requires a non-empty changes array.",
+            code="invalid_price_changes",
+        )
+    if len(raw_changes) > 100:
+        raise SyncProcessingError(
+            "Price sync is limited to 100 source SKUs per request.",
+            {"count": len(raw_changes)},
+            code="too_many_price_changes",
+        )
+
+    total_targets = sum(
+        len(change.get("target_skus") or [])
+        for change in raw_changes
+        if isinstance(change, dict) and isinstance(change.get("target_skus"), list)
+    )
+    if total_targets > 1000:
+        raise SyncProcessingError(
+            "Price sync is limited to 1,000 Shopify variants per request.",
+            {"count": total_targets},
+            code="too_many_price_targets",
+        )
+
+    results: list[dict[str, Any]] = []
+    for index, raw_change in enumerate(raw_changes):
+        source_sku = ""
+        old_price = None
+        new_price_text = ""
+        target_skus: list[str] = []
+        target_results: list[dict[str, Any]] = []
+        try:
+            if not isinstance(raw_change, dict):
+                raise SyncProcessingError(
+                    f"Price change row {index + 1} must be an object.",
+                    code="invalid_price_change",
+                )
+            source_sku = _string_or_none(raw_change.get("source_sku")) or ""
+            old_price = _string_or_none(raw_change.get("old_price"))
+            new_price = _as_float(raw_change.get("new_price"))
+            if not source_sku or new_price is None or new_price < 0:
+                raise SyncProcessingError(
+                    "Each price change requires a source SKU and non-negative new price.",
+                    {"source_sku": source_sku, "new_price": raw_change.get("new_price")},
+                    code="invalid_price_change",
+                )
+            new_price_text = f"{new_price:.2f}"
+            raw_targets = raw_change.get("target_skus")
+            if not isinstance(raw_targets, list):
+                raise SyncProcessingError(
+                    "Each price change requires a target_skus array.",
+                    {"source_sku": source_sku},
+                    code="invalid_price_targets",
+                )
+            target_skus = list(
+                dict.fromkeys(
+                    str(sku).strip()
+                    for sku in raw_targets
+                    if str(sku or "").strip()
+                )
+            )
+            if not target_skus:
+                raise SyncProcessingError(
+                    "Each price change requires at least one target SKU.",
+                    {"source_sku": source_sku},
+                    code="invalid_price_targets",
+                )
+
+            for target_sku in target_skus:
+                try:
+                    target_results.append(
+                        run_with_shop_retry(
+                            shop,
+                            lambda active_shop, target_sku=target_sku: inventory_service.update_price_by_sku(
+                                sku=target_sku,
+                                price=new_price,
+                                shop=active_shop,
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    target_results.append(
+                        {
+                            "sku": target_sku,
+                            "success": False,
+                            "message": str(exc),
+                            "details": exc.details if isinstance(exc, AppError) else {},
+                        }
+                    )
+            success = all(result.get("success") for result in target_results)
+            message = (
+                f"Updated {len(target_results)} Shopify variant price"
+                f"{'' if len(target_results) == 1 else 's'}."
+                if success
+                else "One or more Shopify variant prices could not be updated."
+            )
+        except Exception as exc:
+            success = False
+            message = str(exc)
+
+        result = {
+            "source_sku": source_sku,
+            "old_price": old_price,
+            "new_price": new_price_text or _string_or_none(
+                raw_change.get("new_price") if isinstance(raw_change, dict) else None
+            ),
+            "target_count": len(target_skus),
+            "success": success,
+            "message": message,
+            "targets": target_results,
+        }
+        results.append(result)
+        if source_sku and result["new_price"]:
+            db.record_recent_price_change(
+                shop_domain=shop.shop_domain,
+                source_sku=source_sku,
+                old_price=old_price,
+                new_price=result["new_price"],
+                target_count=len(target_skus),
+                success=success,
+                message=message,
+            )
+
+    succeeded = sum(1 for result in results if result["success"])
+    return JSONResponse(
+        {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "results": results,
             "timestamp": utc_now_iso(),
         }
     )

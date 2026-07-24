@@ -21,6 +21,7 @@ from windows_connector.connector import (
     catalog_total_quantity,
     catalog_upload_priority,
     dbf_record_count,
+    detect_price_changes,
     flatten_quantities,
     iter_selected_dbf_rows,
     matrix_variant_sku_for_row,
@@ -176,6 +177,49 @@ class CatalogUploadPriorityTests(unittest.TestCase):
                     "variant_skus": ["PANTS. 1 1", "PANTS. 2 1"],
                 }
             ],
+        )
+
+
+class PriceChangeDetectionTests(unittest.TestCase):
+    def test_unchanged_prices_are_not_sent(self):
+        changes = detect_price_changes(
+            {"22301": "49.00"},
+            {"22301": "49.00"},
+            sku_bases={"22301": "22301"},
+        )
+        self.assertEqual(changes, [])
+
+    def test_changed_price_is_sent_to_the_exact_sku(self):
+        changes = detect_price_changes(
+            {"22301": "49.00"},
+            {"22301": "59"},
+            sku_bases={"22301": "22301"},
+        )
+        self.assertEqual(
+            changes,
+            [
+                {
+                    "source_sku": "22301",
+                    "target_skus": ["22301"],
+                    "old_price": "49.00",
+                    "new_price": "59.00",
+                }
+            ],
+        )
+
+    def test_matrix_base_price_targets_all_matrix_variants(self):
+        changes = detect_price_changes(
+            {"22001": "100.00"},
+            {"22001": "110.00"},
+            sku_bases={
+                "22001": "22001",
+                "22001. 1 1": "22001",
+                "22001. 1 2": "22001",
+            },
+        )
+        self.assertEqual(
+            changes[0]["target_skus"],
+            ["22001. 1 1", "22001. 1 2"],
         )
 
     def test_numeric_sku_high_water_ignores_legacy_six_digit_skus(self):
@@ -549,6 +593,27 @@ class DatabaseRetentionTests(unittest.TestCase):
                 count = connection.execute("SELECT COUNT(*) FROM connector_heartbeats").fetchone()[0]
             self.assertEqual(count, 1)
 
+    def test_recent_price_changes_are_bounded_to_fifty_rows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(str(Path(temporary_directory) / "sync.sqlite3"), "test-secret")
+            for index in range(55):
+                store.record_recent_price_change(
+                    shop_domain="example.myshopify.com",
+                    source_sku=str(22000 + index),
+                    old_price="10.00",
+                    new_price="11.00",
+                    target_count=1,
+                    success=True,
+                    message="Updated.",
+                )
+
+            recent = store.list_recent_price_changes(
+                shop_domain="example.myshopify.com",
+                limit=50,
+            )
+            self.assertEqual(len(recent), 50)
+            self.assertEqual(recent[0].source_sku, "22054")
+
 
 class ShopifyScopeTests(unittest.TestCase):
     def test_live_access_scopes_are_read_from_current_app_installation(self):
@@ -753,6 +818,42 @@ class InventoryAdjustmentTests(unittest.TestCase):
         self.assertEqual(args[3], "gid://shopify/Location/4")
         self.assertEqual(args[4], -1)
         self.assertEqual(kwargs["idempotency_key"], "stable-key")
+
+    def test_price_update_changes_only_variant_id_and_price(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.variant_update = None
+
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                self.force_refresh = force_refresh
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    current_price=49.0,
+                )
+
+            def update_variant_fields(self, *args, **kwargs):
+                self.variant_update = (args, kwargs)
+                return {}
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(client, SimpleNamespace(), None)
+        result = service.update_price_by_sku(
+            sku="22301",
+            price=59,
+            shop=ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(client.force_refresh)
+        _args, kwargs = client.variant_update
+        self.assertEqual(
+            kwargs["variant"],
+            {"id": "gid://shopify/ProductVariant/1", "price": "59.00"},
+        )
 
 
 class ArchiveStorageTests(unittest.TestCase):

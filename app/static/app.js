@@ -161,6 +161,7 @@ function renderOverview() {
   const connector = state.bridge?.connector || {}
   const inventory = state.bridge?.inventory || {}
   const orders = state.bridge?.orders || {}
+  const prices = state.bridge?.prices || {}
   const bridgeActive = connector.active === true
   const setupNeeded = orders.authorized === false
   const storeName = state.config?.shop_name || state.config?.shop || "Your store"
@@ -218,6 +219,17 @@ function renderOverview() {
           <a class="text-link" href="/app/orders" data-route>View all recent orders</a>
         </div>
         ${renderOrderList((orders.recent || []).slice(0, 5), true)}
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="kicker">Price tracking</p>
+            <h2>Recent POS price changes</h2>
+          </div>
+          <small>Only variant prices are updated</small>
+        </div>
+        ${renderPriceChangeList(prices.recent || [])}
       </section>
 
       <section class="flow-card">
@@ -309,6 +321,33 @@ function renderOrderList(items, compact) {
   `
 }
 
+function renderPriceChangeList(items) {
+  if (!items.length) {
+    return `<div class="empty"><span>$</span><strong>No price changes detected yet</strong><p>The connector checks <code>pricechg.dbf</code> every three minutes.</p></div>`
+  }
+
+  return `
+    <div class="order-list compact">
+      ${items.map((change) => `
+        <article class="order-row">
+          <div class="order-main">
+            <span class="order-icon">$</span>
+            <div>
+              <strong>SKU ${escapeHtml(change.source_sku)}</strong>
+              <small>${escapeHtml(formatDate(change.changed_at))}${number(change.target_count) > 1 ? ` · ${number(change.target_count)} matrix variants` : ""}</small>
+            </div>
+          </div>
+          <div class="price-change">
+            <small>${change.old_price == null ? "New tracked price" : `$${escapeHtml(change.old_price)}`}</small>
+            <strong>→ $${escapeHtml(change.new_price)}</strong>
+          </div>
+          ${statusBadge(change.success ? "Updated" : "Retrying", change.success ? "success" : "warning")}
+        </article>
+      `).join("")}
+    </div>
+  `
+}
+
 function renderSettings() {
   const connection = state.connection
   return `
@@ -344,7 +383,7 @@ function renderSettings() {
       </section>
 
       <div class="notice neutral">
-        Inventory checks in every 3 minutes. A full catalog reconciliation runs nightly. Order payloads are removed from Railway after the Windows connector confirms they were written.
+        Inventory and POS price changes are checked every 3 minutes. A full inventory reconciliation runs nightly. Order payloads are removed from Railway after the Windows connector confirms they were written.
       </div>
     </section>
   `

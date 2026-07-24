@@ -305,6 +305,61 @@ class InventorySyncService:
             "location_id": normalize_gid("Location", location_id),
         }
 
+    def update_price_by_sku(
+        self,
+        *,
+        sku: str,
+        price: float,
+        shop: ShopRecord,
+    ) -> Dict[str, Any]:
+        normalized_sku = str(sku or "").strip()
+        if not normalized_sku:
+            raise SyncProcessingError("Price update requires a SKU.", code="missing_price_sku")
+        normalized_price = float(format_price(price))
+        if normalized_price < 0:
+            raise SyncProcessingError(
+                "Price updates cannot be negative.",
+                {"sku": normalized_sku, "price": price},
+                code="invalid_price",
+            )
+
+        mapping = self.shopify_client.get_variant_by_sku(
+            shop.shop_domain,
+            shop.access_token,
+            normalized_sku,
+            force_refresh=True,
+        )
+        if mapping.sku.strip().casefold() != normalized_sku.casefold():
+            raise SyncProcessingError(
+                "Shopify did not return an exact SKU match for the price update.",
+                {"requested_sku": normalized_sku, "matched_sku": mapping.sku},
+                code="price_sku_mismatch",
+            )
+        changed = mapping.current_price is None or float(mapping.current_price) != normalized_price
+        if changed:
+            self.shopify_client.update_variant_fields(
+                shop.shop_domain,
+                shop.access_token,
+                product_id=mapping.product_id,
+                variant={
+                    "id": normalize_gid("ProductVariant", mapping.variant_id),
+                    "price": str(format_price(normalized_price)),
+                },
+            )
+        return {
+            "sku": normalized_sku,
+            "price": str(format_price(normalized_price)),
+            "previous_price": (
+                str(format_price(mapping.current_price))
+                if mapping.current_price is not None
+                else None
+            ),
+            "success": True,
+            "changed": changed,
+            "variant_id": mapping.variant_id,
+            "product_id": mapping.product_id,
+        }
+
     def list_woo_catalog(self, shop: ShopRecord) -> List[CatalogProductRecord]:
         products = self.shopify_client.get_products(shop.shop_domain, shop.access_token)
         return [self._catalog_record_from_product(product) for product in products]

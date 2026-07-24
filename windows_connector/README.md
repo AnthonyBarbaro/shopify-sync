@@ -10,13 +10,16 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
    before zero-stock products, preserving their original POS order within each group.
 2. It records a small local baseline for every SKU and matrix variant.
 3. Initial descriptions are empty and the generated product name is included as a tag. Later runs
-   send inventory deltas only, so product titles, prices, tags, descriptions, and images are not
-   repeatedly overwritten.
+   send inventory deltas and explicit price changes only, so product titles, tags, descriptions,
+   images, and other merchandising edits are not repeatedly overwritten.
 4. Every three minutes it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
    Those rows identify affected base SKUs; the connector then rereads their authoritative current
    quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
    It also checks the current numeric SKU sequence in `Item.dbf`. A SKU above the saved five-digit
    high-water mark is uploaded once as a new product, normally within the next three-minute cycle.
+   It also compares the latest rows in `pricechg.dbf` with a small local snapshot. The first updated
+   run establishes a baseline without replaying historical price changes; later changes update only
+   the exact Shopify variant price. A base matrix SKU updates all of its matrix variants.
 5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation.
    If the computer was off at midnight, the first later cycle that day performs the missed pass.
    This full scan also catches new alphanumeric or out-of-sequence SKUs that the numeric fast path
@@ -38,9 +41,10 @@ Windows keeps only:
 - a 5 MB rotating log with three backups by default;
 - the small Python virtual environment created by the installer.
 
-Railway receives only small JSON inventory adjustments, never sales/edit history or DBF archives.
+Railway receives only small JSON inventory or price adjustments, never sales/edit history or DBF archives.
 Its inventory-change queue keeps only the latest unprocessed value and deletes it after the Windows
-connector acknowledges it. The server separately caps its feed and request history using
+connector acknowledges it. The dashboard keeps only the 50 most recent lightweight price-change
+results. The server separately caps its feed and request history using
 `FEED_EVENT_RETENTION_ROWS` and `REQUEST_LOG_RETENTION_ROWS`.
 
 ## Shopify order inbox

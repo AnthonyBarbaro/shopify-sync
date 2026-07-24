@@ -218,10 +218,11 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 }
 .order-row:first-child { border-top: 0; }
 .order-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.order-main strong, .order-main small, .order-meta strong, .order-meta small { display: block; }
+.order-main strong, .order-main small, .order-meta strong, .order-meta small,
+.price-change strong, .price-change small { display: block; }
 .order-main strong { overflow: hidden; text-overflow: ellipsis; }
-.order-main small, .order-meta small { margin-top: 4px; color: var(--muted); font-size: .78rem; }
-.order-meta { text-align: right; }
+.order-main small, .order-meta small, .price-change small { margin-top: 4px; color: var(--muted); font-size: .78rem; }
+.order-meta, .price-change { text-align: right; }
 .order-icon {
   display: grid;
   place-items: center;
