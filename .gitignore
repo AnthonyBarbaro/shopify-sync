@@ -7,6 +7,18 @@ windows_connector/connector.env
 # Runtime databases, journals, and logs
 *.sqlite3
 *.sqlite3-*
+shopify-order.db
+shopify-order.db-*
+shopify-orders.db
+shopify-orders.db-*
+shopify-order-header.dbf
+shopify-order-detail.dbf
+shopify-order-header.lock
+shopify-order-header.dbf.*
+shopify-order-detail.dbf.*
+.shopify-order-header.dbf.*.tmp
+.shopify-order-detail.dbf.*.tmp
+.shopify-order-header-shopify-order-detail.update.json
 *.log
 *.pid
 

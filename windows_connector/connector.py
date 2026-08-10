@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shutil
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -29,6 +28,23 @@ POS_READER_DIR = PROJECT_DIR / "jbarbaro_db"
 sys.path.insert(0, str(POS_READER_DIR))
 
 import dbf_pos_sync  # noqa: E402
+
+if __package__:
+    from .order_dbf import (
+        migrate_legacy_sqlite_database,
+        money_text,
+        read_order_dbfs,
+        remove_orders_from_legacy_sqlite,
+        upsert_order_changes,
+    )
+else:
+    from order_dbf import (
+        migrate_legacy_sqlite_database,
+        money_text,
+        read_order_dbfs,
+        remove_orders_from_legacy_sqlite,
+        upsert_order_changes,
+    )
 
 
 STATE_VERSION = 1
@@ -57,6 +73,19 @@ def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def validate_order_dbf_paths(header_path: Path, detail_path: Path) -> None:
+    paths = (header_path, detail_path)
+    if any(path.suffix.lower() != ".dbf" for path in paths):
+        raise ValueError("Shopify order header and detail paths must end in .dbf")
+    if header_path == detail_path:
+        raise ValueError("Shopify order header and detail paths must be different files")
+    if header_path.parent != detail_path.parent:
+        raise ValueError("Shopify order header and detail paths must use the same directory")
+    native_order_files = {"ordhdr.dbf", "orddtl.dbf"}
+    if any(path.name.lower() in native_order_files for path in paths):
+        raise ValueError("Shopify order DBFs must not overwrite native Ordhdr.dbf or Orddtl.dbf")
+
+
 class Connector:
     def __init__(self, *, config_path: Path, dry_run: bool = False) -> None:
         if not config_path.exists():
@@ -76,11 +105,34 @@ class Connector:
         self.initial_catalog_upload = env_bool("INITIAL_CATALOG_UPLOAD", True)
         self.price_sync_enabled = env_bool("PRICE_SYNC_ENABLED", True)
         self.order_sync_enabled = env_bool("ORDER_SYNC_ENABLED", True)
-        self.order_db_path = Path(
-            os.getenv("SHOPIFY_ORDER_DB_PATH") or (self.dbf_dir / "shopify-orders.db")
+        legacy_order_setting = (os.getenv("SHOPIFY_ORDER_DB_PATH") or "").strip()
+        legacy_order_path = (
+            Path(legacy_order_setting).expanduser().resolve()
+            if legacy_order_setting
+            else self.dbf_dir / "shopify-orders.db"
+        )
+        order_dbf_parent = legacy_order_path.parent if legacy_order_setting else self.dbf_dir
+        header_setting = (os.getenv("SHOPIFY_ORDER_HEADER_DBF_PATH") or "").strip()
+        detail_setting = (os.getenv("SHOPIFY_ORDER_DETAIL_DBF_PATH") or "").strip()
+        if header_setting and not detail_setting:
+            order_dbf_parent = Path(header_setting).expanduser().resolve().parent
+        elif detail_setting and not header_setting:
+            order_dbf_parent = Path(detail_setting).expanduser().resolve().parent
+        self.order_header_path = Path(
+            header_setting or (order_dbf_parent / "shopify-order-header.dbf")
         ).expanduser().resolve()
+        self.order_detail_path = Path(
+            detail_setting or (order_dbf_parent / "shopify-order-detail.dbf")
+        ).expanduser().resolve()
+        validate_order_dbf_paths(self.order_header_path, self.order_detail_path)
+        legacy_candidates = [
+            legacy_order_path,
+            self.dbf_dir / "shopify-orders.db",
+            self.dbf_dir / "shopify-order.db",
+        ]
+        self.legacy_order_db_paths = list(dict.fromkeys(path.resolve() for path in legacy_candidates))
         self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 250, minimum=100, maximum=500)
-        self.order_database_initialized = False
+        self.order_dbfs_initialized = False
         self.order_bridge_status_checked = False
         self.last_order_poll_monotonic = 0.0
         self.writeback_mode = (os.getenv("POS_WRITEBACK_MODE") or "disabled").strip().lower()
@@ -703,15 +755,34 @@ class Connector:
 
     def _sync_order_inbox(self) -> None:
         try:
-            if not self.dry_run and not self.order_database_initialized:
-                # Create/migrate the local header/detail schema even when Shopify
-                # has not delivered the first order yet.
+            if not self.dry_run and not self.order_dbfs_initialized:
+                migrated_from: Optional[Path] = None
+                # Resolve any interrupted two-file publish before deciding whether
+                # a retained SQLite inbox still needs to be migrated.
+                read_order_dbfs(self.order_header_path, self.order_detail_path)
+                if not self.order_header_path.exists() and not self.order_detail_path.exists():
+                    for legacy_path in self.legacy_order_db_paths:
+                        if migrate_legacy_sqlite_database(
+                            legacy_path,
+                            self.order_header_path,
+                            self.order_detail_path,
+                            retention_rows=self.order_retention_rows,
+                        ):
+                            migrated_from = legacy_path
+                            break
                 upsert_order_changes(
-                    self.order_db_path,
+                    self.order_header_path,
+                    self.order_detail_path,
                     [],
                     retention_rows=self.order_retention_rows,
                 )
-                self.order_database_initialized = True
+                self.order_dbfs_initialized = True
+                self.logger.info(
+                    "order_dbfs_initialized header=%s detail=%s migrated_from=%s",
+                    self.order_header_path,
+                    self.order_detail_path,
+                    migrated_from or "none",
+                )
             if not self.order_bridge_status_checked:
                 try:
                     status_response = self.session.get(
@@ -734,21 +805,52 @@ class Connector:
             response = self.session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
             response.raise_for_status()
             changes = list(response.json().get("items") or [])
-            self.logger.info("order_inbox_checked changes=%s path=%s", len(changes), self.order_db_path)
+            self.logger.info(
+                "order_inbox_checked changes=%s header=%s detail=%s",
+                len(changes),
+                self.order_header_path,
+                self.order_detail_path,
+            )
             if not changes:
                 return
             if self.dry_run:
-                self.logger.info("order_inbox_dry_run changes=%s path=%s", len(changes), self.order_db_path)
+                self.logger.info(
+                    "order_inbox_dry_run changes=%s header=%s detail=%s",
+                    len(changes),
+                    self.order_header_path,
+                    self.order_detail_path,
+                )
                 return
-            upsert_order_changes(
-                self.order_db_path,
+            delivered_order_ids = upsert_order_changes(
+                self.order_header_path,
+                self.order_detail_path,
                 changes,
                 retention_rows=self.order_retention_rows,
             )
+            remove_orders_from_legacy_sqlite(self.legacy_order_db_paths, changes)
+            delivered_changes = [
+                change
+                for change in changes
+                if str(
+                    change.get("shopify_order_id")
+                    or (change.get("order") or {}).get("id")
+                    or ""
+                ).strip()
+                in delivered_order_ids
+            ]
+            deferred_count = len(changes) - len(delivered_changes)
+            if deferred_count:
+                self.logger.warning(
+                    "order_inbox_capacity_deferred changes=%s retention=%s",
+                    deferred_count,
+                    self.order_retention_rows,
+                )
+            if not delivered_changes:
+                return
             payload = {
                 "changes": [
                     {"id": int(change["id"]), "version": int(change["version"])}
-                    for change in changes
+                    for change in delivered_changes
                 ]
             }
             ack = self.session.post(
@@ -758,10 +860,11 @@ class Connector:
             )
             ack.raise_for_status()
             self.logger.info(
-                "order_inbox_updated changes=%s acknowledged=%s path=%s",
-                len(changes),
+                "order_inbox_updated changes=%s acknowledged=%s header=%s detail=%s",
+                len(delivered_changes),
                 int(ack.json().get("acknowledged") or 0),
-                self.order_db_path,
+                self.order_header_path,
+                self.order_detail_path,
             )
         except Exception:
             # Order intake must not prevent inventory reconciliation. Railway keeps
@@ -1234,431 +1337,6 @@ def negative_catalog_money_field(payload: Dict[str, Any]) -> Optional[str]:
             if value is not None and float(value) < 0:
                 return f"variants[{index}].{field}"
     return None
-
-
-def ensure_local_order_schema(connection: sqlite3.Connection) -> None:
-    additions = {
-        "orders": {
-            "customer_first_name": "TEXT",
-            "customer_last_name": "TEXT",
-            "billing_name": "TEXT",
-            "billing_first_name": "TEXT",
-            "billing_last_name": "TEXT",
-            "billing_company": "TEXT",
-            "billing_address1": "TEXT",
-            "billing_address2": "TEXT",
-            "billing_city": "TEXT",
-            "billing_province": "TEXT",
-            "billing_province_code": "TEXT",
-            "billing_country": "TEXT",
-            "billing_country_code": "TEXT",
-            "billing_zip": "TEXT",
-            "billing_phone": "TEXT",
-            "shipping_first_name": "TEXT",
-            "shipping_last_name": "TEXT",
-            "import_status": "TEXT NOT NULL DEFAULT 'PENDING'",
-            "imported_at": "TEXT",
-            "pos_order_number": "TEXT",
-            "import_error": "TEXT",
-        },
-        "order_items": {
-            "line_number": "INTEGER NOT NULL DEFAULT 0",
-            "product_id": "TEXT",
-            "vendor": "TEXT",
-            "line_tax": "TEXT",
-            "line_total": "TEXT",
-        },
-    }
-    for table, columns in additions.items():
-        existing = {
-            str(row[1]).lower()
-            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        for column, definition in columns.items():
-            if column.lower() not in existing:
-                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-    connection.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_orders_import_status
-            ON orders(import_status, created_at);
-        DROP VIEW IF EXISTS order_header;
-        CREATE VIEW order_header AS
-        SELECT
-            shopify_order_id AS order_id,
-            order_name AS invoice_no,
-            order_number,
-            confirmation_number,
-            created_at AS order_date,
-            processed_at,
-            financial_status,
-            fulfillment_status,
-            currency,
-            customer_name,
-            customer_first_name,
-            customer_last_name,
-            email,
-            phone,
-            billing_name,
-            billing_first_name,
-            billing_last_name,
-            billing_company,
-            billing_address1,
-            billing_address2,
-            billing_city,
-            billing_province,
-            billing_province_code,
-            billing_country,
-            billing_country_code,
-            billing_zip,
-            billing_phone,
-            shipping_name,
-            shipping_first_name,
-            shipping_last_name,
-            shipping_company,
-            shipping_address1,
-            shipping_address2,
-            shipping_city,
-            shipping_province,
-            shipping_province_code,
-            shipping_country,
-            shipping_country_code,
-            shipping_zip,
-            shipping_phone,
-            shipping_method,
-            subtotal_price AS subtotal,
-            total_discounts AS discount,
-            shipping_price AS shipping,
-            '0.00' AS handling,
-            total_tax AS tax,
-            total_price AS total,
-            note,
-            tags,
-            cancelled_at,
-            closed_at,
-            print_status,
-            printed_at,
-            import_status,
-            imported_at,
-            pos_order_number,
-            import_error,
-            source_event,
-            source_version,
-            synced_at
-        FROM orders;
-
-        DROP VIEW IF EXISTS order_detail;
-        CREATE VIEW order_detail AS
-        SELECT
-            i.shopify_order_id AS order_id,
-            o.order_name AS invoice_no,
-            i.line_number,
-            i.shopify_line_item_id AS line_item_id,
-            i.product_id,
-            i.variant_id,
-            i.sku,
-            i.quantity AS qty,
-            i.current_quantity,
-            i.price,
-            i.total_discount AS discount,
-            i.line_tax AS tax,
-            i.line_total AS extension,
-            i.title AS description,
-            i.variant_title,
-            i.vendor,
-            i.grams,
-            i.requires_shipping,
-            i.fulfillment_status
-        FROM order_items AS i
-        JOIN orders AS o ON o.shopify_order_id = i.shopify_order_id;
-        """
-    )
-
-
-def local_order_address_name(address: Dict[str, Any]) -> str:
-    return str(address.get("name") or "").strip() or " ".join(
-        part
-        for part in (
-            str(address.get("first_name") or "").strip(),
-            str(address.get("last_name") or "").strip(),
-        )
-        if part
-    )
-
-
-def local_order_address_columns(prefix: str, address: Dict[str, Any], name: str) -> Dict[str, Any]:
-    values = {
-        f"{prefix}_name": name or None,
-        f"{prefix}_first_name": str(address.get("first_name") or "").strip() or None,
-        f"{prefix}_last_name": str(address.get("last_name") or "").strip() or None,
-        f"{prefix}_company": address.get("company"),
-        f"{prefix}_address1": address.get("address1"),
-        f"{prefix}_address2": address.get("address2"),
-        f"{prefix}_city": address.get("city"),
-        f"{prefix}_province": address.get("province"),
-        f"{prefix}_province_code": address.get("province_code"),
-        f"{prefix}_country": address.get("country"),
-        f"{prefix}_country_code": address.get("country_code"),
-        f"{prefix}_zip": address.get("zip"),
-        f"{prefix}_phone": address.get("phone"),
-    }
-    return values
-
-
-def money_text(value: Any) -> Optional[str]:
-    if value in (None, ""):
-        return None
-    try:
-        return f"{Decimal(str(value)).quantize(Decimal('0.01'))}"
-    except (InvalidOperation, ValueError):
-        return str(value)
-
-
-def order_line_tax(item: Dict[str, Any]) -> str:
-    total = Decimal("0")
-    for tax_line in item.get("tax_lines") or []:
-        if not isinstance(tax_line, dict):
-            continue
-        value = tax_line.get("price")
-        if value in (None, ""):
-            price_set = tax_line.get("price_set") or {}
-            shop_money = price_set.get("shop_money") if isinstance(price_set, dict) else {}
-            value = shop_money.get("amount") if isinstance(shop_money, dict) else None
-        try:
-            total += Decimal(str(value or "0"))
-        except InvalidOperation:
-            continue
-    return f"{total.quantize(Decimal('0.01'))}"
-
-
-def calculate_line_total(price: Optional[str], quantity: int, discount: Optional[str]) -> Optional[str]:
-    if price is None:
-        return None
-    try:
-        total = (Decimal(price) * int(quantity)) - Decimal(discount or "0")
-    except (InvalidOperation, ValueError):
-        return None
-    return f"{total.quantize(Decimal('0.01'))}"
-
-
-def upsert_order_changes(path: Path, changes: List[Dict[str, Any]], *, retention_rows: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=30)
-    try:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                shopify_order_id TEXT PRIMARY KEY,
-                order_name TEXT,
-                order_number TEXT,
-                confirmation_number TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                processed_at TEXT,
-                cancelled_at TEXT,
-                closed_at TEXT,
-                financial_status TEXT,
-                fulfillment_status TEXT,
-                currency TEXT,
-                subtotal_price TEXT,
-                total_discounts TEXT,
-                shipping_price TEXT,
-                total_tax TEXT,
-                total_price TEXT,
-                customer_name TEXT,
-                customer_first_name TEXT,
-                customer_last_name TEXT,
-                email TEXT,
-                phone TEXT,
-                billing_name TEXT,
-                billing_first_name TEXT,
-                billing_last_name TEXT,
-                billing_company TEXT,
-                billing_address1 TEXT,
-                billing_address2 TEXT,
-                billing_city TEXT,
-                billing_province TEXT,
-                billing_province_code TEXT,
-                billing_country TEXT,
-                billing_country_code TEXT,
-                billing_zip TEXT,
-                billing_phone TEXT,
-                shipping_name TEXT,
-                shipping_first_name TEXT,
-                shipping_last_name TEXT,
-                shipping_company TEXT,
-                shipping_address1 TEXT,
-                shipping_address2 TEXT,
-                shipping_city TEXT,
-                shipping_province TEXT,
-                shipping_province_code TEXT,
-                shipping_country TEXT,
-                shipping_country_code TEXT,
-                shipping_zip TEXT,
-                shipping_phone TEXT,
-                shipping_method TEXT,
-                note TEXT,
-                tags TEXT,
-                source_event TEXT NOT NULL,
-                source_version INTEGER NOT NULL,
-                print_status TEXT NOT NULL DEFAULT 'PENDING',
-                printed_at TEXT,
-                import_status TEXT NOT NULL DEFAULT 'PENDING',
-                imported_at TEXT,
-                pos_order_number TEXT,
-                import_error TEXT,
-                synced_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS order_items (
-                shopify_order_id TEXT NOT NULL,
-                line_key TEXT NOT NULL,
-                shopify_line_item_id TEXT,
-                line_number INTEGER NOT NULL DEFAULT 0,
-                product_id TEXT,
-                variant_id TEXT,
-                sku TEXT,
-                title TEXT,
-                variant_title TEXT,
-                vendor TEXT,
-                quantity INTEGER NOT NULL DEFAULT 0,
-                current_quantity INTEGER,
-                price TEXT,
-                total_discount TEXT,
-                line_tax TEXT,
-                line_total TEXT,
-                grams INTEGER,
-                requires_shipping INTEGER,
-                fulfillment_status TEXT,
-                PRIMARY KEY(shopify_order_id, line_key),
-                FOREIGN KEY(shopify_order_id) REFERENCES orders(shopify_order_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_orders_print_status ON orders(print_status, created_at);
-            CREATE INDEX IF NOT EXISTS idx_order_items_sku ON order_items(sku);
-            """
-        )
-        ensure_local_order_schema(connection)
-        with connection:
-            for change in changes:
-                order = change.get("order") or {}
-                order_id = str(change.get("shopify_order_id") or order.get("id") or "").strip()
-                if not order_id:
-                    raise ValueError("Order change is missing shopify_order_id")
-                if change.get("event_topic") in {"orders/delete", "customers/redact"} or order.get("redacted"):
-                    connection.execute("DELETE FROM orders WHERE shopify_order_id = ?", (order_id,))
-                    continue
-                billing_address = order.get("billing_address") or {}
-                shipping_address = order.get("shipping_address") or {}
-                customer_first_name = str(order.get("customer_first_name") or "").strip()
-                customer_last_name = str(order.get("customer_last_name") or "").strip()
-                customer_name = " ".join(
-                    part
-                    for part in (customer_first_name, customer_last_name)
-                    if part
-                )
-                billing_name = local_order_address_name(billing_address)
-                shipping_name = local_order_address_name(shipping_address)
-                shipping_method = ", ".join(
-                    str(line.get("title") or line.get("code") or "").strip()
-                    for line in (order.get("shipping_lines") or [])
-                    if str(line.get("title") or line.get("code") or "").strip()
-                )
-                header_values = {
-                    "shopify_order_id": order_id,
-                    "order_name": order.get("name") or change.get("order_name"),
-                    "order_number": str(order.get("order_number") or "") or None,
-                    "confirmation_number": order.get("confirmation_number"),
-                    "created_at": order.get("created_at"),
-                    "updated_at": order.get("updated_at"),
-                    "processed_at": order.get("processed_at"),
-                    "cancelled_at": order.get("cancelled_at"),
-                    "closed_at": order.get("closed_at"),
-                    "financial_status": order.get("financial_status"),
-                    "fulfillment_status": order.get("fulfillment_status"),
-                    "currency": order.get("currency"),
-                    "subtotal_price": order.get("subtotal_price"),
-                    "total_discounts": order.get("total_discounts"),
-                    "shipping_price": order.get("shipping_price"),
-                    "total_tax": order.get("total_tax"),
-                    "total_price": order.get("total_price"),
-                    "customer_name": customer_name or billing_name or shipping_name or None,
-                    "customer_first_name": customer_first_name or None,
-                    "customer_last_name": customer_last_name or None,
-                    "email": order.get("email"),
-                    "phone": order.get("phone"),
-                    **local_order_address_columns("billing", billing_address, billing_name),
-                    **local_order_address_columns("shipping", shipping_address, shipping_name),
-                    "shipping_method": shipping_method or None,
-                    "note": order.get("note"),
-                    "tags": order.get("tags"),
-                    "source_event": change.get("event_topic") or "orders/updated",
-                    "source_version": int(change.get("version") or 1),
-                    "synced_at": datetime.now().astimezone().isoformat(),
-                }
-                columns = list(header_values)
-                updates = [column for column in columns if column != "shopify_order_id"]
-                connection.execute(
-                    f"""
-                    INSERT INTO orders ({', '.join(columns)})
-                    VALUES ({', '.join('?' for _ in columns)})
-                    ON CONFLICT(shopify_order_id) DO UPDATE SET
-                        {', '.join(f'{column}=excluded.{column}' for column in updates)}
-                    """,
-                    tuple(header_values[column] for column in columns),
-                )
-                connection.execute("DELETE FROM order_items WHERE shopify_order_id = ?", (order_id,))
-                for index, item in enumerate(order.get("line_items") or [], start=1):
-                    line_id = str(item.get("id") or "").strip()
-                    line_key = line_id or f"line-{index}"
-                    quantity = int(item.get("quantity") or 0)
-                    price = money_text(item.get("price"))
-                    discount = money_text(item.get("total_discount"))
-                    line_values = {
-                        "shopify_order_id": order_id,
-                        "line_key": line_key,
-                        "shopify_line_item_id": line_id or None,
-                        "line_number": index,
-                        "product_id": str(item.get("product_id") or "") or None,
-                        "variant_id": str(item.get("variant_id") or "") or None,
-                        "sku": str(item.get("sku") or "").strip() or None,
-                        "title": item.get("title"),
-                        "variant_title": item.get("variant_title"),
-                        "vendor": item.get("vendor"),
-                        "quantity": quantity,
-                        "current_quantity": int(item["current_quantity"])
-                        if item.get("current_quantity") is not None
-                        else None,
-                        "price": price,
-                        "total_discount": discount,
-                        "line_tax": order_line_tax(item),
-                        "line_total": calculate_line_total(price, quantity, discount),
-                        "grams": int(item["grams"]) if item.get("grams") is not None else None,
-                        "requires_shipping": int(bool(item["requires_shipping"]))
-                        if item.get("requires_shipping") is not None
-                        else None,
-                        "fulfillment_status": item.get("fulfillment_status"),
-                    }
-                    line_columns = list(line_values)
-                    connection.execute(
-                        f"INSERT INTO order_items ({', '.join(line_columns)}) "
-                        f"VALUES ({', '.join('?' for _ in line_columns)})",
-                        tuple(line_values[column] for column in line_columns),
-                    )
-            connection.execute(
-                """
-                DELETE FROM orders
-                WHERE shopify_order_id IN (
-                    SELECT shopify_order_id
-                    FROM orders
-                    ORDER BY COALESCE(created_at, synced_at) DESC, shopify_order_id DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (max(100, int(retention_rows)),),
-            )
-    finally:
-        connection.close()
 
 
 def merge_quantity(

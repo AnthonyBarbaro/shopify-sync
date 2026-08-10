@@ -35,11 +35,17 @@ The connector intentionally does not archive Shopify products during unattended 
 
 ## Storage
 
-Windows keeps only:
+The connector's recurring Windows storage is limited to:
 
 - `state.json` and one backup;
+- `shopify-order-header.dbf` and `shopify-order-detail.dbf` when order sync is enabled;
+- `shopify-order-header.lock`, used to coordinate DBF reads and status writes;
 - a 5 MB rotating log with three backups by default;
 - the small Python virtual environment created by the installer.
+
+After an upgrade, a legacy `shopify-order.db` or `shopify-orders.db` may also remain as a recovery copy
+after its rows are migrated into the DBFs. Later Shopify deletion and customer-redaction events are
+also removed from that copy before acknowledgement.
 
 Railway receives only small JSON inventory or price adjustments, never sales/edit history or DBF archives.
 Its inventory-change queue keeps only the latest unprocessed value and deletes it after the Windows
@@ -50,28 +56,39 @@ results. The server separately caps its feed and request history using
 ## Shopify order inbox
 
 When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete
-events before each inventory cycle and writes them transactionally to
-`C:\ashpsdat\shopify-orders.db` by default. This separate SQLite database mirrors the useful shape of
-the POS `Ordhdr.dbf` and `Orddtl.dbf` files but never modifies or copies those FoxPro tables.
-An existing `SHOPIFY_ORDER_DB_PATH=C:\ashpsdat\shopify-order.db` setting remains supported and will
-be migrated in place; change the setting only if the POS developer requires the plural filename.
+events before each inventory cycle and writes genuine dBASE III files at
+`C:\ashpsdat\shopify-order-header.dbf` and `C:\ashpsdat\shopify-order-detail.dbf` by default. These
+isolated inbox files mirror the useful shape of the POS `Ordhdr.dbf` and `Orddtl.dbf` files but never
+modify, copy, or insert into those native FoxPro tables.
 
-The source tables are `orders` and `order_items`. For the POS integration, the database also exposes:
-
-- `order_header`: order/invoice identifiers, customer name, email, phone, billing address, shipping
+- `shopify-order-header.dbf`: order/invoice identifiers, customer name, email, phone, billing address, shipping
   address, shipping method and charge, subtotal, discount, tax, total, fulfillment/financial state,
   printing state, and POS import state;
-- `order_detail`: line number, SKU, quantity, unit price, line discount, line tax, extension, product
+- `shopify-order-detail.dbf`: line number, SKU, quantity, unit price, line discount, line tax, extension, product
   description, variant description, vendor, and fulfillment state.
 
-These two read-only views do not duplicate data. The POS integration can update `orders.import_status`,
-`orders.imported_at`, `orders.pos_order_number`, and `orders.import_error` after attempting an import.
-Card numbers, CVV values, payment credentials, authorization data, and raw webhook payloads are never
-written to this database. Railway deletes a queued change only after the local transaction succeeds.
+Every row carries a generation ID, and each header records its detail count. A reader should open both
+files, verify that their generation IDs match, and retry if the connector was between file replacements.
+The POS integration may update the documented print/import status fields in the header file after an
+import attempt. It must hold the documented header `.lock` byte-range lock while reading or updating
+the pair; with the default name this is `shopify-order-header.lock`. A custom header path uses the same
+path with its suffix replaced by `.lock`. Webhook retries and later Shopify updates then preserve those
+fields.
 
-New orders have `print_status=PENDING`; a printing integration can mark them `PRINTED` and set
-`printed_at`. The file is an order inbox for the bridge and does not appear in the native POS Orders
-tab without a separately tested POS import.
+Existing installations that set `SHOPIFY_ORDER_DB_PATH` keep using that file only as a one-time legacy
+SQLite migration source. On the first non-dry run, the connector copies its retained orders, details,
+and print/import status into the two DBFs and leaves the SQLite file available for manual recovery.
+Subsequent deletion/redaction events are removed from both formats. New installations should use
+`SHOPIFY_ORDER_HEADER_DBF_PATH` and `SHOPIFY_ORDER_DETAIL_DBF_PATH` only when the default DBF locations
+need to change.
+
+Card numbers, CVV values, payment credentials, authorization data, and raw webhook payloads are never
+written to either file. Railway acknowledges queued changes only after both DBFs have been written and
+validated. If the bounded inbox is full of unimported orders, newer changes stay unacknowledged on
+Railway until the POS marks an order imported and frees capacity.
+
+New orders have pending print and import statuses. The DBFs are an order inbox for the bridge and do
+not appear in the native POS Orders tab without a separately tested POS import.
 
 The POS developer handoff, field list, and import queries are in
 [`SHOPIFY_ORDER_DB_SCHEMA.md`](SHOPIFY_ORDER_DB_SCHEMA.md).
@@ -128,8 +145,8 @@ financial transaction for an online Shopify order.
 
 To update the Windows runtime, open `windows_connector\update_connector.bat` as Administrator. The
 updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_sync.py`, plus the small
-supporting PowerShell files. It preserves `connector.env`, connector state, logs, POS DBFs, and the
-local Shopify order database.
+supporting runtime files. It preserves `connector.env`, connector state, logs, Shopify order DBFs,
+native POS DBFs, and any legacy Shopify order SQLite database.
 
 Start or stop the task:
 

@@ -63,7 +63,7 @@ cannot grow the Railway SQLite volume without bound.
 
 Full order payloads are a temporary delivery queue capped at 500 rows even if an older environment
 setting is higher. Railway separately keeps only 50 small order summaries for the dashboard, and
-the Windows `shopify-orders.db` inbox defaults to 250 orders with a hard maximum of 500.
+the Windows Shopify order DBF inbox defaults to 250 orders with a hard maximum of 500.
 
 Legacy POS ZIP uploads retain only the product/inventory DBFs and delete the ZIP after extraction.
 The unattended Windows connector does not upload DBF files at all.
@@ -75,9 +75,10 @@ Shopify edits to titles, descriptions, tags, images, and other merchandising fie
 a price changes only when `pricechg.dbf` records a newer POS price.
 
 With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
-queue until the Windows connector writes them to `C:\ashpsdat\shopify-orders.db`. The local database
-is isolated from the POS FoxPro tables and contains normalized order header/detail rows for printing
-or a later vendor-tested POS import; payment/card data and raw webhook payloads are not retained.
+queue until the Windows connector writes them to `C:\ashpsdat\shopify-order-header.dbf` and
+`C:\ashpsdat\shopify-order-detail.dbf`. These genuine dBASE files are isolated from the native POS
+FoxPro tables and contain normalized order header/detail rows for printing or a later vendor-tested
+POS import; payment/card data and raw webhook payloads are not retained.
 After adding `read_orders` to an existing Railway `APP_SCOPES` value, run the Shopify install flow
 again so the store grants the new scope. Depending on the app's Shopify distribution and protected
 customer data approval, customer contact and shipping fields can be redacted while order and SKU

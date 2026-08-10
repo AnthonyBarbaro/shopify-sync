@@ -13,6 +13,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 $files = @(
     "windows_connector/connector.py",
+    "windows_connector/order_dbf.py",
     "jbarbaro_db/dbf_pos_sync.py",
     "windows_connector/write_pos_quantity.ps1",
     "windows_connector/install.ps1",
@@ -103,4 +104,4 @@ finally {
 }
 
 Write-Host "Updated runtime files: $($files.Count)"
-Write-Host "Preserved: connector.env, connector state, logs, POS DBFs, and shopify-orders.db"
+Write-Host "Preserved: connector.env, connector state, logs, Shopify order DBFs, POS DBFs, and the legacy order SQLite database"

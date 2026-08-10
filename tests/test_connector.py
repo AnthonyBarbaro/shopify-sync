@@ -1,10 +1,13 @@
 import io
 import sqlite3
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -15,7 +18,17 @@ from app.inventory import InventorySyncService
 from app.models import InventoryLevelSnapshot, VariantMapping
 from app.pos_archive import save_uploaded_archive
 from app.shopify import ShopifyClient
+from windows_connector.order_dbf import (
+    DETAIL_FIELDS,
+    HEADER_FIELDS,
+    migrate_legacy_sqlite_database,
+    order_dbf_lock,
+    read_order_dbfs,
+    remove_orders_from_legacy_sqlite,
+    write_order_dbfs,
+)
 from windows_connector.connector import (
+    Connector,
     adjustment_key,
     base_sku,
     catalog_total_quantity,
@@ -33,6 +46,7 @@ from windows_connector.connector import (
     read_appended_dbf_rows,
     sku_base_mapping,
     upsert_order_changes,
+    validate_order_dbf_paths,
 )
 
 
@@ -638,32 +652,906 @@ class ShopifyScopeTests(unittest.TestCase):
 
 
 class LocalOrderInboxTests(unittest.TestCase):
-    def test_empty_sync_creates_header_and_detail_schema(self):
+    def test_order_dbf_paths_must_be_separate_non_native_dbf_files(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database_path = Path(temporary_directory) / "shopify-orders.db"
-
-            upsert_order_changes(database_path, [], retention_rows=100)
-
-            with sqlite3.connect(database_path) as connection:
-                objects = dict(
-                    connection.execute(
-                        "SELECT name, type FROM sqlite_master WHERE name IN "
-                        "('orders', 'order_items', 'order_header', 'order_detail')"
-                    ).fetchall()
-                )
-            self.assertEqual(
-                objects,
-                {
-                    "orders": "table",
-                    "order_items": "table",
-                    "order_header": "view",
-                    "order_detail": "view",
-                },
+            directory = Path(temporary_directory)
+            validate_order_dbf_paths(
+                directory / "shopify-order-header.dbf",
+                directory / "shopify-order-detail.dbf",
             )
+
+            with self.assertRaisesRegex(ValueError, "must end in .dbf"):
+                validate_order_dbf_paths(directory / "header.db", directory / "detail.dbf")
+            with self.assertRaisesRegex(ValueError, "must be different"):
+                validate_order_dbf_paths(directory / "orders.dbf", directory / "orders.dbf")
+            with self.assertRaisesRegex(ValueError, "must use the same directory"):
+                validate_order_dbf_paths(
+                    directory / "header.dbf",
+                    directory / "nested" / "detail.dbf",
+                )
+            with self.assertRaisesRegex(ValueError, "must not overwrite native"):
+                validate_order_dbf_paths(directory / "Ordhdr.dbf", directory / "detail.dbf")
+
+    def test_stable_dbf_keys_are_never_silently_truncated(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            with self.assertRaisesRegex(ValueError, "ORDER_ID.*24 bytes"):
+                upsert_order_changes(
+                    directory / "shopify-order-header.dbf",
+                    directory / "shopify-order-detail.dbf",
+                    [
+                        {
+                            "id": 1,
+                            "version": 1,
+                            "shopify_order_id": "1" * 25,
+                            "event_topic": "orders/create",
+                            "order": {"id": "1" * 25, "line_items": []},
+                        }
+                    ],
+                    retention_rows=100,
+                )
+
+    def test_empty_sync_creates_genuine_header_and_detail_dbfs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            header_path = Path(temporary_directory) / "shopify-order-header.dbf"
+            detail_path = Path(temporary_directory) / "shopify-order-detail.dbf"
+
+            upsert_order_changes(header_path, detail_path, [], retention_rows=100)
+
+            headers, details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(headers, [])
+            self.assertEqual(details, [])
+            for path, schema in (
+                (header_path, HEADER_FIELDS),
+                (detail_path, DETAIL_FIELDS),
+            ):
+                content = path.read_bytes()
+                self.assertEqual(content[0], 0x03)
+                self.assertNotEqual(content[:16], b"SQLite format 3\x00")
+                self.assertEqual(struct.unpack("<I", content[4:8])[0], 0)
+                self.assertEqual(
+                    struct.unpack("<H", content[8:10])[0],
+                    33 + (32 * len(schema)),
+                )
+                self.assertEqual(
+                    struct.unpack("<H", content[10:12])[0],
+                    1 + sum(field.length for field in schema),
+                )
+                self.assertEqual(content[29], 0x03)
+                for index, field in enumerate(schema):
+                    offset = 32 + (index * 32)
+                    descriptor = content[offset : offset + 32]
+                    name = descriptor[:11].split(b"\x00", 1)[0].decode("ascii")
+                    self.assertEqual(name, field.name)
+                    self.assertEqual(chr(descriptor[11]), field.field_type)
+                    self.assertEqual(descriptor[16], field.length)
+                    self.assertEqual(descriptor[17], field.decimals)
+                self.assertEqual(content[32 + (32 * len(schema))], 0x0D)
+                self.assertEqual(content[-1], 0x1A)
+            self.assertTrue(header_path.with_suffix(".lock").exists())
+            self.assertTrue(all(len(field.name) <= 10 for field in HEADER_FIELDS + DETAIL_FIELDS))
+
+    def test_connector_acks_only_after_publishing_both_dbfs(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        class Session:
+            def __init__(self, change):
+                self.change = change
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                if url.endswith("/sync/orders/status"):
+                    return Response({"read_orders_authorized": True})
+                return Response({"items": [self.change]})
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return Response({"acknowledged": 1})
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            change = {
+                "id": 17,
+                "version": 4,
+                "shopify_order_id": "1001",
+                "event_topic": "orders/create",
+                "order": {"id": "1001", "name": "#1001", "line_items": []},
+            }
+            connector = Connector.__new__(Connector)
+            connector.dry_run = False
+            connector.order_dbfs_initialized = False
+            connector.order_header_path = directory / "shopify-order-header.dbf"
+            connector.order_detail_path = directory / "shopify-order-detail.dbf"
+            connector.legacy_order_db_paths = []
+            connector.order_retention_rows = 100
+            connector.order_bridge_status_checked = False
+            connector.base_url = "https://sync.example"
+            connector.timeout = 30
+            connector.logger = mock.Mock()
+            connector.session = Session(change)
+            connector.last_order_poll_monotonic = 0.0
+
+            connector._sync_order_inbox()
+
+            headers, details = read_order_dbfs(
+                connector.order_header_path,
+                connector.order_detail_path,
+            )
+            self.assertEqual(headers[0]["ORDER_ID"], "1001")
+            self.assertEqual(details, [])
+            self.assertEqual(len(connector.session.posts), 1)
+            self.assertEqual(
+                connector.session.posts[0][1]["json"],
+                {"changes": [{"id": 17, "version": 4}]},
+            )
+
+    def test_connector_dry_run_creates_no_dbfs_and_sends_no_ack(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        class Session:
+            def __init__(self):
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                if url.endswith("/sync/orders/status"):
+                    return Response({})
+                return Response(
+                    {
+                        "items": [
+                            {
+                                "id": 17,
+                                "version": 4,
+                                "shopify_order_id": "1001",
+                                "order": {"id": "1001"},
+                            }
+                        ]
+                    }
+                )
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return Response({})
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            connector = Connector.__new__(Connector)
+            connector.dry_run = True
+            connector.order_dbfs_initialized = False
+            connector.order_header_path = directory / "shopify-order-header.dbf"
+            connector.order_detail_path = directory / "shopify-order-detail.dbf"
+            connector.legacy_order_db_paths = []
+            connector.order_retention_rows = 100
+            connector.order_bridge_status_checked = False
+            connector.base_url = "https://sync.example"
+            connector.timeout = 30
+            connector.logger = mock.Mock()
+            connector.session = Session()
+            connector.last_order_poll_monotonic = 0.0
+
+            connector._sync_order_inbox()
+
+            self.assertFalse(connector.order_header_path.exists())
+            self.assertFalse(connector.order_detail_path.exists())
+            self.assertEqual(connector.session.posts, [])
+
+    def test_retention_prunes_headers_and_matching_details_together(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            changes = []
+            for index in range(101):
+                order_id = str(1000 + index)
+                changes.append(
+                    {
+                        "id": index + 1,
+                        "version": 1,
+                        "shopify_order_id": order_id,
+                        "event_topic": "orders/create",
+                        "order": {
+                            "id": order_id,
+                            "name": f"#{order_id}",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "line_items": [
+                                {
+                                    "id": 5000 + index,
+                                    "sku": f"SKU-{index}",
+                                    "quantity": 1,
+                                    "price": "1.00",
+                                }
+                            ],
+                        },
+                    }
+                )
+
+            delivered_order_ids = upsert_order_changes(
+                header_path,
+                detail_path,
+                changes,
+                retention_rows=1,
+            )
+
+            headers, details = read_order_dbfs(header_path, detail_path)
+            header_ids = {str(row["ORDER_ID"]) for row in headers}
+            self.assertEqual(len(headers), 100)
+            self.assertEqual(len(details), 100)
+            self.assertIn("1000", header_ids)
+            self.assertNotIn("1100", header_ids)
+            self.assertIn("1000", delivered_order_ids)
+            self.assertNotIn("1100", delivered_order_ids)
+            self.assertEqual({str(row["ORDER_ID"]) for row in details}, header_ids)
+
+            for header in headers:
+                if header["ORDER_ID"] == "1000":
+                    header["IMPORT_ST"] = "IMPORTED"
+            write_order_dbfs(header_path, detail_path, headers, details)
+            retry_delivered_ids = upsert_order_changes(
+                header_path,
+                detail_path,
+                [changes[-1]],
+                retention_rows=100,
+            )
+            headers, details = read_order_dbfs(header_path, detail_path)
+            header_ids = {str(row["ORDER_ID"]) for row in headers}
+            self.assertIn("1100", retry_delivered_ids)
+            self.assertIn("1100", header_ids)
+            self.assertNotIn("1000", header_ids)
+            self.assertEqual({str(row["ORDER_ID"]) for row in details}, header_ids)
+
+    def test_connector_does_not_ack_a_change_deferred_by_local_capacity(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        class Session:
+            def __init__(self, change):
+                self.change = change
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                return Response({"items": [self.change]})
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return Response({"acknowledged": 1})
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            existing_changes = [
+                {
+                    "id": index + 1,
+                    "version": 1,
+                    "shopify_order_id": str(1000 + index),
+                    "event_topic": "orders/create",
+                    "order": {
+                        "id": str(1000 + index),
+                        "name": f"#{1000 + index}",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "line_items": [],
+                    },
+                }
+                for index in range(100)
+            ]
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                existing_changes,
+                retention_rows=100,
+            )
+            deferred_change = {
+                "id": 101,
+                "version": 1,
+                "shopify_order_id": "1100",
+                "event_topic": "orders/create",
+                "order": {
+                    "id": "1100",
+                    "name": "#1100",
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "line_items": [],
+                },
+            }
+            connector = Connector.__new__(Connector)
+            connector.dry_run = False
+            connector.order_dbfs_initialized = True
+            connector.order_header_path = header_path
+            connector.order_detail_path = detail_path
+            connector.legacy_order_db_paths = []
+            connector.order_retention_rows = 100
+            connector.order_bridge_status_checked = True
+            connector.base_url = "https://sync.example"
+            connector.timeout = 30
+            connector.logger = mock.Mock()
+            connector.session = Session(deferred_change)
+            connector.last_order_poll_monotonic = 0.0
+
+            connector._sync_order_inbox()
+
+            headers, _ = read_order_dbfs(header_path, detail_path)
+            header_ids = {str(row["ORDER_ID"]) for row in headers}
+            self.assertEqual(len(header_ids), 100)
+            self.assertIn("1099", header_ids)
+            self.assertNotIn("1100", header_ids)
+            self.assertEqual(connector.session.posts, [])
+            connector.logger.warning.assert_called_once_with(
+                "order_inbox_capacity_deferred changes=%s retention=%s",
+                1,
+                100,
+            )
+
+    def test_cp1252_text_round_trips_and_unrepresentable_text_is_flagged(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [
+                    {
+                        "id": 1,
+                        "version": 1,
+                        "shopify_order_id": "1001",
+                        "event_topic": "orders/create",
+                        "order": {
+                            "id": "1001",
+                            "name": "#1001",
+                            "customer_first_name": "José",
+                            "note": "Gift 🙂 " + ("x" * 247) + "  tail" + ("y" * 600),
+                            "line_items": [
+                                {
+                                    "id": 501,
+                                    "sku": "ABC",
+                                    "title": "Men’s Shirt",
+                                    "quantity": 1,
+                                    "price": "10.00",
+                                }
+                            ],
+                        },
+                    }
+                ],
+                retention_rows=100,
+            )
+
+            headers, details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(headers[0]["CUST_FIRST"], "José")
+            self.assertEqual(details[0]["DESCRIPT"], "Men’s Shirt")
+            self.assertIn("?", (headers[0]["NOTE1"] or "") + (headers[0]["NOTE2"] or ""))
+            self.assertTrue((headers[0]["NOTE2"] or "").startswith("  tail"))
+            self.assertTrue(headers[0]["TRUNCATED"])
+            self.assertFalse(details[0]["TRUNCATED"])
+
+    def test_header_money_rounding_is_flagged(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [
+                    {
+                        "id": 1,
+                        "version": 1,
+                        "shopify_order_id": "1001",
+                        "event_topic": "orders/create",
+                        "order": {
+                            "id": "1001",
+                            "name": "#1001",
+                            "currency": "KWD",
+                            "subtotal_price": "1.005",
+                            "total_price": "1.005",
+                            "line_items": [],
+                        },
+                    }
+                ],
+                retention_rows=100,
+            )
+
+            headers, _ = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(headers[0]["SUBTOTAL"], Decimal("1.00"))
+            self.assertEqual(headers[0]["TOTAL"], Decimal("1.00"))
+            self.assertTrue(headers[0]["TRUNCATED"])
+
+    def test_malformed_line_tax_is_coerced_and_flagged(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [
+                    {
+                        "id": 1,
+                        "version": 1,
+                        "shopify_order_id": "1001",
+                        "event_topic": "orders/create",
+                        "order": {
+                            "id": "1001",
+                            "name": "#1001",
+                            "line_items": [
+                                {
+                                    "id": "501",
+                                    "quantity": 1,
+                                    "price": "10.00",
+                                    "tax_lines": [{"price": "invalid"}],
+                                }
+                            ],
+                        },
+                    }
+                ],
+                retention_rows=100,
+            )
+
+            _, details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(details[0]["TAX"], Decimal("0.00"))
+            self.assertTrue(details[0]["TRUNCATED"])
+
+    def test_dbf_record_count_cannot_hide_physical_order_rows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [
+                    {
+                        "id": 1,
+                        "version": 1,
+                        "shopify_order_id": "1001",
+                        "event_topic": "orders/create",
+                        "order": {"id": "1001", "name": "#1001", "line_items": []},
+                    }
+                ],
+                retention_rows=100,
+            )
+            corrupted = bytearray(header_path.read_bytes())
+            corrupted[4:8] = struct.pack("<I", 0)
+            header_path.write_bytes(corrupted)
+
+            with self.assertRaisesRegex(ValueError, "record count or end marker"):
+                read_order_dbfs(header_path, detail_path)
+
+    def test_legacy_sqlite_orders_are_migrated_without_deleting_the_source(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            legacy_path = directory / "shopify-order.db"
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            with sqlite3.connect(legacy_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE orders (
+                        shopify_order_id TEXT PRIMARY KEY,
+                        order_name TEXT,
+                        created_at TEXT,
+                        total_price TEXT,
+                        print_status TEXT,
+                        printed_at TEXT,
+                        import_status TEXT,
+                        imported_at TEXT,
+                        pos_order_number TEXT,
+                        import_error TEXT,
+                        source_event TEXT,
+                        source_version INTEGER,
+                        synced_at TEXT
+                    );
+                    CREATE TABLE order_items (
+                        shopify_order_id TEXT,
+                        line_key TEXT,
+                        shopify_line_item_id TEXT,
+                        sku TEXT,
+                        quantity INTEGER,
+                        price TEXT,
+                        total_discount TEXT
+                    );
+                    INSERT INTO orders VALUES (
+                        '1001', '#1001', '2026-07-22T12:00:00-07:00', '21.00',
+                        'PRINTED', '2026-07-22T12:01:00-07:00',
+                        'IMPORTED', '2026-07-22T12:02:00-07:00',
+                        'POS-1', NULL, 'orders/create', 3, '2026-07-22T12:00:05-07:00'
+                    );
+                    INSERT INTO order_items VALUES (
+                        '1001', '501', '501', 'ABC', 1, '21.00', '0.00'
+                    );
+                    INSERT INTO order_items VALUES (
+                        '1001', '502', '502', 'XYZ', 2, '10.00', '1.00'
+                    );
+                    """
+                )
+
+            migrated = migrate_legacy_sqlite_database(
+                legacy_path,
+                header_path,
+                detail_path,
+                retention_rows=100,
+            )
+
+            headers, details = read_order_dbfs(header_path, detail_path)
+            self.assertTrue(migrated)
+            self.assertTrue(legacy_path.exists())
+            self.assertEqual(headers[0]["ORDER_ID"], "1001")
+            self.assertEqual(headers[0]["PRINT_ST"], "PRINTED")
+            self.assertEqual(headers[0]["IMPORT_ST"], "IMPORTED")
+            self.assertEqual(headers[0]["POS_ORD_NO"], "POS-1")
+            self.assertEqual(details[0]["SKU"], "ABC")
+            self.assertEqual([row["LINE_NO"] for row in details], [Decimal("1"), Decimal("2")])
+            self.assertEqual(
+                [row["EXTENSION"] for row in details],
+                [Decimal("21.00"), Decimal("19.00")],
+            )
+
+    def test_removal_changes_also_scrub_the_legacy_sqlite_copy(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            legacy_path = directory / "shopify-order.db"
+            with sqlite3.connect(legacy_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE orders (shopify_order_id TEXT PRIMARY KEY, email TEXT);
+                    CREATE TABLE order_items (shopify_order_id TEXT, line_key TEXT);
+                    INSERT INTO orders VALUES ('1001', 'customer@example.com');
+                    INSERT INTO order_items VALUES ('1001', '501');
+                    """
+                )
+
+            removed = remove_orders_from_legacy_sqlite(
+                [legacy_path],
+                [
+                    {
+                        "shopify_order_id": "1001",
+                        "event_topic": "customers/redact",
+                        "order": {"id": "1001", "redacted": True},
+                    }
+                ],
+            )
+
+            with sqlite3.connect(legacy_path) as connection:
+                order_count = connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+                item_count = connection.execute("SELECT COUNT(*) FROM order_items").fetchone()[0]
+            self.assertEqual(removed, 1)
+            self.assertEqual(order_count, 0)
+            self.assertEqual(item_count, 0)
+            self.assertNotIn(b"customer@example.com", legacy_path.read_bytes())
+            self.assertFalse(Path(f"{legacy_path}-wal").exists())
+            self.assertFalse(Path(f"{legacy_path}-journal").exists())
+
+    def test_custom_header_lock_blocks_a_second_process(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "orders.dbf"
+            detail_path = directory / "lines.dbf"
+            acquired_path = directory / "child-acquired"
+            child_code = """
+import sys
+from pathlib import Path
+from windows_connector.order_dbf import order_dbf_lock
+
+print('started', flush=True)
+with order_dbf_lock(Path(sys.argv[1]), Path(sys.argv[2])):
+    Path(sys.argv[3]).write_text('acquired', encoding='utf-8')
+"""
+            with order_dbf_lock(header_path, detail_path) as lock_path:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(header_path),
+                        str(detail_path),
+                        str(acquired_path),
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(process.stdout.readline().strip(), "started")
+                self.assertEqual(lock_path, directory / "orders.lock")
+                self.assertFalse(acquired_path.exists())
+
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(acquired_path.read_text(encoding="utf-8"), "acquired")
+
+    def test_connector_recovers_partial_initial_publish_before_legacy_migration(self):
+        import hashlib
+        import json
+
+        from windows_connector import order_dbf
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        class Session:
+            def get(self, url, **kwargs):
+                if url.endswith("/sync/orders/status"):
+                    return Response({})
+                return Response({"items": []})
+
+            def post(self, url, **kwargs):
+                raise AssertionError("an empty recovery poll must not acknowledge changes")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            legacy_path = directory / "shopify-order.db"
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            with sqlite3.connect(legacy_path) as connection:
+                connection.execute(
+                    "CREATE TABLE orders (shopify_order_id TEXT PRIMARY KEY, order_name TEXT)"
+                )
+                connection.execute("INSERT INTO orders VALUES ('1001', '#1001')")
+            self.assertTrue(
+                migrate_legacy_sqlite_database(
+                    legacy_path,
+                    header_path,
+                    detail_path,
+                    retention_rows=100,
+                )
+            )
+            headers, _ = read_order_dbfs(header_path, detail_path)
+            header_content = header_path.read_bytes()
+            detail_content = detail_path.read_bytes()
+            _, _, journal_path = order_dbf._publish_paths(header_path, detail_path)
+            header_path.unlink()
+            journal_path.write_text(
+                json.dumps(
+                    {
+                        "generation": headers[0]["GEN_ID"],
+                        "header_existed": False,
+                        "detail_existed": False,
+                        "header_sha256": hashlib.sha256(header_content).hexdigest(),
+                        "detail_sha256": hashlib.sha256(detail_content).hexdigest(),
+                        "previous_header_sha256": None,
+                        "previous_detail_sha256": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            connector = Connector.__new__(Connector)
+            connector.dry_run = False
+            connector.order_dbfs_initialized = False
+            connector.order_header_path = header_path
+            connector.order_detail_path = detail_path
+            connector.legacy_order_db_paths = [legacy_path]
+            connector.order_retention_rows = 100
+            connector.order_bridge_status_checked = False
+            connector.base_url = "https://sync.example"
+            connector.timeout = 30
+            connector.logger = mock.Mock()
+            connector.session = Session()
+            connector.last_order_poll_monotonic = 0.0
+
+            connector._sync_order_inbox()
+
+            recovered_headers, recovered_details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual([row["ORDER_ID"] for row in recovered_headers], ["1001"])
+            self.assertEqual(recovered_details, [])
+            self.assertFalse(journal_path.exists())
+
+    def test_recovery_removes_orphan_publish_temp_files(self):
+        from windows_connector import order_dbf
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(header_path, detail_path, [], retention_rows=100)
+            previous_header, previous_detail, journal_path = order_dbf._publish_paths(
+                header_path,
+                detail_path,
+            )
+            orphan_paths = [
+                target.parent / f".{target.name}.abandoned.tmp"
+                for target in (
+                    header_path,
+                    detail_path,
+                    previous_header,
+                    previous_detail,
+                    journal_path,
+                )
+            ]
+            for orphan_path in orphan_paths:
+                orphan_path.write_bytes(b"old customer data")
+
+            read_order_dbfs(header_path, detail_path)
+
+            self.assertTrue(all(not path.exists() for path in orphan_paths))
+
+    def test_failed_second_file_replace_restores_the_previous_pair(self):
+        from windows_connector import order_dbf
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            base_change = {
+                "id": 1,
+                "version": 1,
+                "shopify_order_id": "1001",
+                "event_topic": "orders/create",
+                "order": {
+                    "id": "1001",
+                    "name": "#1001",
+                    "created_at": "2026-07-22T12:00:00-07:00",
+                    "total_price": "10.00",
+                    "line_items": [{"id": 1, "sku": "ABC", "quantity": 1, "price": "10.00"}],
+                },
+            }
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [base_change],
+                retention_rows=100,
+            )
+            original_header = header_path.read_bytes()
+            original_detail = detail_path.read_bytes()
+            real_replace = order_dbf.os.replace
+            failed = False
+
+            def fail_header_once(source, destination):
+                nonlocal failed
+                if Path(destination) == header_path and Path(source).suffix == ".tmp" and not failed:
+                    failed = True
+                    raise OSError("simulated header publish failure")
+                return real_replace(source, destination)
+
+            updated_change = {
+                **base_change,
+                "version": 2,
+                "order": {**base_change["order"], "total_price": "12.00"},
+            }
+            with mock.patch.object(order_dbf.os, "replace", side_effect=fail_header_once):
+                with self.assertRaisesRegex(OSError, "simulated header publish failure"):
+                    upsert_order_changes(
+                        header_path,
+                        detail_path,
+                        [updated_change],
+                        retention_rows=100,
+                    )
+
+            self.assertEqual(header_path.read_bytes(), original_header)
+            self.assertEqual(detail_path.read_bytes(), original_detail)
+            headers, details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(headers[0]["TOTAL"], Decimal("10.00"))
+            self.assertEqual(details[0]["SKU"], "ABC")
+
+    def test_failed_detail_temp_creation_cleans_the_header_temp(self):
+        from windows_connector import order_dbf
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            upsert_order_changes(header_path, detail_path, [], retention_rows=100)
+            original_header = header_path.read_bytes()
+            original_detail = detail_path.read_bytes()
+            real_write_temp = order_dbf._write_temp_file
+            calls = 0
+
+            def fail_second_temp(path, content):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated detail temp failure")
+                return real_write_temp(path, content)
+
+            with mock.patch.object(order_dbf, "_write_temp_file", side_effect=fail_second_temp):
+                with self.assertRaisesRegex(OSError, "simulated detail temp failure"):
+                    upsert_order_changes(
+                        header_path,
+                        detail_path,
+                        [],
+                        retention_rows=100,
+                    )
+
+            self.assertEqual(header_path.read_bytes(), original_header)
+            self.assertEqual(detail_path.read_bytes(), original_detail)
+            self.assertEqual(list(directory.glob(".*.tmp")), [])
+
+    def test_recovery_keeps_a_fully_published_journal_generation(self):
+        import hashlib
+        import json
+
+        from windows_connector import order_dbf
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            header_path = directory / "shopify-order-header.dbf"
+            detail_path = directory / "shopify-order-detail.dbf"
+            change = {
+                "id": 1,
+                "version": 1,
+                "shopify_order_id": "1001",
+                "event_topic": "orders/create",
+                "order": {
+                    "id": "1001",
+                    "name": "#1001",
+                    "total_price": "10.00",
+                    "line_items": [{"id": 1, "sku": "ABC", "quantity": 1, "price": "10.00"}],
+                },
+            }
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [change],
+                retention_rows=100,
+            )
+            old_header = header_path.read_bytes()
+            old_detail = detail_path.read_bytes()
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [{**change, "version": 2, "order": {**change["order"], "total_price": "12.00"}}],
+                retention_rows=100,
+            )
+            new_header = header_path.read_bytes()
+            new_detail = detail_path.read_bytes()
+            headers, _ = read_order_dbfs(header_path, detail_path)
+            previous_header, previous_detail, journal_path = order_dbf._publish_paths(
+                header_path,
+                detail_path,
+            )
+            previous_header.write_bytes(old_header)
+            previous_detail.write_bytes(old_detail)
+            journal_path.write_text(
+                json.dumps(
+                    {
+                        "generation": headers[0]["GEN_ID"],
+                        "header_existed": True,
+                        "detail_existed": True,
+                        "header_sha256": hashlib.sha256(new_header).hexdigest(),
+                        "detail_sha256": hashlib.sha256(new_detail).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered_headers, _ = read_order_dbfs(header_path, detail_path)
+
+            self.assertEqual(recovered_headers[0]["TOTAL"], Decimal("12.00"))
+            self.assertFalse(journal_path.exists())
+            self.assertFalse(previous_header.exists())
+            self.assertFalse(previous_detail.exists())
 
     def test_order_and_lines_are_upserted_without_changing_print_status(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database_path = Path(temporary_directory) / "shopify-orders.db"
+            header_path = Path(temporary_directory) / "shopify-order-header.dbf"
+            detail_path = Path(temporary_directory) / "shopify-order-detail.dbf"
             base_change = {
                 "id": 1,
                 "version": 1,
@@ -715,12 +1603,24 @@ class LocalOrderInboxTests(unittest.TestCase):
                     ],
                 },
             }
-            upsert_order_changes(database_path, [base_change], retention_rows=100)
-            with sqlite3.connect(database_path) as connection:
-                connection.execute(
-                    "UPDATE orders SET print_status='PRINTED', printed_at='2026-07-22T12:01:00-07:00'"
-                )
-                connection.commit()
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [base_change],
+                retention_rows=100,
+            )
+            headers, details = read_order_dbfs(header_path, detail_path)
+            headers[0].update(
+                {
+                    "PRINT_ST": "PRINTED",
+                    "PRINTED_AT": "2026-07-22T12:01:00-07:00",
+                    "IMPORT_ST": "IMPORTED",
+                    "IMPORTEDAT": "2026-07-22T12:03:00-07:00",
+                    "POS_ORD_NO": "POS-77",
+                    "IMP_ERROR": "reviewed",
+                }
+            )
+            write_order_dbfs(header_path, detail_path, headers, details)
 
             updated_change = {
                 **base_change,
@@ -732,32 +1632,40 @@ class LocalOrderInboxTests(unittest.TestCase):
                     "total_price": "45.00",
                 },
             }
-            upsert_order_changes(database_path, [updated_change], retention_rows=100)
+            upsert_order_changes(
+                header_path,
+                detail_path,
+                [updated_change],
+                retention_rows=100,
+            )
 
-            with sqlite3.connect(database_path) as connection:
-                connection.row_factory = sqlite3.Row
-                order = connection.execute("SELECT * FROM orders").fetchone()
-                items = connection.execute("SELECT * FROM order_items").fetchall()
-                header = connection.execute("SELECT * FROM order_header").fetchone()
-                detail = connection.execute("SELECT * FROM order_detail").fetchone()
-            self.assertEqual(order["total_price"], "45.00")
-            self.assertEqual(order["print_status"], "PRINTED")
-            self.assertEqual(order["import_status"], "PENDING")
-            self.assertEqual(order["source_version"], 2)
-            self.assertEqual(order["billing_address1"], "456 Billing Ave")
-            self.assertEqual(order["shipping_address1"], "123 Main St")
-            self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]["sku"], "ABC")
-            self.assertEqual(items[0]["line_total"], "40.00")
-            self.assertEqual(items[0]["line_tax"], "3.20")
-            self.assertEqual(header["invoice_no"], "#1001")
-            self.assertEqual(header["email"], "ada@example.com")
-            self.assertEqual(header["shipping"], "8.00")
-            self.assertEqual(detail["qty"], 2)
-            self.assertEqual(detail["extension"], "40.00")
+            headers, details = read_order_dbfs(header_path, detail_path)
+            header = headers[0]
+            detail = details[0]
+            self.assertEqual(header["TOTAL"], Decimal("45.00"))
+            self.assertEqual(header["PRINT_ST"], "PRINTED")
+            self.assertEqual(header["PRINTED_AT"], "2026-07-22T12:01:00-07:00")
+            self.assertEqual(header["IMPORT_ST"], "IMPORTED")
+            self.assertEqual(header["IMPORTEDAT"], "2026-07-22T12:03:00-07:00")
+            self.assertEqual(header["POS_ORD_NO"], "POS-77")
+            self.assertEqual(header["IMP_ERROR"], "reviewed")
+            self.assertEqual(header["SRC_VER"], Decimal("2"))
+            self.assertEqual(header["BILL_ADR1"], "456 Billing Ave")
+            self.assertEqual(header["SHIP_ADR1"], "123 Main St")
+            self.assertEqual(len(details), 1)
+            self.assertEqual(detail["SKU"], "ABC")
+            self.assertEqual(detail["EXTENSION"], Decimal("40.00"))
+            self.assertEqual(detail["TAX"], Decimal("3.20"))
+            self.assertEqual(header["INVOICE_NO"], "#1001")
+            self.assertEqual(header["EMAIL"], "ada@example.com")
+            self.assertEqual(header["SHIPPING"], Decimal("8.00"))
+            self.assertEqual(detail["QTY"], Decimal("2"))
+            self.assertEqual(header["GEN_ID"], detail["GEN_ID"])
+            self.assertEqual(header["LINE_COUNT"], Decimal("1"))
 
             upsert_order_changes(
-                database_path,
+                header_path,
+                detail_path,
                 [
                     {
                         "id": 2,
@@ -769,9 +1677,9 @@ class LocalOrderInboxTests(unittest.TestCase):
                 ],
                 retention_rows=100,
             )
-            with sqlite3.connect(database_path) as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM order_items").fetchone()[0], 0)
+            headers, details = read_order_dbfs(header_path, detail_path)
+            self.assertEqual(headers, [])
+            self.assertEqual(details, [])
 
 
 class InventoryAdjustmentTests(unittest.TestCase):

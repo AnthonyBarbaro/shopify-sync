@@ -269,7 +269,7 @@ function renderOrders() {
         <div>
           <p class="kicker">Order sync</p>
           <h1>Recent Shopify orders</h1>
-          <p>Only small order summaries are kept here. Full order details are delivered to <code>shopify-orders.db</code> on the POS computer.</p>
+          <p>Only small order summaries are kept here. Full order details are delivered to <code>shopify-order-header.dbf</code> and <code>shopify-order-detail.dbf</code> on the POS computer.</p>
         </div>
         <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>${state.refreshing ? "Checking…" : "Refresh"}</button>
       </div>
