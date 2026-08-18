@@ -682,6 +682,43 @@ class LocalOrderInboxTests(unittest.TestCase):
                 directory / "ashpsdat_web" / "shopify-order-detail.dbf",
             )
 
+    def test_connector_redirects_legacy_default_order_settings_to_web_folder(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pos_directory = directory / "ashpsdat"
+            config_path = directory / "connector.env"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        f"POS_DBF_DIR={pos_directory}",
+                        "SHOPIFY_SYNC_BASE_URL=https://sync.example",
+                        "SHOPIFY_SYNC_API_KEY=test-key",
+                        "SHOPIFY_SYNC_API_SECRET=test-secret",
+                        f"SHOPIFY_ORDER_DB_PATH={pos_directory / 'shopify-orders.db'}",
+                        f"SHOPIFY_ORDER_HEADER_DBF_PATH={pos_directory / 'shopify-order-header.dbf'}",
+                        f"SHOPIFY_ORDER_DETAIL_DBF_PATH={pos_directory / 'shopify-order-detail.dbf'}",
+                        f"CONNECTOR_DATA_DIR={directory / 'connector-data'}",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                connector = Connector(config_path=config_path)
+
+            self.assertEqual(
+                connector.order_header_path,
+                directory / "ashpsdat_web" / "shopify-order-header.dbf",
+            )
+            self.assertEqual(
+                connector.order_detail_path,
+                directory / "ashpsdat_web" / "shopify-order-detail.dbf",
+            )
+            self.assertIn(
+                pos_directory / "shopify-orders.db",
+                connector.legacy_order_db_paths,
+            )
+
     def test_empty_sync_creates_missing_web_order_folder_and_dbfs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             web_directory = Path(temporary_directory) / "ashpsdat_web"

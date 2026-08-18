@@ -81,7 +81,8 @@ SQLite migration source. On the first non-dry run, the connector copies its reta
 and print/import status into the two DBFs and leaves the SQLite file available for manual recovery.
 Subsequent deletion/redaction events are removed from both formats. New installations should use
 `SHOPIFY_ORDER_HEADER_DBF_PATH` and `SHOPIFY_ORDER_DETAIL_DBF_PATH` only when the default DBF locations
-need to change.
+need to change. The former standard values inside `POS_DBF_DIR` are automatically redirected to the
+new sibling `_web` folder, so an existing `connector.env` does not need to be edited for this move.
 
 Card numbers, CVV values, payment credentials, authorization data, and raw webhook payloads are never
 written to either file. Railway acknowledges queued changes only after both DBFs have been written and
