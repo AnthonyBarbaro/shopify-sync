@@ -75,8 +75,9 @@ Shopify edits to titles, descriptions, tags, images, and other merchandising fie
 a price changes only when `pricechg.dbf` records a newer POS price.
 
 With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
-queue until the Windows connector writes them to `C:\ashpsdat\shopify-order-header.dbf` and
-`C:\ashpsdat\shopify-order-detail.dbf`. These genuine dBASE files are isolated from the native POS
+queue until the Windows connector writes them to `C:\ashpsdat_web\shopify-order-header.dbf` and
+`C:\ashpsdat_web\shopify-order-detail.dbf`. The connector creates the folder and files when they do
+not exist. These genuine dBASE files are isolated from the native POS
 FoxPro tables and contain normalized order header/detail rows for printing or a later vendor-tested
 POS import; payment/card data and raw webhook payloads are not retained.
 After adding `read_orders` to an existing Railway `APP_SCOPES` value, run the Shopify install flow

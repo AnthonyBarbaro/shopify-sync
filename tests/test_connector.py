@@ -652,6 +652,50 @@ class ShopifyScopeTests(unittest.TestCase):
 
 
 class LocalOrderInboxTests(unittest.TestCase):
+    def test_connector_defaults_order_dbfs_to_sibling_web_folder(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pos_directory = directory / "ashpsdat"
+            config_path = directory / "connector.env"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        f"POS_DBF_DIR={pos_directory}",
+                        "SHOPIFY_SYNC_BASE_URL=https://sync.example",
+                        "SHOPIFY_SYNC_API_KEY=test-key",
+                        "SHOPIFY_SYNC_API_SECRET=test-secret",
+                        f"CONNECTOR_DATA_DIR={directory / 'connector-data'}",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                connector = Connector(config_path=config_path)
+
+            self.assertEqual(
+                connector.order_header_path,
+                directory / "ashpsdat_web" / "shopify-order-header.dbf",
+            )
+            self.assertEqual(
+                connector.order_detail_path,
+                directory / "ashpsdat_web" / "shopify-order-detail.dbf",
+            )
+
+    def test_empty_sync_creates_missing_web_order_folder_and_dbfs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            web_directory = Path(temporary_directory) / "ashpsdat_web"
+            header_path = web_directory / "shopify-order-header.dbf"
+            detail_path = web_directory / "shopify-order-detail.dbf"
+
+            self.assertFalse(web_directory.exists())
+
+            upsert_order_changes(header_path, detail_path, [], retention_rows=100)
+
+            self.assertTrue(header_path.is_file())
+            self.assertTrue(detail_path.is_file())
+            self.assertTrue(header_path.with_suffix(".lock").is_file())
+
     def test_order_dbf_paths_must_be_separate_non_native_dbf_files(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

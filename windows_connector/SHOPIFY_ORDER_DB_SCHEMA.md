@@ -38,10 +38,11 @@ The POS import is ready when all of these pass:
 - stopping and restarting the importer between native commit and status update still cannot create a
   duplicate because the native system can find the previous import by `ORDER_ID`.
 
-The Windows connector creates two genuine dBASE III files by default:
+When `POS_DBF_DIR=C:\ashpsdat`, the Windows connector creates the separate folder and two genuine
+dBASE III files by default if they do not already exist:
 
-- `C:\ashpsdat\shopify-order-header.dbf`
-- `C:\ashpsdat\shopify-order-detail.dbf`
+- `C:\ashpsdat_web\shopify-order-header.dbf`
+- `C:\ashpsdat_web\shopify-order-detail.dbf`
 
 They are a separate Shopify order inbox. The connector does not modify or copy the native
 `Ordhdr.dbf`, `Orddtl.dbf`, `Customer.dbf`, or `CustShip.dbf` tables. A separate, tested POS import

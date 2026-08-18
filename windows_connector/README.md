@@ -57,9 +57,10 @@ results. The server separately caps its feed and request history using
 
 When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete
 events before each inventory cycle and writes genuine dBASE III files at
-`C:\ashpsdat\shopify-order-header.dbf` and `C:\ashpsdat\shopify-order-detail.dbf` by default. These
-isolated inbox files mirror the useful shape of the POS `Ordhdr.dbf` and `Orddtl.dbf` files but never
-modify, copy, or insert into those native FoxPro tables.
+`C:\ashpsdat_web\shopify-order-header.dbf` and `C:\ashpsdat_web\shopify-order-detail.dbf` by default
+when `POS_DBF_DIR=C:\ashpsdat`. The connector creates the separate folder and both files when they do
+not exist. These isolated inbox files mirror the useful shape of the POS `Ordhdr.dbf` and `Orddtl.dbf`
+files but never modify, copy, or insert into those native FoxPro tables.
 
 - `shopify-order-header.dbf`: order/invoice identifiers, customer name, email, phone, billing address, shipping
   address, shipping method and charge, subtotal, discount, tax, total, fulfillment/financial state,

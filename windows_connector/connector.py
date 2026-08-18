@@ -111,7 +111,11 @@ class Connector:
             if legacy_order_setting
             else self.dbf_dir / "shopify-orders.db"
         )
-        order_dbf_parent = legacy_order_path.parent if legacy_order_setting else self.dbf_dir
+        order_dbf_parent = (
+            legacy_order_path.parent
+            if legacy_order_setting
+            else self.dbf_dir.with_name(f"{self.dbf_dir.name}_web")
+        )
         header_setting = (os.getenv("SHOPIFY_ORDER_HEADER_DBF_PATH") or "").strip()
         detail_setting = (os.getenv("SHOPIFY_ORDER_DETAIL_DBF_PATH") or "").strip()
         if header_setting and not detail_setting:
