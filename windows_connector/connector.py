@@ -48,12 +48,16 @@ else:
 
 
 STATE_VERSION = 1
+CONNECTOR_VERSION = "1.1"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
+CATALOG_STRUCTURE_SCHEMA_VERSION = 1
+MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS = 900
 INVENTORY_RECONCILE_SCHEMA_VERSION = 2
 INVENTORY_SNAPSHOT_SCHEMA_VERSION = 2
 POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
 MATRIX_VARIANT_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
+ACTIVE_MATRIX_STRUCTURE_STAGES = {"candidate", "verification"}
 
 
 def parse_cli() -> argparse.Namespace:
@@ -74,6 +78,58 @@ def env_bool(name: str, default: bool) -> bool:
 def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     value = int((os.getenv(name) or str(default)).strip())
     return max(minimum, min(maximum, value))
+
+
+def has_active_matrix_structure_repairs(state: Dict[str, Any]) -> bool:
+    pending = state.get("pending_matrix_structure_repairs") or {}
+    return any(
+        isinstance(entry, dict)
+        and entry.get("stage") in ACTIVE_MATRIX_STRUCTURE_STAGES
+        for entry in pending.values()
+    )
+
+
+def matrix_structure_entry_skus(
+    base: str,
+    entry: Optional[Dict[str, Any]],
+) -> set[str]:
+    skus = {str(base or "").strip()}
+    if not isinstance(entry, dict):
+        return {sku for sku in skus if sku}
+    for field in ("expected_child_skus", "protected_skus"):
+        values = entry.get(field) or []
+        if isinstance(values, list):
+            skus.update(str(value or "").strip() for value in values)
+    return {sku for sku in skus if sku}
+
+
+def pending_matrix_structure_skus(state: Dict[str, Any]) -> set[str]:
+    pending = state.get("pending_matrix_structure_repairs") or {}
+    protected: set[str] = set()
+    for base, entry in pending.items():
+        if isinstance(entry, dict):
+            protected.update(matrix_structure_entry_skus(str(base), entry))
+    return protected
+
+
+def snapshot_overlay_ignored_matrix_skus(state: Dict[str, Any]) -> set[str]:
+    """Keep obsolete matrix identities out of snapshot/webhook comparisons."""
+    pending = state.get("pending_matrix_structure_repairs") or {}
+    ignored: set[str] = set()
+    for base, entry in pending.items():
+        if not isinstance(entry, dict):
+            continue
+        related = matrix_structure_entry_skus(str(base), entry)
+        if entry.get("stage") == "quantity_reconciliation":
+            expected_children = {
+                str(sku or "").strip()
+                for sku in entry.get("expected_child_skus") or []
+                if str(sku or "").strip()
+            }
+            ignored.update(related - expected_children)
+        else:
+            ignored.update(related)
+    return ignored
 
 
 def validate_order_dbf_paths(header_path: Path, detail_path: Path) -> None:
@@ -165,7 +221,7 @@ class Connector:
         self.session.headers.update(
             {
                 "Content-Type": "application/json",
-                "User-Agent": "shopify-pos-windows-connector/1.0",
+                "User-Agent": f"shopify-pos-windows-connector/{CONNECTOR_VERSION}",
                 "X-API-Key": self.api_key,
                 "X-API-Secret": self.api_secret,
                 "X-Sync-Workers": str(self.workers),
@@ -181,7 +237,8 @@ class Connector:
 
     def run_forever(self, *, once: bool = False) -> int:
         self.logger.info(
-            "connector_started dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
+            "connector_started version=%s dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
+            CONNECTOR_VERSION,
             self.dbf_dir,
             self.interval_seconds,
             self.writeback_mode,
@@ -205,7 +262,21 @@ class Connector:
         state = load_state(self.state_path)
         now = datetime.now()
         if not self.dry_run:
-            self._retry_pending(state)
+            protected_pending_skus = pending_matrix_structure_skus(state)
+            structure_schema_outdated = (
+                int(state.get("catalog_structure_schema_version") or 0)
+                < CATALOG_STRUCTURE_SCHEMA_VERSION
+            )
+            if structure_schema_outdated and not protected_pending_skus:
+                # The first structure-upgrade scan has not identified matrix SKUs
+                # yet. Defer every legacy action once instead of risking a stale
+                # zero write before the full POS payload and Shopify shape are read.
+                self.logger.warning("matrix_structure_pending_retries_deferred")
+            else:
+                self._retry_pending(
+                    state,
+                    excluded_skus=protected_pending_skus,
+                )
 
         if self.order_sync_enabled:
             self._sync_order_inbox()
@@ -214,10 +285,14 @@ class Connector:
         event_skus, event_file_reset = self._collect_pos_event_skus(state)
         known_products = set(state.get("catalog_products") or [])
         new_numeric_skus: set[str] = set()
+        structure_probe_skus: set[str] = set()
         if state.get("catalog_complete"):
             new_numeric_skus = self._collect_new_numeric_product_skus(
                 state,
                 known_products=known_products,
+            )
+            structure_probe_skus = set(
+                state.get("matrix_structure_probe_skus") or []
             )
         sku_bases: Dict[str, str] = state.setdefault("sku_bases", {})
         shopify_skus = {
@@ -244,16 +319,25 @@ class Connector:
             int(state.get("inventory_reconcile_schema_version") or 0)
             < INVENTORY_RECONCILE_SCHEMA_VERSION
         )
+        catalog_structure_upgrade_due = (
+            int(state.get("catalog_structure_schema_version") or 0)
+            < CATALOG_STRUCTURE_SCHEMA_VERSION
+            or has_active_matrix_structure_repairs(state)
+            or bool(structure_probe_skus)
+        )
         full_reconcile = (
             catalog_incomplete
             or nightly_due
             or event_file_reset
             or matrix_option_repair_due
             or inventory_reconcile_upgrade_due
+            or catalog_structure_upgrade_due
         )
         if full_reconcile:
             if catalog_incomplete:
                 read_mode = "initial"
+            elif catalog_structure_upgrade_due:
+                read_mode = "matrix-structure-repair"
             elif matrix_option_repair_due:
                 read_mode = "matrix-option-repair"
             elif inventory_reconcile_upgrade_due:
@@ -301,6 +385,24 @@ class Connector:
             payloads.sort(key=catalog_upload_priority)
 
         payload_by_base = {str(payload["sku"]): payload for payload in payloads}
+        if structure_probe_skus:
+            probe_not_before: Dict[str, int] = state.setdefault(
+                "matrix_structure_probe_not_before",
+                {},
+            )
+            for sku in structure_probe_skus:
+                payload = payload_by_base.get(sku)
+                if payload is not None and payload.get("variants"):
+                    probe_not_before.pop(sku, None)
+                else:
+                    probe_not_before[sku] = (
+                        int(time.time()) + MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS
+                    )
+                    self.logger.info(
+                        "matrix_structure_probe_waiting sku=%s retry_seconds=%s",
+                        sku,
+                        MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
+                    )
         discovered_sku_bases = sku_base_mapping(payloads)
         if full_reconcile:
             state["sku_bases"] = discovered_sku_bases
@@ -415,6 +517,33 @@ class Connector:
         if self.price_sync_enabled:
             self._sync_pos_price_changes(state)
 
+        ready_structure_repairs: List[Dict[str, Any]] = []
+        if (
+            full_reconcile
+            and not catalog_incomplete
+            and bool(state.get("catalog_complete"))
+        ):
+            ready_structure_repairs = self._ready_matrix_structure_repairs(
+                state,
+                payloads,
+                known_products=known_products,
+            )
+            if ready_structure_repairs:
+                if self.dry_run:
+                    self.logger.info(
+                        "matrix_structure_repair_dry_run candidates=%s",
+                        len(ready_structure_repairs),
+                    )
+                else:
+                    structure_statuses = self._repair_matrix_structures(
+                        ready_structure_repairs,
+                    )
+                    self._record_matrix_structure_repair_results(
+                        state,
+                        ready_structure_repairs,
+                        structure_statuses,
+                    )
+
         inventory_snapshot: Optional[Dict[str, Any]] = None
         if (
             full_reconcile
@@ -422,6 +551,10 @@ class Connector:
             and bool(state.get("catalog_complete"))
         ):
             inventory_snapshot = self._fetch_inventory_snapshot()
+            # Re-read the versioned queue after the snapshot. A Shopify sale can
+            # arrive while the paginated snapshot is loading, and the later
+            # observation must take precedence over an older snapshot row.
+            inventory_changes = self._fetch_inventory_changes()
 
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
         remote_quantities = (
@@ -433,7 +566,10 @@ class Connector:
             }
         )
         remote_updated_at: Dict[str, str] = {}
+        snapshot_overlay_deltas: Dict[str, int] = {}
         blocked_inventory_skus = set(state.get("blocked_inventory_skus") or [])
+        catalog_structure_scan_complete = False
+        structure_rebased_skus: set[str] = set()
         if inventory_snapshot is None:
             inventory_items_by_sku: Dict[str, set[str]] = {}
             for change in inventory_changes:
@@ -490,11 +626,13 @@ class Connector:
                 )
             blocked_snapshot_skus: set[str] = set()
             snapshot_skus: set[str] = set()
+            snapshot_items_by_sku: Dict[str, Dict[str, Any]] = {}
             for item in snapshot_items:
                 sku = str(item.get("sku") or "").strip()
                 if not sku:
                     continue
                 snapshot_skus.add(sku)
+                snapshot_items_by_sku[sku] = item
                 if str(item.get("location_id") or "") != snapshot_location_id:
                     raise RuntimeError(
                         f"Inventory snapshot returned SKU {sku} for an unexpected location."
@@ -547,6 +685,19 @@ class Connector:
                     remote_quantities[sku] = int(item["quantity"])
                     if snapshot_updated_at:
                         remote_updated_at[sku] = snapshot_updated_at
+            snapshot_overlay_deltas = self._overlay_inventory_changes_on_snapshot(
+                inventory_changes,
+                snapshot_items_by_sku=snapshot_items_by_sku,
+                location_id=snapshot_location_id,
+                remote_quantities=remote_quantities,
+                remote_updated_at=remote_updated_at,
+                already_blocked=blocked_snapshot_skus,
+                relevant_skus=set(local_quantities),
+                ignored_skus=(
+                    uploaded_inventory_skus
+                    | snapshot_overlay_ignored_matrix_skus(state)
+                ),
+            )
             expected_snapshot_skus = {
                 sku
                 for sku in local_quantities
@@ -567,16 +718,31 @@ class Connector:
                 len(remote_quantities),
                 len(blocked_snapshot_skus),
             )
+            (
+                catalog_structure_scan_complete,
+                structure_rebased_skus,
+            ) = self._update_matrix_structure_state(
+                state,
+                payloads,
+                known_products=known_products,
+                snapshot_items=snapshot_items,
+                location_id=snapshot_location_id,
+                remote_quantities=remote_quantities,
+            )
         initialized = 0
         for sku in sorted(local_quantities.keys() & remote_quantities.keys(), key=str.casefold):
             if sku in entries:
                 continue
             pos_quantity = local_quantities[sku]
             shop_quantity = remote_quantities[sku]
-            if pos_quantity == shop_quantity:
-                canonical = pos_quantity
-            else:
-                canonical = pos_quantity
+            canonical = (
+                shop_quantity
+                if sku in structure_rebased_skus
+                else max(
+                    0,
+                    pos_quantity + int(snapshot_overlay_deltas.get(sku) or 0),
+                )
+            )
             entries[sku] = {
                 "canonical": canonical,
                 "pos_seen": pos_quantity,
@@ -590,6 +756,11 @@ class Connector:
         planned_pos: List[Dict[str, Any]] = []
         for sku in sorted(local_quantities.keys() & remote_quantities.keys(), key=str.casefold):
             entry = entries[sku]
+            if sku in structure_rebased_skus:
+                # ProductSet just replaced the old inventory identities. Preserve
+                # this post-mutation snapshot as the new baseline and let queued
+                # versioned webhooks (or the next snapshot) carry any racing sale.
+                continue
             if entry.get("pending_shop") or entry.get("pending_pos"):
                 continue
             pos_quantity = local_quantities[sku]
@@ -648,21 +819,27 @@ class Connector:
         if inventory_snapshot is not None:
             state["last_full_reconcile_date"] = now.date().isoformat()
             state["inventory_reconcile_schema_version"] = INVENTORY_RECONCILE_SCHEMA_VERSION
+            if catalog_structure_scan_complete:
+                state["catalog_structure_schema_version"] = CATALOG_STRUCTURE_SCHEMA_VERSION
         save_state(self.state_path, state)
-        deferred_pos_skus: set[str] = set()
+        blocked_pos_skus: set[str] = set()
         if planned_shop:
-            deferred_pos_skus = self._apply_shopify_adjustments(state, planned_shop) or set()
-        if planned_pos:
+            blocked_pos_skus = self._apply_shopify_adjustments(state, planned_shop) or set()
+        if planned_pos or planned_shop:
             if self.writeback_mode == "vfp-oledb":
+                pos_candidate_skus = {
+                    action["sku"]
+                    for action in [*planned_pos, *planned_shop]
+                }
                 current_pos_actions = [
-                    action
-                    for action in planned_pos
-                    if action["sku"] not in deferred_pos_skus
-                    and (state["quantities"].get(action["sku"]) or {}).get("pending_pos") == action
+                    state["quantities"][sku]["pending_pos"]
+                    for sku in sorted(pos_candidate_skus, key=str.casefold)
+                    if sku not in blocked_pos_skus
+                    and (state["quantities"].get(sku) or {}).get("pending_pos")
                 ]
                 if current_pos_actions:
                     self._apply_pos_adjustments(state, current_pos_actions)
-            else:
+            elif planned_pos:
                 self.logger.warning(
                     "pos_writeback_not_applied mode=%s adjustments=%s",
                     self.writeback_mode,
@@ -670,8 +847,16 @@ class Connector:
                 )
         state["last_cycle_epoch"] = int(time.time())
         save_state(self.state_path, state)
-        if inventory_changes:
+        if inventory_changes and inventory_snapshot is None:
             self._acknowledge_inventory_changes(inventory_changes)
+        elif inventory_changes:
+            # A full snapshot can race a newer queued webhook. Leave versioned
+            # changes queued so the next incremental cycle can compare and merge
+            # them instead of acknowledging an update the snapshot may not contain.
+            self.logger.info(
+                "inventory_webhook_ack_deferred_after_snapshot changes=%s",
+                len(inventory_changes),
+            )
         self.logger.info(
             "connector_cycle_complete initialized=%s webhook_changes=%s shopify_adjustments=%s pos_adjustments=%s",
             initialized,
@@ -721,12 +906,50 @@ class Connector:
             self.logger.warning("new_product_scan_missing file=Item.dbf")
             return set()
 
+        item_rows = list(dbf_pos_sync.iter_dbf_rows(item_path))
         item_skus = [
             str(row.get("SKU") or "").strip()
-            for row in dbf_pos_sync.iter_dbf_rows(item_path)
+            for row in item_rows
             if str(row.get("SKU") or "").strip()
         ]
         item_sku_set = set(item_skus)
+        sku_bases = state.get("sku_bases") or {}
+        bases_with_known_children = {
+            str(mapped_base or "").strip()
+            for sku, mapped_base in sku_bases.items()
+            if str(sku or "").strip()
+            and str(mapped_base or "").strip()
+            and str(sku or "").strip() != str(mapped_base or "").strip()
+        }
+        matrix_bases_without_children = {
+            str(row.get("SKU") or "").strip()
+            for row in item_rows
+            if str(row.get("SKU") or "").strip() in known_products
+            and str(row.get("TYPE") or "").strip().upper() == "M"
+            and str(row.get("SKU") or "").strip() not in bases_with_known_children
+        }
+        probe_not_before: Dict[str, int] = state.setdefault(
+            "matrix_structure_probe_not_before",
+            {},
+        )
+        for sku in list(probe_not_before):
+            if sku not in matrix_bases_without_children:
+                probe_not_before.pop(sku, None)
+        now_epoch = int(time.time())
+        structure_probe_skus = {
+            sku
+            for sku in matrix_bases_without_children
+            if now_epoch >= int(probe_not_before.get(sku) or 0)
+        }
+        state["matrix_structure_probe_skus"] = sorted(
+            structure_probe_skus,
+            key=str.casefold,
+        )
+        if structure_probe_skus:
+            self.logger.info(
+                "matrix_structure_probe_detected skus=%s",
+                ",".join(sorted(structure_probe_skus, key=str.casefold)),
+            )
         pending_products: Dict[str, Dict[str, Any]] = state.setdefault(
             "pending_catalog_products",
             {},
@@ -872,6 +1095,95 @@ class Connector:
             raise RuntimeError("Inventory snapshot contains an invalid item row.")
         return {"location_id": location_id, "items": items}
 
+    def _overlay_inventory_changes_on_snapshot(
+        self,
+        changes: List[Dict[str, Any]],
+        *,
+        snapshot_items_by_sku: Dict[str, Dict[str, Any]],
+        location_id: str,
+        remote_quantities: Dict[str, int],
+        remote_updated_at: Dict[str, str],
+        already_blocked: set[str],
+        relevant_skus: set[str],
+        ignored_skus: set[str],
+    ) -> Dict[str, int]:
+        """Overlay queued observations that are provably newer than a full snapshot."""
+        changes_by_sku: Dict[str, List[Dict[str, Any]]] = {}
+        for change in changes:
+            sku = str(change.get("sku") or "").strip()
+            if sku:
+                changes_by_sku.setdefault(sku, []).append(change)
+        overlaid_deltas: Dict[str, int] = {}
+
+        def conflict(sku: str, reason: str) -> None:
+            raise RuntimeError(
+                "Cannot safely reconcile Shopify's full inventory snapshot with "
+                f"queued inventory for SKU {sku}: {reason}."
+            )
+
+        for sku, sku_changes in changes_by_sku.items():
+            if sku not in relevant_skus:
+                continue
+            if sku in already_blocked or sku in ignored_skus:
+                continue
+            if len(sku_changes) != 1:
+                conflict(sku, "multiple queued inventory items")
+            change = sku_changes[0]
+            snapshot_item = snapshot_items_by_sku.get(sku)
+            if snapshot_item is None or sku not in remote_quantities:
+                conflict(sku, "the snapshot has no usable matching row")
+            if str(change.get("location_id") or "").strip() != location_id:
+                conflict(sku, "the inventory location does not match")
+            snapshot_inventory_item_id = str(
+                snapshot_item.get("inventory_item_id") or ""
+            ).strip()
+            change_inventory_item_id = str(
+                change.get("inventory_item_id") or ""
+            ).strip()
+            if (
+                not snapshot_inventory_item_id
+                or not change_inventory_item_id
+                or snapshot_inventory_item_id != change_inventory_item_id
+            ):
+                conflict(sku, "the inventory item identity does not match")
+            try:
+                change_quantity = int(change["quantity"])
+            except (KeyError, TypeError, ValueError):
+                conflict(sku, "the queued quantity is invalid")
+
+            current_quantity = int(remote_quantities[sku])
+            source_updated_at = str(
+                change.get("source_updated_at") or ""
+            ).strip()
+            current_updated_at = str(remote_updated_at.get(sku) or "").strip()
+            source_time = parse_inventory_observation_timestamp(source_updated_at)
+            current_time = parse_inventory_observation_timestamp(current_updated_at)
+
+            if change_quantity == current_quantity:
+                if (
+                    source_time is not None
+                    and (current_time is None or source_time > current_time)
+                ):
+                    remote_updated_at[sku] = source_updated_at
+                continue
+            if source_time is None or current_time is None:
+                conflict(sku, "the differing observations have no comparable timestamp")
+            if source_time > current_time:
+                remote_quantities[sku] = change_quantity
+                remote_updated_at[sku] = source_updated_at
+                overlaid_deltas[sku] = change_quantity - current_quantity
+                self.logger.info(
+                    "inventory_snapshot_webhook_overlaid sku=%s snapshot_quantity=%s webhook_quantity=%s",
+                    sku,
+                    current_quantity,
+                    change_quantity,
+                )
+                continue
+            if source_time == current_time:
+                conflict(sku, "equal timestamps report different quantities")
+
+        return overlaid_deltas
+
     def _repair_matrix_options(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
         summary = {"updated": 0, "already_correct": 0, "failed": 0}
         endpoint = f"{self.base_url}/sync/catalog/matrix-options/repair"
@@ -908,6 +1220,430 @@ class Connector:
             ):
                 self._sync_order_inbox()
         return summary
+
+    def _ready_matrix_structure_repairs(
+        self,
+        state: Dict[str, Any],
+        payloads: List[Dict[str, Any]],
+        *,
+        known_products: set[str],
+    ) -> List[Dict[str, Any]]:
+        candidates = matrix_structure_payloads(
+            payloads,
+            known_products=known_products,
+        )
+        candidate_by_base = {
+            str(payload.get("sku") or "").strip(): payload
+            for payload in candidates
+        }
+        pending: Dict[str, Dict[str, Any]] = state.setdefault(
+            "pending_matrix_structure_repairs",
+            {},
+        )
+        for base in list(pending):
+            if base not in candidate_by_base:
+                self._discard_matrix_quantity_state(
+                    state,
+                    matrix_structure_entry_skus(base, pending[base]),
+                )
+                pending.pop(base, None)
+
+        ready: List[Dict[str, Any]] = []
+        for base, payload in candidate_by_base.items():
+            entry = pending.get(base)
+            if not isinstance(entry, dict):
+                continue
+            fingerprint = catalog_payload_fingerprint(payload)
+            if entry.get("fingerprint") != fingerprint:
+                self._discard_matrix_quantity_state(
+                    state,
+                    matrix_structure_entry_skus(base, entry),
+                )
+                pending.pop(base, None)
+                continue
+            stage = entry.get("stage")
+            if stage == "server_blocked":
+                if entry.get("last_attempt_date") == datetime.now().date().isoformat():
+                    continue
+                entry["observations"] = int(entry.get("observations") or 0) + 1
+                ready.append(payload)
+                continue
+            if stage != "candidate":
+                continue
+            entry["observations"] = int(entry.get("observations") or 0) + 1
+            if int(entry["observations"]) >= NEW_PRODUCT_STABLE_OBSERVATIONS:
+                ready.append(payload)
+        return ready
+
+    def _repair_matrix_structures(
+        self,
+        payloads: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        allowed_statuses = {
+            "repaired",
+            "already_correct",
+            "quantity_mismatch",
+            "blocked",
+            "failed",
+        }
+        results_by_base: Dict[str, Dict[str, Any]] = {
+            str(payload.get("sku") or "").strip(): {
+                "base_sku": str(payload.get("sku") or "").strip(),
+                "status": "failed",
+                "variants": [],
+            }
+            for payload in payloads
+            if str(payload.get("sku") or "").strip()
+        }
+        endpoint = f"{self.base_url}/sync/catalog/matrix-structure/repair"
+        processed = 0
+        for chunk in chunks(payloads, min(self.batch_size, 5)):
+            response = self.session.post(
+                endpoint,
+                json={"items": chunk},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            results = body.get("results") if isinstance(body, dict) else None
+            if not isinstance(results, list):
+                results = []
+            chunk_bases = {
+                str(payload.get("sku") or "").strip()
+                for payload in chunk
+                if str(payload.get("sku") or "").strip()
+            }
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                base = str(result.get("base_sku") or "").strip()
+                status = str(result.get("status") or "").strip()
+                if base in chunk_bases and status in allowed_statuses:
+                    results_by_base[base] = result
+            processed += len(chunk)
+            self.logger.info(
+                "matrix_structure_repair_progress processed=%s total=%s",
+                processed,
+                len(payloads),
+            )
+        return results_by_base
+
+    def _record_matrix_structure_repair_results(
+        self,
+        state: Dict[str, Any],
+        payloads: List[Dict[str, Any]],
+        results_by_base: Dict[str, Dict[str, Any]],
+    ) -> None:
+        pending: Dict[str, Dict[str, Any]] = state.setdefault(
+            "pending_matrix_structure_repairs",
+            {},
+        )
+        for payload in payloads:
+            base = str(payload.get("sku") or "").strip()
+            entry = pending.get(base)
+            if not base or not isinstance(entry, dict):
+                continue
+            repair_result = results_by_base.get(base) or {}
+            status = str(repair_result.get("status") or "failed")
+            expected_child_skus = matrix_variant_skus(payload)
+            expected_quantities = flatten_quantities([payload])
+            confirmed_quantities: Dict[str, int] = {}
+            confirmed_updated_at: Dict[str, str] = {}
+            if status in {"repaired", "already_correct"}:
+                for variant in repair_result.get("variants") or []:
+                    if not isinstance(variant, dict):
+                        continue
+                    sku = str(variant.get("sku") or "").strip()
+                    quantity = variant.get("quantity")
+                    if sku not in expected_child_skus or quantity is None:
+                        continue
+                    confirmed_quantities[sku] = int(quantity)
+                    updated_at = str(
+                        variant.get("inventory_level_updated_at") or ""
+                    ).strip()
+                    if updated_at:
+                        confirmed_updated_at[sku] = updated_at
+                if (
+                    set(confirmed_quantities) != expected_child_skus
+                    or confirmed_quantities
+                    != {
+                        sku: expected_quantities[sku]
+                        for sku in expected_child_skus
+                    }
+                ):
+                    status = "failed"
+                    self.logger.error(
+                        "matrix_structure_repair_unconfirmed_inventory sku=%s expected=%s returned=%s",
+                        base,
+                        len(expected_child_skus),
+                        len(confirmed_quantities),
+                    )
+            entry["result"] = status
+            entry["last_attempt_date"] = datetime.now().date().isoformat()
+            if status in {"repaired", "already_correct"}:
+                entry["stage"] = "verification"
+                entry["confirmed_quantities"] = confirmed_quantities
+                entry["confirmed_updated_at"] = confirmed_updated_at
+            elif status == "quantity_mismatch":
+                entry["stage"] = "quantity_reconciliation"
+                entry.pop("confirmed_quantities", None)
+                entry.pop("confirmed_updated_at", None)
+            elif status == "blocked":
+                entry["stage"] = "server_blocked"
+                entry.pop("confirmed_quantities", None)
+                entry.pop("confirmed_updated_at", None)
+            else:
+                entry["stage"] = "candidate"
+                entry.pop("confirmed_quantities", None)
+                entry.pop("confirmed_updated_at", None)
+            if status in {"quantity_mismatch", "blocked", "failed"}:
+                self.logger.warning(
+                    "matrix_structure_repair_skipped sku=%s status=%s",
+                    base,
+                    status,
+                )
+
+    def _update_matrix_structure_state(
+        self,
+        state: Dict[str, Any],
+        payloads: List[Dict[str, Any]],
+        *,
+        known_products: set[str],
+        snapshot_items: List[Dict[str, Any]],
+        location_id: str,
+        remote_quantities: Dict[str, int],
+    ) -> tuple[bool, set[str]]:
+        candidates = matrix_structure_payloads(
+            payloads,
+            known_products=known_products,
+        )
+        candidate_bases = {
+            str(payload.get("sku") or "").strip()
+            for payload in candidates
+        }
+        pending: Dict[str, Dict[str, Any]] = state.setdefault(
+            "pending_matrix_structure_repairs",
+            {},
+        )
+        entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
+        migration_scan = (
+            int(state.get("catalog_structure_schema_version") or 0)
+            < CATALOG_STRUCTURE_SCHEMA_VERSION
+        )
+        for base in list(pending):
+            if base not in candidate_bases:
+                self._discard_matrix_quantity_state(
+                    state,
+                    matrix_structure_entry_skus(base, pending[base]),
+                )
+                pending.pop(base, None)
+
+        verified = 0
+        scalar_candidates = 0
+        blocked = 0
+        rebased_skus: set[str] = set()
+        for payload in candidates:
+            base = str(payload.get("sku") or "").strip()
+            fingerprint = catalog_payload_fingerprint(payload)
+            shape = matrix_snapshot_structure(
+                payload,
+                snapshot_items,
+                location_id=location_id,
+            )
+            previous = pending.get(base)
+            same_payload = (
+                isinstance(previous, dict)
+                and previous.get("fingerprint") == fingerprint
+            )
+            protected_skus = matrix_structure_related_skus(payload, snapshot_items)
+            if shape == "correct":
+                previous_stage = previous.get("stage") if same_payload else None
+                expected_child_skus = matrix_variant_skus(payload)
+                confirmed_quantities = (
+                    previous.get("confirmed_quantities")
+                    if same_payload and isinstance(previous, dict)
+                    else None
+                )
+                payload_quantities = flatten_quantities([payload])
+                confirmed_exact = (
+                    isinstance(confirmed_quantities, dict)
+                    and set(confirmed_quantities) == expected_child_skus
+                    and all(
+                        isinstance(quantity, int)
+                        for quantity in confirmed_quantities.values()
+                    )
+                    and confirmed_quantities
+                    == {
+                        sku: payload_quantities[sku]
+                        for sku in expected_child_skus
+                    }
+                )
+                if previous_stage in ACTIVE_MATRIX_STRUCTURE_STAGES and not confirmed_exact:
+                    for sku in expected_child_skus:
+                        remote_quantities.pop(sku, None)
+                    continue
+                if previous_stage == "quantity_reconciliation":
+                    self._discard_legacy_matrix_pending_actions(
+                        state,
+                        payload,
+                        remote_quantities=remote_quantities,
+                    )
+                    self._discard_matrix_quantity_state(state, {base})
+                    pending.pop(base, None)
+                    verified += 1
+                    continue
+                if previous_stage == "server_blocked":
+                    for sku in expected_child_skus:
+                        remote_quantities.pop(sku, None)
+                    continue
+
+                discarded_skus = {base} if migration_scan or same_payload else set()
+                if previous_stage == "verification" and confirmed_exact:
+                    discarded_skus.update(protected_skus)
+                    discarded_skus.update(matrix_structure_entry_skus(base, previous))
+                    confirmed_updated_at = previous.get("confirmed_updated_at") or {}
+                    self._discard_matrix_quantity_state(state, discarded_skus)
+                    for sku in expected_child_skus:
+                        confirmed_quantity = int(confirmed_quantities[sku])
+                        entries[sku] = {
+                            "canonical": confirmed_quantity,
+                            "pos_seen": int(
+                                payload_quantities.get(sku, confirmed_quantity)
+                            ),
+                            "shop_seen": confirmed_quantity,
+                        }
+                        updated_at = str(
+                            confirmed_updated_at.get(sku) or ""
+                        ).strip()
+                        if updated_at:
+                            entries[sku]["shop_seen_at"] = updated_at
+                    rebased_skus.update(expected_child_skus)
+                    discarded_skus = set()
+                elif migration_scan or same_payload:
+                    self._discard_legacy_matrix_pending_actions(
+                        state,
+                        payload,
+                        remote_quantities=remote_quantities,
+                    )
+                if discarded_skus:
+                    self._discard_matrix_quantity_state(
+                        state,
+                        discarded_skus,
+                    )
+                pending.pop(base, None)
+                verified += 1
+                continue
+            if shape == "scalar":
+                scalar_candidates += 1
+                if same_payload and previous.get("stage") in {
+                    "candidate",
+                    "verification",
+                    "server_blocked",
+                }:
+                    continue
+                pending[base] = {
+                    "fingerprint": fingerprint,
+                    "observations": 1,
+                    "stage": "candidate",
+                    "expected_child_skus": sorted(
+                        matrix_variant_skus(payload),
+                        key=str.casefold,
+                    ),
+                    "protected_skus": sorted(
+                        protected_skus,
+                        key=str.casefold,
+                    ),
+                }
+                continue
+            blocked += 1
+            unsafe_child_skus = matrix_variant_skus(payload)
+            for sku in unsafe_child_skus:
+                remote_quantities.pop(sku, None)
+            state["blocked_inventory_skus"] = sorted(
+                set(state.get("blocked_inventory_skus") or []) | unsafe_child_skus,
+                key=str.casefold,
+            )
+            if same_payload and previous.get("stage") in {
+                "verification",
+                "quantity_reconciliation",
+            }:
+                previous["protected_skus"] = sorted(
+                    matrix_structure_entry_skus(base, previous) | protected_skus,
+                    key=str.casefold,
+                )
+                continue
+            pending[base] = {
+                "fingerprint": fingerprint,
+                "observations": (
+                    int(previous.get("observations") or 0)
+                    if same_payload
+                    else 1
+                ),
+                "stage": "snapshot_blocked",
+                "expected_child_skus": sorted(
+                    matrix_variant_skus(payload),
+                    key=str.casefold,
+                ),
+                "protected_skus": sorted(
+                    protected_skus,
+                    key=str.casefold,
+                ),
+            }
+
+        self.logger.info(
+            "matrix_structure_scan matrices=%s verified=%s scalar_candidates=%s blocked=%s pending=%s",
+            len(candidates),
+            verified,
+            scalar_candidates,
+            blocked,
+            len(pending),
+        )
+        return not has_active_matrix_structure_repairs(state), rebased_skus
+
+    def _discard_matrix_quantity_state(
+        self,
+        state: Dict[str, Any],
+        skus: set[str],
+    ) -> None:
+        entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
+        discarded = [sku for sku in skus if entries.pop(sku, None) is not None]
+        if discarded:
+            self.logger.warning(
+                "matrix_structure_legacy_quantity_state_discarded skus=%s",
+                ",".join(sorted(discarded, key=str.casefold)),
+            )
+
+    def _discard_legacy_matrix_pending_actions(
+        self,
+        state: Dict[str, Any],
+        payload: Dict[str, Any],
+        *,
+        remote_quantities: Dict[str, int],
+    ) -> None:
+        entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
+        local_quantities = flatten_quantities([payload])
+        cleared: List[str] = []
+        for sku in matrix_variant_skus(payload):
+            entry = entries.get(sku)
+            if not isinstance(entry, dict):
+                continue
+            pending_shop = entry.pop("pending_shop", None)
+            pending_pos = entry.pop("pending_pos", None)
+            if isinstance(pending_shop, dict):
+                target = pending_shop.get("target_quantity")
+                if target is not None and remote_quantities.get(sku) == int(target):
+                    entry["shop_seen"] = int(target)
+            if isinstance(pending_pos, dict):
+                target = pending_pos.get("target_quantity")
+                if target is not None and local_quantities.get(sku) == int(target):
+                    entry["pos_seen"] = int(target)
+            if pending_shop is not None or pending_pos is not None:
+                cleared.append(sku)
+        if cleared:
+            self.logger.warning(
+                "matrix_structure_legacy_pending_actions_discarded skus=%s",
+                ",".join(sorted(cleared, key=str.casefold)),
+            )
 
     def _sync_pos_price_changes(self, state: Dict[str, Any]) -> None:
         current_snapshot = read_pos_price_snapshot(self.dbf_dir)
@@ -1134,13 +1870,33 @@ class Connector:
         )
         response.raise_for_status()
 
-    def _retry_pending(self, state: Dict[str, Any]) -> None:
+    def _retry_pending(
+        self,
+        state: Dict[str, Any],
+        *,
+        excluded_skus: Optional[set[str]] = None,
+    ) -> None:
         entries = state.get("quantities") or {}
-        shop_actions = [entry["pending_shop"] for entry in entries.values() if entry.get("pending_shop")]
+        excluded = excluded_skus or set()
+        shop_actions = [
+            entry["pending_shop"]
+            for sku, entry in entries.items()
+            if sku not in excluded
+            and str((entry.get("pending_shop") or {}).get("sku") or "").strip()
+            not in excluded
+            and entry.get("pending_shop")
+        ]
         if shop_actions:
             self.logger.warning("retrying_pending_shopify_adjustments count=%s", len(shop_actions))
             self._apply_shopify_adjustments(state, shop_actions)
-        pos_actions = [entry["pending_pos"] for entry in entries.values() if entry.get("pending_pos")]
+        pos_actions = [
+            entry["pending_pos"]
+            for sku, entry in entries.items()
+            if sku not in excluded
+            and str((entry.get("pending_pos") or {}).get("sku") or "").strip()
+            not in excluded
+            and entry.get("pending_pos")
+        ]
         if pos_actions and self.writeback_mode == "vfp-oledb":
             self.logger.warning("retrying_pending_pos_adjustments count=%s", len(pos_actions))
             self._apply_pos_adjustments(state, pos_actions)
@@ -1152,7 +1908,7 @@ class Connector:
     ) -> set[str]:
         endpoint = f"{self.base_url}/sync/inventory/adjustments"
         entries = state["quantities"]
-        deferred_pos_skus: set[str] = set()
+        blocked_pos_skus = {str(action["sku"]) for action in actions}
         for chunk in chunks(actions, min(self.batch_size, 250)):
             response = self.session.post(endpoint, json={"adjustments": chunk}, timeout=self.timeout)
             response.raise_for_status()
@@ -1173,31 +1929,54 @@ class Connector:
                     entry["shop_seen_at"] = inventory_updated_at
                 if quantity_after_change is None:
                     entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
-                    if entry.pop("pending_pos", None) is not None:
-                        deferred_pos_skus.add(action["sku"])
+                    entry.pop("pending_pos", None)
                     self.logger.warning(
                         "pos_adjustment_deferred_after_unconfirmed_shopify_result sku=%s",
                         action["sku"],
                     )
                 else:
-                    entry["shop_seen"] = int(quantity_after_change)
-                    entry["canonical"] = int(quantity_after_change)
+                    actual_quantity = int(quantity_after_change)
+                    entry["shop_seen"] = actual_quantity
+                    entry["canonical"] = actual_quantity
                     target_quantity = action.get("target_quantity")
                     if (
                         target_quantity is not None
-                        and int(quantity_after_change) != int(target_quantity)
+                        and actual_quantity != int(target_quantity)
                     ):
-                        if entry.pop("pending_pos", None) is not None:
-                            deferred_pos_skus.add(action["sku"])
+                        entry.pop("pending_pos", None)
+                        pos_quantity = int(entry.get("pos_seen") or 0)
+                        if (
+                            getattr(self, "writeback_mode", "disabled") == "vfp-oledb"
+                            and pos_quantity != actual_quantity
+                        ):
+                            revision = int(entry.get("revision") or 0) + 1
+                            entry["revision"] = revision
+                            entry["pending_pos"] = {
+                                "sku": action["sku"],
+                                "delta": actual_quantity - pos_quantity,
+                                "target_quantity": actual_quantity,
+                                "expected_quantity": pos_quantity,
+                                "idempotency_key": adjustment_key(
+                                    "pos",
+                                    action["sku"],
+                                    revision,
+                                    pos_quantity,
+                                    actual_quantity,
+                                    int(target_quantity),
+                                ),
+                            }
+                        blocked_pos_skus.discard(action["sku"])
                         self.logger.warning(
-                            "pos_adjustment_deferred_after_shopify_race sku=%s planned=%s actual=%s",
+                            "pos_adjustment_replanned_after_shopify_race sku=%s planned=%s actual=%s",
                             action["sku"],
                             target_quantity,
-                            quantity_after_change,
+                            actual_quantity,
                         )
+                    elif target_quantity is not None:
+                        blocked_pos_skus.discard(action["sku"])
                 entry.pop("pending_shop", None)
             save_state(self.state_path, state)
-        return deferred_pos_skus
+        return blocked_pos_skus
 
     def _apply_pos_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
         if not self.writer_script.exists():
@@ -1622,15 +2401,7 @@ def stable_catalog_payloads(
         sku = str(payload.get("sku") or "").strip()
         if not sku:
             continue
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                payload,
-                default=str,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        fingerprint = catalog_payload_fingerprint(payload)
         previous = pending_products.get(sku) or {}
         observations = (
             int(previous.get("observations") or 0) + 1
@@ -1644,6 +2415,18 @@ def stable_catalog_payloads(
         if observations >= max(1, int(required_observations)):
             ready.append(payload)
     return ready
+
+
+def catalog_payload_fingerprint(payload: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            default=str,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def negative_catalog_money_field(payload: Dict[str, Any]) -> Optional[str]:
@@ -1751,6 +2534,87 @@ def matrix_length_repair_candidates(
     return candidates
 
 
+def matrix_structure_payloads(
+    payloads: Iterable[Dict[str, Any]],
+    *,
+    known_products: set[str],
+) -> List[Dict[str, Any]]:
+    return [
+        payload
+        for payload in payloads
+        if str(payload.get("sku") or "").strip() in known_products
+        and bool(payload.get("variants"))
+    ]
+
+
+def matrix_variant_skus(payload: Dict[str, Any]) -> set[str]:
+    return {
+        str(variant.get("sku") or "").strip()
+        for variant in payload.get("variants") or []
+        if isinstance(variant, dict) and str(variant.get("sku") or "").strip()
+    }
+
+
+def matrix_structure_related_skus(
+    payload: Dict[str, Any],
+    snapshot_items: Iterable[Dict[str, Any]],
+) -> set[str]:
+    base = str(payload.get("sku") or "").strip()
+    related = {base, *matrix_variant_skus(payload)}
+    for item in snapshot_items:
+        sku = str(item.get("sku") or "").strip()
+        if sku and (sku == base or base_sku(sku) == base):
+            related.add(sku)
+    return {sku for sku in related if sku}
+
+
+def matrix_snapshot_structure(
+    payload: Dict[str, Any],
+    snapshot_items: Iterable[Dict[str, Any]],
+    *,
+    location_id: str,
+) -> str:
+    base = str(payload.get("sku") or "").strip()
+    expected_children = matrix_variant_skus(payload)
+    if not base or not expected_children or base in expected_children:
+        return "blocked"
+
+    rows_by_sku: Dict[str, List[Dict[str, Any]]] = {}
+    for item in snapshot_items:
+        sku = str(item.get("sku") or "").strip()
+        if sku:
+            rows_by_sku.setdefault(sku, []).append(item)
+
+    def usable(sku: str) -> bool:
+        rows = rows_by_sku.get(sku) or []
+        if len(rows) != 1:
+            return False
+        item = rows[0]
+        return (
+            str(item.get("location_id") or "") == location_id
+            and int(item.get("duplicate_sku_count") or 0) == 0
+            and bool(item.get("available_at_location"))
+            and item.get("quantity") is not None
+        )
+
+    observed_related_children = {
+        sku
+        for sku in rows_by_sku
+        if sku != base
+        and (sku in expected_children or base_sku(sku) == base)
+    }
+    base_present = base in rows_by_sku
+    if (
+        not base_present
+        and observed_related_children == expected_children
+        and all(usable(sku) for sku in expected_children)
+    ):
+        return "correct"
+    if base_present and usable(base) and not observed_related_children:
+        return "scalar"
+    return "blocked"
+
+
 def chunks(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     for start in range(0, len(items), max(1, size)):
         yield items[start : start + max(1, size)]
@@ -1768,6 +2632,9 @@ def load_state(path: Path) -> Dict[str, Any]:
                 data.setdefault("event_cursors", {})
                 data.setdefault("sku_bases", {})
                 data.setdefault("pending_catalog_products", {})
+                data.setdefault("pending_matrix_structure_repairs", {})
+                data.setdefault("matrix_structure_probe_skus", [])
+                data.setdefault("matrix_structure_probe_not_before", {})
                 data.setdefault("blocked_inventory_skus", [])
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
@@ -1780,6 +2647,9 @@ def load_state(path: Path) -> Dict[str, Any]:
         "event_cursors": {},
         "sku_bases": {},
         "pending_catalog_products": {},
+        "pending_matrix_structure_repairs": {},
+        "matrix_structure_probe_skus": [],
+        "matrix_structure_probe_not_before": {},
         "blocked_inventory_skus": [],
     }
 

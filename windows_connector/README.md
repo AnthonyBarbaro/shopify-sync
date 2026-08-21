@@ -24,11 +24,21 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
    the exact Shopify variant price. A base matrix SKU updates all of its matrix variants.
 5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation
    against Shopify's actual inventory snapshot at the pinned inventory location. The first run after
-   this reconciliation upgrade also performs the pass immediately, even if today's nightly pass was
-   already recorded.
+   an inventory or catalog-structure reconciliation upgrade also performs the pass immediately, even
+   if today's nightly pass was already recorded.
    If the computer was off at midnight, the first later cycle that day performs the missed pass.
    This full scan also catches new alphanumeric or out-of-sequence SKUs that the numeric fast path
    cannot identify, and repairs older SKUs that are missing a local baseline.
+   It also detects a legacy copied matrix product that was uploaded too early as one zero-stock base
+   variant. The connector waits for the complete POS matrix payload to be identical on two full scans,
+   then asks the backend to replace only that verified default variant with the POS variants. The
+   backend preserves all product-level merchandising and refuses nonzero inventory in any state at any Shopify
+   location, partial, duplicate, unmanaged, or otherwise ambiguous structures. During the existing
+   every-cycle `Item.dbf` scan, a known `M`
+   product with no cached child mapping schedules the same guarded probe immediately; if its matrix
+   is still incomplete, another probe is allowed after a 15-minute cooldown. A verified repair uses
+   Shopify's confirmed mutation quantities as the new baseline, so a stale post-repair snapshot
+   cannot write zero back to either system.
 6. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
    changed quantities. The full location-specific Shopify inventory snapshot is read only during the
    upgrade/nightly reconciliation.

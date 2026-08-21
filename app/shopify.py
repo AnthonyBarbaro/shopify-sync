@@ -19,6 +19,18 @@ from app.utils import (
 )
 
 
+INVENTORY_QUANTITY_NAMES = (
+    "available",
+    "committed",
+    "damaged",
+    "incoming",
+    "on_hand",
+    "quality_control",
+    "reserved",
+    "safety_stock",
+)
+
+
 class ShopifyClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -237,6 +249,96 @@ class ShopifyClient:
         item = payload["data"].get("inventoryItem")
         sku = (item or {}).get("sku")
         return sku.strip() if isinstance(sku, str) and sku.strip() else None
+
+    def get_inventory_item_levels(
+        self,
+        shop_domain: str,
+        access_token: str,
+        inventory_item_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Load every inventory level for one inventory item."""
+        query = """
+        query InventoryItemLevels($id: ID!, $first: Int!, $after: String) {
+          inventoryItem(id: $id) {
+            inventoryLevels(first: $first, after: $after) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                updatedAt
+                location {
+                  id
+                  name
+                }
+                quantities(names: [
+                  "available",
+                  "committed",
+                  "damaged",
+                  "incoming",
+                  "on_hand",
+                  "quality_control",
+                  "reserved",
+                  "safety_stock"
+                ]) {
+                  name
+                  quantity
+                }
+              }
+            }
+          }
+        }
+        """
+        normalized_inventory_item_id = normalize_gid(
+            "InventoryItem",
+            inventory_item_id,
+        )
+        levels: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        while True:
+            payload = self.graphql(
+                shop_domain,
+                access_token,
+                query,
+                {
+                    "id": normalized_inventory_item_id,
+                    "first": 250,
+                    "after": cursor,
+                },
+                operation_name="InventoryItemLevels",
+            )
+            inventory_item = payload["data"].get("inventoryItem")
+            connection = (inventory_item or {}).get("inventoryLevels")
+            page_info = (connection or {}).get("pageInfo")
+            nodes = (connection or {}).get("nodes")
+            has_next_page = (page_info or {}).get("hasNextPage")
+            if (
+                not isinstance(connection, dict)
+                or not isinstance(page_info, dict)
+                or not isinstance(nodes, list)
+                or not all(isinstance(node, dict) for node in nodes)
+                or not isinstance(has_next_page, bool)
+            ):
+                raise ShopifyAPIError(
+                    "Shopify did not return a verifiable inventory-level page.",
+                    {"inventory_item_id": normalized_inventory_item_id},
+                )
+            levels.extend(nodes)
+            if not has_next_page:
+                return levels
+
+            end_cursor = page_info.get("endCursor")
+            if (
+                not isinstance(end_cursor, str)
+                or not end_cursor.strip()
+                or end_cursor == cursor
+            ):
+                raise ShopifyAPIError(
+                    "Shopify returned an incomplete inventory-level page.",
+                    {"inventory_item_id": normalized_inventory_item_id},
+                )
+            cursor = end_cursor
 
     def ensure_inventory_webhook(
         self,
@@ -738,6 +840,9 @@ class ShopifyClient:
               ) {
                 value
               }
+              managedSku: metafield(namespace: "pos", key: "sku") {
+                value
+              }
               vendor
               productType
               updatedAt
@@ -760,11 +865,15 @@ class ShopifyClient:
                 }
               }
               variants(first: 100) {
+                pageInfo {
+                  hasNextPage
+                }
                 nodes {
                   id
                   sku
                   barcode
                   price
+                  compareAtPrice
                   inventoryItem {
                     id
                     unitCost {
@@ -772,6 +881,7 @@ class ShopifyClient:
                     }
                     inventoryLevels(first: 10) {
                       nodes {
+                        updatedAt
                         location {
                           id
                           name
@@ -955,6 +1065,7 @@ class ShopifyClient:
                     }
                     inventoryLevels(first: 25) {
                       nodes {
+                        updatedAt
                         location {
                           id
                           name

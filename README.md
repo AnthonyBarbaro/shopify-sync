@@ -77,9 +77,20 @@ a price changes only when `pricechg.dbf` records a newer POS price. Each success
 also saves its SKU/variant quantity baseline before the connector marks that product complete. New
 numeric products must produce the same complete catalog payload on two consecutive scans before
 they are uploaded, which avoids reading a product while a POS copy operation is still being edited.
+If an older connector already uploaded a copied matrix product during its temporary zero-stock,
+single-variant stage, the upgraded connector detects that exact legacy shape and requires two stable
+complete scans before rebuilding its variants. The repair is limited to a POS-managed product with
+one default/base variant, zero inventory in every state at every Shopify location, and no conflicting
+child SKUs; ambiguous or partially edited products are blocked for review. Shopify titles,
+descriptions, tags, images, vendor, type, and status are omitted
+from the structural mutation. Merchant-managed status remains unchanged; a product carrying the
+sync's own zero-stock auto-archive marker is restored to Draft after positive child inventory is
+confirmed. The connector also probes a known product when its POS type becomes a matrix but its
+cached Shopify mapping still has no children, so future copy-then-finish transitions do not wait for
+the nightly scan. Incomplete matrix definitions are probed again after a 15-minute cooldown.
 
-The first connector run after this inventory-reconciliation upgrade, and one run after local
-midnight each day, compares POS quantities with a lean Shopify inventory snapshot at one location.
+The first connector run after an inventory or catalog-structure reconciliation upgrade, and one run
+after local midnight each day, compares POS quantities with a lean Shopify inventory snapshot at one location.
 This repairs SKUs that predate a local baseline or whose webhook was missed during downtime. Set
 `SHOPIFY_LOCATION_ID` when the store has more than one inventory location; otherwise Shopify's
 primary location is pinned on the first verified snapshot. Duplicate Shopify SKUs and items that
@@ -181,6 +192,7 @@ POST /sync/inventory/adjustments
 GET /sync/inventory/changes
 POST /sync/inventory/changes/ack
 POST /sync/catalog/reconcile
+POST /sync/catalog/matrix-structure/repair
 ```
 
 Catalog reconciliation accepts the complete source SKU list and previews Shopify products whose

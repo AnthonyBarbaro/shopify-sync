@@ -20,7 +20,12 @@ from app.models import (
     SyncResult,
     VariantMapping,
 )
-from app.shopify import ShopifyClient, format_price, normalize_gid
+from app.shopify import (
+    INVENTORY_QUANTITY_NAMES,
+    ShopifyClient,
+    format_price,
+    normalize_gid,
+)
 from app.state import SyncActivityStore
 from app.utils import (
     AppError,
@@ -981,6 +986,336 @@ class InventorySyncService:
             },
         )
 
+    def repair_matrix_structure(
+        self,
+        payload: ProductSyncRequest,
+        shop: ShopRecord,
+    ) -> Dict[str, Any]:
+        """Convert one connector-owned default variant into its stable POS matrix."""
+        normalized = self._normalize_payload(payload)
+        base_sku = normalized.sku or ""
+        expected_skus = sorted(
+            (variant.sku for variant in normalized.variants),
+            key=str.casefold,
+        )
+
+        def result(
+            status: str,
+            message: str,
+            *,
+            product_id: Optional[str] = None,
+            variants: Optional[List[Dict[str, Any]]] = None,
+        ) -> Dict[str, Any]:
+            return {
+                "base_sku": base_sku,
+                "status": status,
+                "message": message,
+                "product_id": product_id,
+                "variants": variants or [],
+            }
+
+        if not base_sku:
+            return result("blocked", "Matrix structure repair requires a base SKU.")
+        if not expected_skus:
+            return result("blocked", "Matrix structure repair requires POS variants.")
+        if any(variant.quantity is None for variant in normalized.variants):
+            return result(
+                "blocked",
+                "Every matrix variant needs a confirmed POS quantity before repair.",
+            )
+        if len(expected_skus) > 100:
+            return result(
+                "blocked",
+                "Matrix structure repair is limited to products with 100 variants.",
+            )
+        if base_sku in expected_skus:
+            return result(
+                "blocked",
+                "A matrix child SKU cannot be the same as its base SKU.",
+            )
+
+        base_mapping: Optional[VariantMapping] = None
+        try:
+            base_mapping = self.shopify_client.get_variant_by_sku(
+                shop.shop_domain,
+                shop.access_token,
+                base_sku,
+                force_refresh=True,
+            )
+        except SyncProcessingError as exc:
+            if exc.code != "sku_not_found":
+                raise
+
+        child_mappings: Dict[str, VariantMapping] = {}
+        missing_child_skus: List[str] = []
+        for child_sku in expected_skus:
+            try:
+                child_mappings[child_sku] = self.shopify_client.get_variant_by_sku(
+                    shop.shop_domain,
+                    shop.access_token,
+                    child_sku,
+                    force_refresh=True,
+                )
+            except SyncProcessingError as exc:
+                if exc.code != "sku_not_found":
+                    raise
+                missing_child_skus.append(child_sku)
+
+        if base_mapping is None:
+            if missing_child_skus:
+                return result(
+                    "blocked",
+                    "Shopify has neither the exact base variant nor the complete expected matrix.",
+                )
+            product_ids = {mapping.product_id for mapping in child_mappings.values()}
+            if len(product_ids) != 1:
+                return result(
+                    "blocked",
+                    "Expected matrix SKUs resolve to more than one Shopify product.",
+                )
+            product_id = product_ids.pop()
+            product = self.shopify_client.get_product_by_id(
+                shop.shop_domain,
+                shop.access_token,
+                product_id,
+            )
+            blocked_message = self._matrix_structure_product_block(
+                product,
+                base_sku=base_sku,
+            )
+            if blocked_message:
+                return result("blocked", blocked_message, product_id=product_id)
+            existing_skus = self._matrix_product_skus(product)
+            if existing_skus != expected_skus:
+                return result(
+                    "blocked",
+                    "Shopify's current variant set is not the exact expected POS matrix.",
+                    product_id=product_id,
+                )
+            reference_mapping = next(iter(child_mappings.values()))
+            location_id = self._resolve_location_id(
+                shop,
+                reference_mapping,
+            )
+            inventory_rows = self._matrix_inventory_rows(product, location_id=location_id)
+            if (
+                len(inventory_rows) != len(expected_skus)
+                or any(row["quantity"] is None for row in inventory_rows)
+            ):
+                raise ShopifyAPIError(
+                    "Shopify did not return inventory mappings for every matrix variant.",
+                    {
+                        "base_sku": base_sku,
+                        "product_id": product_id,
+                        "expected_count": len(expected_skus),
+                        "returned_count": len(inventory_rows),
+                    },
+                )
+            expected_quantities = {
+                variant.sku: int(variant.quantity)
+                for variant in normalized.variants
+                if variant.quantity is not None
+            }
+            returned_quantities = {
+                row["sku"]: row["quantity"]
+                for row in inventory_rows
+            }
+            if returned_quantities != expected_quantities:
+                return result(
+                    "quantity_mismatch",
+                    "Shopify has the expected matrix structure, but its quantities do not match the stable POS payload.",
+                    product_id=product_id,
+                    variants=inventory_rows,
+                )
+            self._restore_auto_archived_product(
+                shop=shop,
+                mapping=reference_mapping,
+                resulting_quantity=_total_inventory_quantity(normalized),
+            )
+            return result(
+                "already_correct",
+                "Shopify already has the complete expected POS matrix.",
+                product_id=product_id,
+                variants=inventory_rows,
+            )
+
+        product_id = base_mapping.product_id
+        product = self.shopify_client.get_product_by_id(
+            shop.shop_domain,
+            shop.access_token,
+            product_id,
+        )
+        blocked_message = self._matrix_structure_product_block(
+            product,
+            base_sku=base_sku,
+        )
+        if blocked_message:
+            return result("blocked", blocked_message, product_id=product_id)
+        if child_mappings:
+            return result(
+                "blocked",
+                "One or more expected matrix SKUs already exist in Shopify.",
+                product_id=product_id,
+            )
+
+        existing_variants = ((product or {}).get("variants") or {}).get("nodes") or []
+        existing_variant = existing_variants[0] if len(existing_variants) == 1 else None
+        if (
+            existing_variant is None
+            or str(existing_variant.get("sku") or "").strip() != base_sku
+            or str(existing_variant.get("id") or "") != base_mapping.variant_id
+        ):
+            return result(
+                "blocked",
+                "Automatic repair requires exactly one Shopify variant with the base SKU.",
+                product_id=product_id,
+            )
+        all_level_nodes = self.shopify_client.get_inventory_item_levels(
+            shop.shop_domain,
+            shop.access_token,
+            base_mapping.inventory_item_id,
+        )
+        if not all_level_nodes:
+            return result(
+                "blocked",
+                "Shopify did not return any inventory locations for the base variant.",
+                product_id=product_id,
+            )
+        seen_location_ids: set[str] = set()
+        for level in all_level_nodes:
+            level_location_id = str(
+                ((level.get("location") or {}).get("id") or "")
+            ).strip()
+            quantities = level.get("quantities")
+            quantity_by_name: Dict[str, int] = {}
+            quantities_valid = isinstance(quantities, list)
+            if isinstance(quantities, list):
+                for quantity in quantities:
+                    if not isinstance(quantity, dict):
+                        quantities_valid = False
+                        continue
+                    name = str(quantity.get("name") or "").strip()
+                    value = quantity.get("quantity")
+                    if (
+                        name not in INVENTORY_QUANTITY_NAMES
+                        or name in quantity_by_name
+                        or not isinstance(value, int)
+                    ):
+                        quantities_valid = False
+                        continue
+                    quantity_by_name[name] = value
+            if (
+                not level_location_id
+                or level_location_id in seen_location_ids
+                or not quantities_valid
+                or set(quantity_by_name) != set(INVENTORY_QUANTITY_NAMES)
+                or any(value != 0 for value in quantity_by_name.values())
+            ):
+                return result(
+                    "blocked",
+                    "Automatic repair requires every inventory state to be zero at every Shopify location.",
+                    product_id=product_id,
+                )
+            seen_location_ids.add(level_location_id)
+
+        location_id = self._resolve_location_id(shop, base_mapping)
+        mapping_quantity = self._get_inventory_quantity(base_mapping, location_id)
+        if mapping_quantity is None:
+            return result(
+                "blocked",
+                "The base variant inventory is unavailable at the configured Shopify location.",
+                product_id=product_id,
+            )
+        if mapping_quantity != 0:
+            return result(
+                "blocked",
+                "Automatic repair is limited to a zero-stock base variant.",
+                product_id=product_id,
+            )
+
+        base_inventory_rows = self._matrix_inventory_rows(
+            product,
+            location_id=location_id,
+        )
+        if (
+            len(base_inventory_rows) != 1
+            or base_inventory_rows[0]["sku"] != base_sku
+            or base_inventory_rows[0]["quantity"] != 0
+        ):
+            return result(
+                "blocked",
+                "The base variant is no longer verifiably zero at the configured Shopify location.",
+                product_id=product_id,
+            )
+        product_set_input = self._build_matrix_structure_repair_input(
+            normalized,
+            location_id=location_id,
+            existing_product=product,
+        )
+        repaired_product = self.shopify_client.product_set(
+            shop.shop_domain,
+            shop.access_token,
+            input_data=product_set_input,
+            identifier={"id": normalize_gid("Product", product_id)},
+        )
+        returned_product_id = str(repaired_product.get("id") or "")
+        returned_skus = self._matrix_product_skus(repaired_product)
+        if (
+            returned_product_id != normalize_gid("Product", product_id)
+            or returned_skus != expected_skus
+        ):
+            raise ShopifyAPIError(
+                "Shopify did not return the exact repaired POS matrix.",
+                {
+                    "base_sku": base_sku,
+                    "product_id": product_id,
+                    "returned_product_id": returned_product_id,
+                    "expected_skus": expected_skus,
+                    "returned_skus": returned_skus,
+                },
+            )
+        inventory_rows = self._matrix_inventory_rows(
+            repaired_product,
+            location_id=location_id,
+        )
+        expected_quantities = {
+            variant.sku: int(variant.quantity)
+            for variant in normalized.variants
+            if variant.quantity is not None
+        }
+        returned_quantities = {
+            row["sku"]: row["quantity"]
+            for row in inventory_rows
+        }
+        if (
+            len(inventory_rows) != len(expected_skus)
+            or returned_quantities != expected_quantities
+        ):
+            raise ShopifyAPIError(
+                "Shopify did not confirm the requested inventory for every repaired matrix variant.",
+                {
+                    "base_sku": base_sku,
+                    "product_id": product_id,
+                    "expected_quantities": expected_quantities,
+                    "returned_quantities": returned_quantities,
+                },
+            )
+        repaired_mapping = self._mapping_from_product(
+            repaired_product,
+            expected_skus[0],
+        )
+        self._restore_auto_archived_product(
+            shop=shop,
+            mapping=repaired_mapping,
+            resulting_quantity=_total_inventory_quantity(normalized),
+        )
+        return result(
+            "repaired",
+            f"Converted the base variant into {len(expected_skus)} POS matrix variants.",
+            product_id=product_id,
+            variants=inventory_rows,
+        )
+
     def repair_matrix_length_option(
         self,
         *,
@@ -1121,6 +1456,122 @@ class InventorySyncService:
                 )
 
         return None
+
+    @staticmethod
+    def _matrix_structure_product_block(
+        product: Optional[Dict[str, Any]],
+        *,
+        base_sku: str,
+    ) -> Optional[str]:
+        if product is None:
+            return "The Shopify product for the matrix repair could not be loaded."
+        managed_sku = str(
+            ((product.get("managedSku") or {}).get("value") or "")
+        ).strip()
+        if managed_sku != base_sku:
+            return "Automatic repair is limited to products managed by this exact POS base SKU."
+        variants_connection = product.get("variants")
+        if not isinstance(variants_connection, dict):
+            return "Shopify did not return a verifiable variant connection."
+        page_info = variants_connection.get("pageInfo")
+        if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not False:
+            return "Shopify's variant list is truncated and cannot be repaired automatically."
+        if not isinstance(variants_connection.get("nodes"), list):
+            return "Shopify did not return a verifiable variant list."
+        return None
+
+    @staticmethod
+    def _matrix_product_skus(product: Optional[Dict[str, Any]]) -> List[str]:
+        nodes = (((product or {}).get("variants") or {}).get("nodes") or [])
+        skus = [str(variant.get("sku") or "").strip() for variant in nodes]
+        if not skus or any(not sku for sku in skus) or len(set(skus)) != len(skus):
+            return []
+        return sorted(skus, key=str.casefold)
+
+    @staticmethod
+    def _matrix_inventory_rows(
+        product: Dict[str, Any],
+        *,
+        location_id: str,
+    ) -> List[Dict[str, Any]]:
+        normalized_location_id = normalize_gid("Location", location_id)
+        rows: List[Dict[str, Any]] = []
+        variants = ((product.get("variants") or {}).get("nodes") or [])
+        for variant in variants:
+            sku = str(variant.get("sku") or "").strip()
+            inventory_item = variant.get("inventoryItem") or {}
+            inventory_item_id = str(inventory_item.get("id") or "").strip()
+            if not sku or not inventory_item_id:
+                continue
+            quantity = None
+            inventory_level_updated_at = None
+            levels = ((inventory_item.get("inventoryLevels") or {}).get("nodes") or [])
+            for level in levels:
+                level_location_id = str(((level.get("location") or {}).get("id") or "")).strip()
+                if not level_location_id:
+                    continue
+                if normalize_gid("Location", level_location_id) != normalized_location_id:
+                    continue
+                quantity = next(
+                    (
+                        int(item["quantity"])
+                        for item in level.get("quantities") or []
+                        if item.get("name") == "available" and item.get("quantity") is not None
+                    ),
+                    None,
+                )
+                inventory_level_updated_at = str(level.get("updatedAt") or "").strip() or None
+                break
+            rows.append(
+                {
+                    "sku": sku,
+                    "inventory_item_id": normalize_gid("InventoryItem", inventory_item_id),
+                    "location_id": normalized_location_id,
+                    "quantity": quantity,
+                    "inventory_level_updated_at": inventory_level_updated_at,
+                }
+            )
+        return rows
+
+    def _build_matrix_structure_repair_input(
+        self,
+        payload: ProductSyncRequest,
+        *,
+        location_id: str,
+        existing_product: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        product_set_input = self._build_matrix_product_set_input(
+            payload,
+            location_id=location_id,
+            media_inputs=[],
+            existing_product=existing_product,
+        )
+        existing_variants = ((existing_product.get("variants") or {}).get("nodes") or [])
+        default_variant = existing_variants[0]
+        preserved_price = _safe_float(default_variant.get("price"))
+        preserved_compare_at_price = _safe_float(default_variant.get("compareAtPrice"))
+        preserved_cost = _extract_unit_cost(default_variant.get("inventoryItem") or {})
+
+        for variant_input in product_set_input["variants"]:
+            if preserved_price is None:
+                variant_input.pop("price", None)
+            else:
+                variant_input["price"] = float(format_price(preserved_price))
+            if preserved_compare_at_price is None:
+                variant_input.pop("compareAtPrice", None)
+            else:
+                variant_input["compareAtPrice"] = float(
+                    format_price(preserved_compare_at_price)
+                )
+            inventory_item = variant_input["inventoryItem"]
+            if preserved_cost is None:
+                inventory_item.pop("cost", None)
+            else:
+                inventory_item["cost"] = float(format_price(preserved_cost))
+        return {
+            "productOptions": product_set_input["productOptions"],
+            "variants": product_set_input["variants"],
+        }
 
     def _build_matrix_product_set_input(
         self,
@@ -1676,7 +2127,7 @@ class InventorySyncService:
         )
 
     def _resolve_location_id(self, shop: ShopRecord, mapping: VariantMapping) -> str:
-        if self.settings.shopify_location_id:
+        if self.settings is not None and self.settings.shopify_location_id:
             return normalize_gid("Location", self.settings.shopify_location_id)
         return self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
 

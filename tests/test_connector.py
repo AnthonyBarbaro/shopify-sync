@@ -30,6 +30,8 @@ from windows_connector.order_dbf import (
     write_order_dbfs,
 )
 from windows_connector.connector import (
+    CATALOG_STRUCTURE_SCHEMA_VERSION,
+    MATRIX_OPTION_SCHEMA_VERSION,
     Connector,
     adjustment_key,
     base_sku,
@@ -306,6 +308,175 @@ class CatalogUploadBaselineTests(unittest.TestCase):
             self.assertIn('"ZERO":{"canonical":0', persisted)
 
 
+class MatrixStructureRepairClientTests(unittest.TestCase):
+    def test_posts_full_payloads_to_structure_endpoint_in_5_item_chunks(self):
+        navy = FullInventoryReconciliationTests._navy_matrix_payload()
+        payloads = []
+        for index in range(26):
+            payload = json.loads(json.dumps(navy))
+            payload["sku"] = "22392" if index == 0 else f"MATRIX-{index}"
+            for variant_index, variant in enumerate(payload["variants"], start=1):
+                variant["sku"] = f"{payload['sku']}. 1 {variant_index}"
+                variant["barcode"] = variant["sku"]
+            payloads.append(payload)
+
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.batch_size = 100
+        connector.timeout = 30
+        connector.logger = mock.Mock()
+        connector.session = mock.Mock()
+        exceptional_statuses = {
+            "22392": "repaired",
+            "MATRIX-24": "blocked",
+            "MATRIX-25": "failed",
+        }
+
+        def response_for_chunk(_endpoint, *, json, timeout):
+            self.assertEqual(timeout, 30)
+            response = mock.Mock()
+            response.json.return_value = {
+                "results": [
+                    {
+                        "base_sku": item["sku"],
+                        "status": exceptional_statuses.get(
+                            item["sku"],
+                            "already_correct",
+                        ),
+                    }
+                    for item in json["items"]
+                ]
+            }
+            return response
+
+        connector.session.post.side_effect = response_for_chunk
+
+        statuses = connector._repair_matrix_structures(payloads)
+
+        self.assertEqual(connector.session.post.call_count, 6)
+        calls = connector.session.post.call_args_list
+        first_call = calls[0]
+        self.assertEqual(
+            first_call.args[0],
+            "https://sync.example/sync/catalog/matrix-structure/repair",
+        )
+        self.assertTrue(
+            all(len(call.kwargs["json"]["items"]) == 5 for call in calls[:-1])
+        )
+        self.assertEqual(len(calls[-1].kwargs["json"]["items"]), 1)
+        self.assertEqual(first_call.kwargs["json"]["items"][0], navy)
+        self.assertEqual(statuses["22392"]["status"], "repaired")
+        self.assertEqual(statuses["MATRIX-24"]["status"], "blocked")
+        self.assertEqual(statuses["MATRIX-25"]["status"], "failed")
+
+    def test_pending_retries_exclude_protected_matrix_skus(self):
+        connector = Connector.__new__(Connector)
+        connector.logger = mock.Mock()
+        connector.writeback_mode = "vfp-oledb"
+        connector._apply_shopify_adjustments = mock.Mock(return_value=set())
+        connector._apply_pos_adjustments = mock.Mock()
+        protected_shop = {"sku": "22392. 1 1", "delta": 1}
+        protected_pos = {"sku": "22392", "delta": -6}
+        unrelated_shop = {"sku": "OTHER", "delta": 2}
+        unrelated_pos = {"sku": "SECOND", "delta": -1}
+        state = {
+            "quantities": {
+                "22392. 1 1": {"pending_shop": protected_shop},
+                "22392": {"pending_pos": protected_pos},
+                "OTHER": {"pending_shop": unrelated_shop},
+                "SECOND": {"pending_pos": unrelated_pos},
+            }
+        }
+
+        connector._retry_pending(
+            state,
+            excluded_skus={"22392", "22392. 1 1"},
+        )
+
+        connector._apply_shopify_adjustments.assert_called_once_with(
+            state,
+            [unrelated_shop],
+        )
+        connector._apply_pos_adjustments.assert_called_once_with(
+            state,
+            [unrelated_pos],
+        )
+
+    def test_successful_structure_response_must_confirm_the_pos_quantities(self):
+        payload = FullInventoryReconciliationTests._navy_matrix_payload()
+        connector = Connector.__new__(Connector)
+        connector.logger = mock.Mock()
+        state = {
+            "pending_matrix_structure_repairs": {
+                "22392": {
+                    "fingerprint": "stable",
+                    "observations": 2,
+                    "stage": "candidate",
+                }
+            }
+        }
+        wrong_result = FullInventoryReconciliationTests._structure_result(
+            payload,
+            quantities={variant["sku"]: 0 for variant in payload["variants"]},
+        )
+
+        connector._record_matrix_structure_repair_results(
+            state,
+            [payload],
+            {"22392": wrong_result},
+        )
+
+        entry = state["pending_matrix_structure_repairs"]["22392"]
+        self.assertEqual(entry["result"], "failed")
+        self.assertEqual(entry["stage"], "candidate")
+        self.assertNotIn("confirmed_quantities", entry)
+
+    def test_known_matrix_type_without_cached_children_schedules_a_structure_probe(self):
+        connector = Connector.__new__(Connector)
+        connector.dbf_dir = Path("unused-pos-data")
+        connector.logger = mock.Mock()
+        state = {
+            "sku_bases": {"22392": "22392"},
+            "pending_catalog_products": {},
+            "matrix_structure_probe_not_before": {},
+        }
+        module = sys.modules["windows_connector.connector"].dbf_pos_sync
+
+        with mock.patch.object(
+            module,
+            "find_dbf_file",
+            return_value=Path("unused-pos-data/Item.dbf"),
+        ), mock.patch.object(
+            module,
+            "iter_dbf_rows",
+            return_value=iter([{"SKU": "22392", "TYPE": "M"}]),
+        ):
+            new_skus = connector._collect_new_numeric_product_skus(
+                state,
+                known_products={"22392"},
+            )
+
+        self.assertEqual(new_skus, set())
+        self.assertEqual(state["matrix_structure_probe_skus"], ["22392"])
+
+        state["sku_bases"]["22392. 1 1"] = "22392"
+        with mock.patch.object(
+            module,
+            "find_dbf_file",
+            return_value=Path("unused-pos-data/Item.dbf"),
+        ), mock.patch.object(
+            module,
+            "iter_dbf_rows",
+            return_value=iter([{"SKU": "22392", "TYPE": "M"}]),
+        ):
+            connector._collect_new_numeric_product_skus(
+                state,
+                known_products={"22392"},
+            )
+
+        self.assertEqual(state["matrix_structure_probe_skus"], [])
+
+
 class PriceChangeDetectionTests(unittest.TestCase):
     def test_unchanged_prices_are_not_sent(self):
         changes = detect_price_changes(
@@ -474,6 +645,103 @@ class IncrementalPosEventTests(unittest.TestCase):
 
 
 class FullInventoryReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def _navy_matrix_payload(*, title="Eterna Dress Shirt - Navy"):
+        quantities = [1, 1, 1, 1, 1, 1, 0, 0, 0]
+        return {
+            "sku": "22392",
+            "title": title,
+            "price": 195.0,
+            "cost": 59.0,
+            "quantity": 6,
+            "vendor": "Scott Barber",
+            "variants": [
+                {
+                    "sku": f"22392. 1 {index}",
+                    "barcode": f"22392. 1 {index}",
+                    "option_values": {"Size": str(index)},
+                    "price": 195.0,
+                    "cost": 59.0,
+                    "quantity": quantity,
+                }
+                for index, quantity in enumerate(quantities, start=1)
+            ],
+        }
+
+    @staticmethod
+    def _snapshot_item(sku, quantity, *, duplicate=0, available=True):
+        return {
+            "sku": sku,
+            "quantity": quantity,
+            "location_id": "gid://shopify/Location/4",
+            "available_at_location": available,
+            "duplicate_sku_count": duplicate,
+        }
+
+    @staticmethod
+    def _structure_result(payload, *, status="repaired", quantities=None):
+        quantities = quantities or {
+            variant["sku"]: variant["quantity"]
+            for variant in payload["variants"]
+        }
+        return {
+            "base_sku": payload["sku"],
+            "status": status,
+            "variants": [
+                {
+                    "sku": variant["sku"],
+                    "quantity": quantities[variant["sku"]],
+                    "inventory_item_id": f"inventory-{index}",
+                    "location_id": "gid://shopify/Location/4",
+                }
+                for index, variant in enumerate(payload["variants"], start=1)
+            ],
+        }
+
+    @staticmethod
+    def _matrix_connector(state_path):
+        connector = Connector.__new__(Connector)
+        connector.dry_run = False
+        connector.order_sync_enabled = False
+        connector.price_sync_enabled = False
+        connector.initial_catalog_upload = True
+        connector.nightly_full_sync_hour = 0
+        connector.writeback_mode = "dry-run"
+        connector.base_url = "https://sync.example"
+        connector.batch_size = 25
+        connector.timeout = 30
+        connector.state_path = state_path
+        connector.dbf_dir = Path("unused-pos-data")
+        connector.logger = mock.Mock()
+        connector._retry_pending = mock.Mock()
+        connector._fetch_inventory_changes = mock.Mock(return_value=[])
+        connector._collect_pos_event_skus = mock.Mock(return_value=(set(), False))
+        connector._collect_new_numeric_product_skus = mock.Mock(return_value=set())
+        connector._reader_args = mock.Mock(return_value=SimpleNamespace())
+        connector._apply_shopify_adjustments = mock.Mock(return_value=set())
+        connector._apply_pos_adjustments = mock.Mock()
+        connector._acknowledge_inventory_changes = mock.Mock()
+        return connector
+
+    @staticmethod
+    def _matrix_state():
+        return {
+            "version": 1,
+            "catalog_complete": True,
+            "catalog_products": ["22392"],
+            "quantities": {
+                "22392": {"canonical": 0, "pos_seen": 0, "shop_seen": 0}
+            },
+            "event_cursors": {},
+            "sku_bases": {"22392": "22392"},
+            "pending_catalog_products": {},
+            "pending_matrix_structure_repairs": {},
+            "blocked_inventory_skus": [],
+            "matrix_option_schema_version": 2,
+            "inventory_reconcile_schema_version": 2,
+            "last_full_reconcile_date": datetime.now().date().isoformat(),
+        }
+
     def test_nightly_snapshot_repairs_skus_missing_connector_baselines(self):
         for shopify_quantity, expected_delta in ((0, 6), (4, 2)):
             with self.subTest(shopify_quantity=shopify_quantity):
@@ -496,6 +764,8 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                                 "sku": "22392",
                                 "quantity": 1,
                                 "inventory_item_id": "gid://shopify/InventoryItem/3",
+                                "location_id": "gid://shopify/Location/4",
+                                "source_updated_at": "2026-08-21T10:00:00Z",
                             }
                         ]
                     )
@@ -512,6 +782,8 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                                     "location_id": "gid://shopify/Location/4",
                                     "available_at_location": True,
                                     "duplicate_sku_count": 0,
+                                    "inventory_item_id": "gid://shopify/InventoryItem/3",
+                                    "inventory_level_updated_at": "2026-08-21T11:00:00Z",
                                 }
                             ],
                         }
@@ -564,11 +836,981 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                         {"canonical": 6, "pos_seen": 6, "shop_seen": 6},
                     )
                     self.assertNotIn("pending_shop", persisted["quantities"]["22392"])
+                    connector._acknowledge_inventory_changes.assert_not_called()
                     self.assertEqual(persisted["inventory_reconcile_schema_version"], 2)
                     self.assertEqual(
                         persisted["inventory_location_id"],
                         "gid://shopify/Location/4",
                     )
+
+    def test_newer_webhook_overlays_a_stale_full_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector.writeback_mode = "vfp-oledb"
+            queued_sale = {
+                "id": 1,
+                "version": 1,
+                "sku": "ABC",
+                "quantity": 5,
+                "inventory_item_id": "gid://shopify/InventoryItem/3",
+                "location_id": "gid://shopify/Location/4",
+                "source_updated_at": "2026-08-21T12:02:00Z",
+            }
+            connector._fetch_inventory_changes = mock.Mock(
+                side_effect=[[], [queued_sale]]
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [
+                        {
+                            "sku": "ABC",
+                            "quantity": 6,
+                            "inventory_item_id": "gid://shopify/InventoryItem/3",
+                            "location_id": "gid://shopify/Location/4",
+                            "inventory_level_updated_at": "2026-08-21T12:01:00Z",
+                            "available_at_location": True,
+                            "duplicate_sku_count": 0,
+                        }
+                    ],
+                }
+            )
+            state = {
+                "version": 1,
+                "catalog_complete": True,
+                "catalog_products": ["ABC"],
+                "quantities": {
+                    "ABC": {"canonical": 6, "pos_seen": 6, "shop_seen": 6}
+                },
+                "event_cursors": {},
+                "sku_bases": {"ABC": "ABC"},
+                "pending_catalog_products": {},
+                "pending_matrix_structure_repairs": {},
+                "blocked_inventory_skus": [],
+                "matrix_option_schema_version": MATRIX_OPTION_SCHEMA_VERSION,
+                "catalog_structure_schema_version": CATALOG_STRUCTURE_SCHEMA_VERSION,
+                "inventory_reconcile_schema_version": 1,
+                "last_full_reconcile_date": datetime.now().date().isoformat(),
+            }
+            save_state(state_path, state)
+            prepared = SimpleNamespace(payload={"sku": "ABC", "quantity": 7})
+            stats = SimpleNamespace(skipped_non_sellable=0)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+
+            self.assertEqual(connector._fetch_inventory_changes.call_count, 2)
+            shop_actions = connector._apply_shopify_adjustments.call_args.args[1]
+            pos_actions = connector._apply_pos_adjustments.call_args.args[1]
+            self.assertEqual(
+                {
+                    key: shop_actions[0][key]
+                    for key in ("sku", "delta", "target_quantity")
+                },
+                {"sku": "ABC", "delta": 1, "target_quantity": 6},
+            )
+            self.assertEqual(
+                {
+                    key: pos_actions[0][key]
+                    for key in ("sku", "delta", "target_quantity", "expected_quantity")
+                },
+                {
+                    "sku": "ABC",
+                    "delta": -1,
+                    "target_quantity": 6,
+                    "expected_quantity": 7,
+                },
+            )
+            connector._acknowledge_inventory_changes.assert_not_called()
+
+    def test_full_snapshot_aborts_on_an_unverifiable_queued_quantity(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            queued_change = {
+                "id": 1,
+                "version": 1,
+                "sku": "ABC",
+                "quantity": 5,
+                "inventory_item_id": "gid://shopify/InventoryItem/3",
+                "location_id": "gid://shopify/Location/4",
+                "source_updated_at": None,
+            }
+            connector._fetch_inventory_changes = mock.Mock(
+                side_effect=[[], [queued_change]]
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [
+                        {
+                            "sku": "ABC",
+                            "quantity": 6,
+                            "inventory_item_id": "gid://shopify/InventoryItem/3",
+                            "location_id": "gid://shopify/Location/4",
+                            "inventory_level_updated_at": "2026-08-21T12:01:00Z",
+                            "available_at_location": True,
+                            "duplicate_sku_count": 0,
+                        }
+                    ],
+                }
+            )
+            state = {
+                "version": 1,
+                "catalog_complete": True,
+                "catalog_products": ["ABC"],
+                "quantities": {
+                    "ABC": {"canonical": 6, "pos_seen": 6, "shop_seen": 6}
+                },
+                "event_cursors": {},
+                "sku_bases": {"ABC": "ABC"},
+                "pending_catalog_products": {},
+                "pending_matrix_structure_repairs": {},
+                "blocked_inventory_skus": [],
+                "matrix_option_schema_version": MATRIX_OPTION_SCHEMA_VERSION,
+                "catalog_structure_schema_version": CATALOG_STRUCTURE_SCHEMA_VERSION,
+                "inventory_reconcile_schema_version": 1,
+                "last_full_reconcile_date": datetime.now().date().isoformat(),
+            }
+            save_state(state_path, state)
+            prepared = SimpleNamespace(payload={"sku": "ABC", "quantity": 7})
+            stats = SimpleNamespace(skipped_non_sellable=0)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ), self.assertRaisesRegex(RuntimeError, "no comparable timestamp"):
+                connector.run_cycle()
+
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+            connector._acknowledge_inventory_changes.assert_not_called()
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["inventory_reconcile_schema_version"], 1)
+
+    def test_deleted_shopify_sku_does_not_block_a_full_reconcile(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            deleted_change = {
+                "id": 9,
+                "version": 1,
+                "sku": "DELETED",
+                "quantity": 0,
+                "inventory_item_id": "gid://shopify/InventoryItem/99",
+                "location_id": "gid://shopify/Location/4",
+                "source_updated_at": "2026-08-21T12:02:00Z",
+            }
+            connector._fetch_inventory_changes = mock.Mock(
+                side_effect=[[deleted_change], [deleted_change], [deleted_change]]
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [
+                        {
+                            "sku": "ABC",
+                            "quantity": 6,
+                            "inventory_item_id": "gid://shopify/InventoryItem/3",
+                            "location_id": "gid://shopify/Location/4",
+                            "inventory_level_updated_at": "2026-08-21T12:01:00Z",
+                            "available_at_location": True,
+                            "duplicate_sku_count": 0,
+                        }
+                    ],
+                }
+            )
+            state = {
+                "version": 1,
+                "catalog_complete": True,
+                "catalog_products": ["ABC"],
+                "quantities": {
+                    "ABC": {"canonical": 6, "pos_seen": 6, "shop_seen": 6}
+                },
+                "event_cursors": {},
+                "sku_bases": {"ABC": "ABC"},
+                "pending_catalog_products": {},
+                "pending_matrix_structure_repairs": {},
+                "blocked_inventory_skus": [],
+                "matrix_option_schema_version": MATRIX_OPTION_SCHEMA_VERSION,
+                "catalog_structure_schema_version": CATALOG_STRUCTURE_SCHEMA_VERSION,
+                "inventory_reconcile_schema_version": 1,
+                "last_full_reconcile_date": datetime.now().date().isoformat(),
+            }
+            save_state(state_path, state)
+            prepared = SimpleNamespace(payload={"sku": "ABC", "quantity": 6})
+            stats = SimpleNamespace(skipped_non_sellable=0)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ), mock.patch.object(
+                sys.modules["windows_connector.connector"],
+                "read_targeted_pos_quantities",
+                return_value={},
+            ):
+                connector.run_cycle()
+                connector._acknowledge_inventory_changes.assert_not_called()
+                connector.run_cycle()
+
+            connector._fetch_inventory_snapshot.assert_called_once()
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+            connector._acknowledge_inventory_changes.assert_called_once_with(
+                [deleted_change]
+            )
+
+    def test_structure_upgrade_repairs_scalar_navy_before_post_repair_snapshot(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        call_order = []
+        repaired = False
+
+        def repair_structures(items):
+            nonlocal repaired
+            call_order.append("repair")
+            self.assertEqual(items, [payload])
+            repaired = True
+            return {"22392": self._structure_result(payload)}
+
+        def inventory_snapshot():
+            call_order.append("snapshot")
+            if not repaired:
+                items = [self._snapshot_item("22392", 0)]
+            else:
+                items = [
+                    self._snapshot_item(variant["sku"], variant["quantity"])
+                    for variant in payload["variants"]
+                ]
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._repair_matrix_structures = mock.Mock(
+                side_effect=repair_structures
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            save_state(state_path, self._matrix_state())
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ) as load_products:
+                connector.run_cycle()
+                first_state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertNotIn("catalog_structure_schema_version", first_state)
+                pending = first_state["pending_matrix_structure_repairs"]["22392"]
+                self.assertEqual(pending["observations"], 1)
+                self.assertEqual(pending["stage"], "candidate")
+                connector._repair_matrix_structures.assert_not_called()
+
+                connector.run_cycle()
+                connector.run_cycle()
+
+            self.assertEqual(call_order, ["snapshot", "repair", "snapshot"])
+            connector._repair_matrix_structures.assert_called_once_with([payload])
+            self.assertEqual(load_products.call_count, 2)
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+            self.assertEqual(persisted["pending_matrix_structure_repairs"], {})
+            self.assertNotIn("22392", persisted["quantities"])
+            self.assertEqual(persisted["blocked_inventory_skus"], [])
+            self.assertEqual(
+                persisted["sku_bases"],
+                {
+                    "22392": "22392",
+                    **{
+                        variant["sku"]: "22392"
+                        for variant in payload["variants"]
+                    },
+                },
+            )
+            for variant in payload["variants"]:
+                self.assertEqual(
+                    persisted["quantities"][variant["sku"]],
+                    {
+                        "canonical": variant["quantity"],
+                        "pos_seen": variant["quantity"],
+                        "shop_seen": variant["quantity"],
+                    },
+                )
+
+    def test_existing_matrix_quantity_mismatch_merges_a_newer_child_sale(self):
+        payload = self._navy_matrix_payload()
+        racing_sku = payload["variants"][0]["sku"]
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        repaired = False
+
+        def repair_structures(items):
+            nonlocal repaired
+            repaired = True
+            return {
+                "22392": self._structure_result(
+                    payload,
+                    status="quantity_mismatch",
+                    quantities={variant["sku"]: 0 for variant in payload["variants"]},
+                )
+            }
+
+        def inventory_snapshot():
+            if repaired:
+                items = [
+                    self._snapshot_item(
+                        variant["sku"],
+                        1 if variant["sku"] == racing_sku else 0,
+                    )
+                    for variant in payload["variants"]
+                ]
+                items[0]["inventory_item_id"] = "inventory-1"
+                items[0]["inventory_level_updated_at"] = (
+                    "2026-08-21T12:01:00Z"
+                )
+            else:
+                items = [self._snapshot_item("22392", 0)]
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector.writeback_mode = "vfp-oledb"
+            queued_sale = {
+                "id": 7,
+                "version": 1,
+                "sku": racing_sku,
+                "quantity": 0,
+                "inventory_item_id": "inventory-1",
+                "location_id": "gid://shopify/Location/4",
+                "source_updated_at": "2026-08-21T12:02:00Z",
+            }
+            connector._fetch_inventory_changes = mock.Mock(
+                side_effect=[[], [], [queued_sale], [queued_sale]]
+            )
+            connector._repair_matrix_structures = mock.Mock(
+                side_effect=repair_structures
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            save_state(state_path, self._matrix_state())
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+                connector.run_cycle()
+
+            connector._repair_matrix_structures.assert_called_once_with([payload])
+            shop_actions = connector._apply_shopify_adjustments.call_args.args[1]
+            self.assertEqual(
+                {
+                    action["sku"]: (action["delta"], action["target_quantity"])
+                    for action in shop_actions
+                },
+                {
+                    variant["sku"]: (variant["quantity"], variant["quantity"])
+                    for variant in payload["variants"]
+                    if variant["quantity"] and variant["sku"] != racing_sku
+                },
+            )
+            pos_actions = connector._apply_pos_adjustments.call_args.args[1]
+            self.assertEqual(
+                {
+                    key: pos_actions[0][key]
+                    for key in ("sku", "delta", "target_quantity", "expected_quantity")
+                },
+                {
+                    "sku": racing_sku,
+                    "delta": -1,
+                    "target_quantity": 0,
+                    "expected_quantity": 1,
+                },
+            )
+            connector._acknowledge_inventory_changes.assert_not_called()
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["pending_matrix_structure_repairs"], {})
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+
+    def test_known_scalar_to_matrix_transition_triggers_a_probe_before_nightly(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        repaired = False
+
+        def detect_probe(state, *, known_products):
+            has_children = any(
+                sku != mapped_base and mapped_base == "22392"
+                for sku, mapped_base in (state.get("sku_bases") or {}).items()
+            )
+            state["matrix_structure_probe_skus"] = [] if has_children else ["22392"]
+            return set()
+
+        def repair_structures(items):
+            nonlocal repaired
+            repaired = True
+            return {"22392": self._structure_result(payload)}
+
+        def inventory_snapshot():
+            items = (
+                [
+                    self._snapshot_item(variant["sku"], variant["quantity"])
+                    for variant in payload["variants"]
+                ]
+                if repaired
+                else [self._snapshot_item("22392", 0)]
+            )
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._collect_new_numeric_product_skus = mock.Mock(
+                side_effect=detect_probe
+            )
+            connector._repair_matrix_structures = mock.Mock(
+                side_effect=repair_structures
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            state = self._matrix_state()
+            state["catalog_structure_schema_version"] = (
+                CATALOG_STRUCTURE_SCHEMA_VERSION
+            )
+            save_state(state_path, state)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ) as load_products:
+                connector.run_cycle()
+                connector.run_cycle()
+
+            self.assertEqual(load_products.call_count, 2)
+            connector._repair_matrix_structures.assert_called_once_with([payload])
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["pending_matrix_structure_repairs"], {})
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+
+    def test_structure_upgrade_accepts_an_already_correct_matrix_without_pending_state(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector.writeback_mode = "vfp-oledb"
+            connector._retry_pending = Connector._retry_pending.__get__(
+                connector,
+                Connector,
+            )
+            connector._apply_shopify_adjustments = mock.Mock(return_value=set())
+            connector._apply_pos_adjustments = mock.Mock()
+            connector._repair_matrix_structures = mock.Mock()
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [
+                        self._snapshot_item(variant["sku"], variant["quantity"])
+                        for variant in payload["variants"]
+                    ],
+                }
+            )
+            state = self._matrix_state()
+            state["quantities"].update(
+                {
+                    variant["sku"]: {
+                        "canonical": variant["quantity"],
+                        "pos_seen": variant["quantity"],
+                        "shop_seen": variant["quantity"],
+                    }
+                    for variant in payload["variants"]
+                }
+            )
+            first_stocked_sku = next(
+                variant["sku"]
+                for variant in payload["variants"]
+                if variant["quantity"]
+            )
+            state["quantities"][first_stocked_sku]["pending_pos"] = {
+                "sku": first_stocked_sku,
+                "delta": -1,
+                "target_quantity": 0,
+                "expected_quantity": 1,
+            }
+            save_state(state_path, state)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+                connector.run_cycle()
+
+            connector._repair_matrix_structures.assert_not_called()
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+            self.assertEqual(persisted["pending_matrix_structure_repairs"], {})
+            self.assertNotIn("22392", persisted["quantities"])
+            for variant in payload["variants"]:
+                self.assertEqual(
+                    persisted["quantities"][variant["sku"]]["canonical"],
+                    variant["quantity"],
+                )
+            self.assertNotIn(
+                "pending_pos",
+                persisted["quantities"][first_stocked_sku],
+            )
+
+    def test_structure_upgrade_never_retries_legacy_matrix_actions_and_rebases_children(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        snapshot_calls = 0
+
+        def inventory_snapshot():
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            if snapshot_calls == 1:
+                items = [self._snapshot_item("22392", 0)]
+            else:
+                items = [
+                    self._snapshot_item(variant["sku"], 0)
+                    for variant in payload["variants"]
+                ]
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector.writeback_mode = "vfp-oledb"
+            connector._retry_pending = Connector._retry_pending.__get__(
+                connector,
+                Connector,
+            )
+            connector._repair_matrix_structures = mock.Mock(
+                return_value={"22392": self._structure_result(payload)}
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            connector._apply_shopify_adjustments = mock.Mock(return_value=set())
+            connector._apply_pos_adjustments = mock.Mock()
+            state = self._matrix_state()
+            state["quantities"] = {
+                "22392": {
+                    "canonical": 6,
+                    "pos_seen": 6,
+                    "shop_seen": 6,
+                    "pending_pos": {
+                        "sku": "22392",
+                        "delta": -6,
+                        "target_quantity": 0,
+                        "expected_quantity": 6,
+                    },
+                },
+                "OTHER": {
+                    "canonical": 2,
+                    "pos_seen": 2,
+                    "shop_seen": 0,
+                    "pending_shop": {
+                        "sku": "OTHER",
+                        "delta": 2,
+                        "target_quantity": 2,
+                    },
+                },
+                **{
+                    variant["sku"]: {
+                        "canonical": variant["quantity"],
+                        "pos_seen": variant["quantity"],
+                        "shop_seen": variant["quantity"],
+                        "pending_pos": {
+                            "sku": variant["sku"],
+                            "delta": -variant["quantity"],
+                            "target_quantity": 0,
+                            "expected_quantity": variant["quantity"],
+                        },
+                    }
+                    for variant in payload["variants"]
+                },
+            }
+            save_state(state_path, state)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+                connector._apply_shopify_adjustments.assert_not_called()
+                connector._apply_pos_adjustments.assert_not_called()
+                connector.run_cycle()
+
+            post_repair_state = json.loads(state_path.read_text(encoding="utf-8"))
+            post_repair_state["quantities"]["OTHER"].pop("pending_shop", None)
+            save_state(state_path, post_repair_state)
+            delayed_base_change = {
+                "id": 7,
+                "version": 1,
+                "sku": "22392",
+                "quantity": 0,
+                "inventory_item_id": "legacy-base-item",
+                "source_updated_at": "2026-08-21T12:00:00+00:00",
+            }
+            connector._fetch_inventory_changes.return_value = [delayed_base_change]
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"],
+                "read_targeted_pos_quantities",
+                return_value=flatten_quantities([payload]),
+            ):
+                connector.run_cycle()
+
+            shop_calls = connector._apply_shopify_adjustments.call_args_list
+            self.assertEqual(shop_calls[0].args[1], [state["quantities"]["OTHER"]["pending_shop"]])
+            self.assertEqual(len(shop_calls), 1)
+            connector._apply_pos_adjustments.assert_not_called()
+            connector._acknowledge_inventory_changes.assert_called_once_with(
+                [delayed_base_change]
+            )
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("22392", persisted["quantities"])
+            for variant in payload["variants"]:
+                entry = persisted["quantities"][variant["sku"]]
+                self.assertEqual(entry["canonical"], variant["quantity"])
+                self.assertEqual(entry["pos_seen"], variant["quantity"])
+                self.assertEqual(entry["shop_seen"], variant["quantity"])
+                self.assertNotIn("pending_shop", entry)
+                self.assertNotIn("pending_pos", entry)
+
+    def test_repaired_matrix_remains_due_until_child_snapshot_verifies(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        snapshot_calls = 0
+
+        def inventory_snapshot():
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            if snapshot_calls == 1:
+                items = [self._snapshot_item("22392", 0)]
+            elif snapshot_calls == 2:
+                items = [
+                    self._snapshot_item(variant["sku"], variant["quantity"])
+                    for variant in payload["variants"][:3]
+                ]
+            else:
+                items = [
+                    self._snapshot_item(variant["sku"], variant["quantity"])
+                    for variant in payload["variants"]
+                ]
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._repair_matrix_structures = mock.Mock(
+                return_value={"22392": self._structure_result(payload)}
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            save_state(state_path, self._matrix_state())
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+                connector.run_cycle()
+                waiting = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertNotIn("catalog_structure_schema_version", waiting)
+                self.assertEqual(
+                    waiting["pending_matrix_structure_repairs"]["22392"]["stage"],
+                    "verification",
+                )
+                connector.run_cycle()
+
+            connector._repair_matrix_structures.assert_called_once_with([payload])
+            self.assertEqual(connector._fetch_inventory_snapshot.call_count, 3)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+            self.assertEqual(persisted["pending_matrix_structure_repairs"], {})
+
+    def test_structure_upgrade_requires_two_identical_full_payloads(self):
+        first_payload = self._navy_matrix_payload(title="Copied shirt")
+        finished_payload = self._navy_matrix_payload(
+            title="Eterna Dress Shirt - Navy"
+        )
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        call_order = []
+        repaired = False
+
+        def repair_structures(items):
+            nonlocal repaired
+            call_order.append("repair")
+            repaired = True
+            return {"22392": self._structure_result(finished_payload)}
+
+        def inventory_snapshot():
+            call_order.append("snapshot")
+            items = (
+                [
+                    self._snapshot_item(variant["sku"], variant["quantity"])
+                    for variant in finished_payload["variants"]
+                ]
+                if repaired
+                else [self._snapshot_item("22392", 0)]
+            )
+            return {
+                "location_id": "gid://shopify/Location/4",
+                "items": items,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._repair_matrix_structures = mock.Mock(
+                side_effect=repair_structures
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=inventory_snapshot
+            )
+            save_state(state_path, self._matrix_state())
+            load_results = [
+                ([SimpleNamespace(payload=first_payload)], stats),
+                ([SimpleNamespace(payload=finished_payload)], stats),
+                ([SimpleNamespace(payload=finished_payload)], stats),
+            ]
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                side_effect=load_results,
+            ):
+                connector.run_cycle()
+                connector.run_cycle()
+                second_state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    second_state["pending_matrix_structure_repairs"]["22392"][
+                        "observations"
+                    ],
+                    1,
+                )
+                connector._repair_matrix_structures.assert_not_called()
+                connector.run_cycle()
+
+            self.assertEqual(
+                call_order,
+                ["snapshot", "snapshot", "repair", "snapshot"],
+            )
+            connector._repair_matrix_structures.assert_called_once_with(
+                [finished_payload]
+            )
+
+    def test_unsafe_matrix_shapes_are_recorded_without_mutation_or_busy_retry(self):
+        payload = self._navy_matrix_payload()
+        first_child = payload["variants"][0]["sku"]
+        unsafe_shapes = {
+            "partial": [
+                self._snapshot_item("22392", 0),
+                self._snapshot_item(first_child, 0),
+            ],
+            "duplicate_base": [
+                self._snapshot_item("22392", 0, duplicate=1),
+            ],
+            "unavailable_base": [
+                self._snapshot_item("22392", 0, available=False),
+            ],
+            "child_without_base": [
+                self._snapshot_item(first_child, 0),
+            ],
+        }
+
+        for shape, snapshot_items in unsafe_shapes.items():
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary_directory:
+                state_path = Path(temporary_directory) / "state.json"
+                connector = self._matrix_connector(state_path)
+                connector._repair_matrix_structures = mock.Mock()
+                connector._fetch_inventory_snapshot = mock.Mock(
+                    return_value={
+                        "location_id": "gid://shopify/Location/4",
+                        "items": snapshot_items,
+                    }
+                )
+                save_state(state_path, self._matrix_state())
+                prepared = SimpleNamespace(payload=payload)
+                stats = SimpleNamespace(skipped_non_sellable=0)
+
+                with mock.patch.object(
+                    sys.modules["windows_connector.connector"].dbf_pos_sync,
+                    "load_products",
+                    return_value=([prepared], stats),
+                ) as load_products:
+                    connector.run_cycle()
+                    connector.run_cycle()
+
+                connector._repair_matrix_structures.assert_not_called()
+                connector._apply_shopify_adjustments.assert_not_called()
+                connector._apply_pos_adjustments.assert_not_called()
+                connector._fetch_inventory_snapshot.assert_called_once()
+                self.assertEqual(load_products.call_count, 1)
+                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    persisted["catalog_structure_schema_version"],
+                    CATALOG_STRUCTURE_SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    persisted["pending_matrix_structure_repairs"]["22392"]["stage"],
+                    "snapshot_blocked",
+                )
+
+    def test_snapshot_blocked_matrix_can_become_a_safe_scalar_candidate_later(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+        snapshot_items = [
+            self._snapshot_item("22392", 0),
+            self._snapshot_item(payload["variants"][0]["sku"], 0),
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._repair_matrix_structures = mock.Mock()
+            connector._fetch_inventory_snapshot = mock.Mock(
+                side_effect=lambda: {
+                    "location_id": "gid://shopify/Location/4",
+                    "items": snapshot_items,
+                }
+            )
+            save_state(state_path, self._matrix_state())
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+                blocked_state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    blocked_state["pending_matrix_structure_repairs"]["22392"]["stage"],
+                    "snapshot_blocked",
+                )
+                blocked_state["last_full_reconcile_date"] = "2000-01-01"
+                save_state(state_path, blocked_state)
+                snapshot_items[:] = [self._snapshot_item("22392", 0)]
+                connector.run_cycle()
+
+            connector._repair_matrix_structures.assert_not_called()
+            pending = json.loads(state_path.read_text(encoding="utf-8"))[
+                "pending_matrix_structure_repairs"
+            ]["22392"]
+            self.assertEqual(pending["stage"], "candidate")
+            self.assertEqual(pending["observations"], 1)
+
+    def test_server_blocked_matrix_retries_on_a_later_nightly_scan_not_every_cycle(self):
+        payload = self._navy_matrix_payload()
+        prepared = SimpleNamespace(payload=payload)
+        stats = SimpleNamespace(skipped_non_sellable=0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "state.json"
+            connector = self._matrix_connector(state_path)
+            connector._repair_matrix_structures = mock.Mock(
+                return_value={
+                    "22392": self._structure_result(payload, status="blocked")
+                }
+            )
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [self._snapshot_item("22392", 0)],
+                }
+            )
+            save_state(state_path, self._matrix_state())
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ) as load_products:
+                connector.run_cycle()
+                connector.run_cycle()
+                connector.run_cycle()
+                waiting = json.loads(state_path.read_text(encoding="utf-8"))
+                waiting["last_full_reconcile_date"] = "2000-01-01"
+                waiting["pending_matrix_structure_repairs"]["22392"][
+                    "last_attempt_date"
+                ] = "2000-01-01"
+                save_state(state_path, waiting)
+                connector.run_cycle()
+                connector.run_cycle()
+
+            self.assertEqual(connector._repair_matrix_structures.call_count, 2)
+            self.assertEqual(connector._fetch_inventory_snapshot.call_count, 3)
+            self.assertEqual(load_products.call_count, 3)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["catalog_structure_schema_version"],
+                CATALOG_STRUCTURE_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                persisted["pending_matrix_structure_repairs"]["22392"]["stage"],
+                "server_blocked",
+            )
 
     def test_duplicate_snapshot_sku_is_blocked_from_all_adjustments(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -648,7 +1890,7 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
         response.raise_for_status.assert_called_once()
 
-    def test_actual_shopify_result_cancels_a_stale_paired_pos_adjustment(self):
+    def test_actual_shopify_result_rebases_a_stale_paired_pos_adjustment(self):
         connector = Connector.__new__(Connector)
         connector.base_url = "https://sync.example"
         connector.timeout = 30
@@ -696,11 +1938,67 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             connector.state_path = Path(temporary_directory) / "state.json"
             deferred = connector._apply_shopify_adjustments(state, [shop_action])
 
-        self.assertEqual(deferred, {"ABC"})
+        self.assertEqual(deferred, set())
         self.assertEqual(state["quantities"]["ABC"]["canonical"], 9)
         self.assertEqual(state["quantities"]["ABC"]["shop_seen"], 9)
         self.assertNotIn("pending_shop", state["quantities"]["ABC"])
         self.assertNotIn("pending_pos", state["quantities"]["ABC"])
+
+    def test_shopify_race_synthesizes_a_guarded_pos_correction(self):
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.timeout = 30
+        connector.batch_size = 25
+        connector.writeback_mode = "vfp-oledb"
+        connector.logger = mock.Mock()
+        connector.session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {
+            "results": [
+                {
+                    "success": True,
+                    "sku": "ABC",
+                    "quantity_after_change": 6,
+                }
+            ]
+        }
+        connector.session.post.return_value = response
+        shop_action = {
+            "sku": "ABC",
+            "delta": 1,
+            "target_quantity": 7,
+            "idempotency_key": "shop-key",
+        }
+        state = {
+            "quantities": {
+                "ABC": {
+                    "canonical": 7,
+                    "pos_seen": 7,
+                    "shop_seen": 6,
+                    "pending_shop": shop_action,
+                    "revision": 1,
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector.state_path = Path(temporary_directory) / "state.json"
+            blocked = connector._apply_shopify_adjustments(state, [shop_action])
+
+        self.assertEqual(blocked, set())
+        self.assertEqual(state["quantities"]["ABC"]["canonical"], 6)
+        self.assertEqual(
+            {
+                key: state["quantities"]["ABC"]["pending_pos"][key]
+                for key in ("sku", "delta", "target_quantity", "expected_quantity")
+            },
+            {
+                "sku": "ABC",
+                "delta": -1,
+                "target_quantity": 6,
+                "expected_quantity": 7,
+            },
+        )
 
     def test_unconfirmed_shopify_result_defers_a_paired_pos_adjustment(self):
         connector = Connector.__new__(Connector)

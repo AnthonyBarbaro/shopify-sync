@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import csv
 import html
@@ -2777,6 +2778,107 @@ async def repair_catalog_matrix_options(
             "updated": updated,
             "already_correct": already_correct,
             "failed": failed,
+            "results": results,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
+@app.post("/sync/catalog/matrix-structure/repair", response_model=None)
+@app.post(
+    "/wc-api/v3/products/matrix-structure/repair",
+    response_model=None,
+    include_in_schema=False,
+)
+async def repair_catalog_matrix_structure(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else None
+    if not isinstance(raw_items, list):
+        raise SyncProcessingError(
+            "Matrix structure repair requires an items array.",
+            code="invalid_matrix_structure_repair_payload",
+        )
+    if len(raw_items) > 5:
+        raise SyncProcessingError(
+            "Matrix structure repair is limited to 5 products per request.",
+            {"count": len(raw_items)},
+            code="too_many_matrix_structure_repairs",
+        )
+
+    results: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        base_sku = _string_or_none(raw_item.get("sku")) if isinstance(raw_item, dict) else None
+        if not isinstance(raw_item, dict):
+            results.append(
+                {
+                    "base_sku": "",
+                    "status": "failed",
+                    "message": "Matrix structure repair item must be an object.",
+                }
+            )
+            continue
+        try:
+            normalized = normalize_external_product_payload(raw_item)
+            if len(normalized.variants) > 100:
+                raise SyncProcessingError(
+                    "Matrix structure repair is limited to 100 variants per product.",
+                    {"base_sku": normalized.sku, "count": len(normalized.variants)},
+                    code="too_many_matrix_structure_variants",
+                )
+            result = await asyncio.to_thread(
+                run_with_shop_retry,
+                shop,
+                lambda active_shop, normalized=normalized: (
+                    inventory_service.repair_matrix_structure(
+                        normalized,
+                        active_shop,
+                    )
+                ),
+            )
+        except Exception as exc:
+            result = {
+                "base_sku": base_sku or "",
+                "status": "failed",
+                "message": str(exc),
+            }
+
+        if result.get("status") in {"repaired", "already_correct"}:
+            for variant in result.get("variants") or []:
+                inventory_item_id = _string_or_none(variant.get("inventory_item_id"))
+                sku = _string_or_none(variant.get("sku"))
+                if not inventory_item_id or not sku:
+                    continue
+                quantity = variant.get("quantity")
+                if quantity is None:
+                    db.upsert_inventory_item_sku(
+                        shop_domain=shop.shop_domain,
+                        inventory_item_id=normalize_gid("InventoryItem", inventory_item_id),
+                        sku=sku,
+                    )
+                else:
+                    db.upsert_inventory_item_quantity(
+                        shop_domain=shop.shop_domain,
+                        inventory_item_id=normalize_gid("InventoryItem", inventory_item_id),
+                        sku=sku,
+                        quantity=int(quantity),
+                    )
+        results.append(result)
+
+    return JSONResponse(
+        {
+            "total": len(results),
+            "repaired": sum(result.get("status") == "repaired" for result in results),
+            "already_correct": sum(
+                result.get("status") == "already_correct" for result in results
+            ),
+            "quantity_mismatch": sum(
+                result.get("status") == "quantity_mismatch" for result in results
+            ),
+            "blocked": sum(result.get("status") == "blocked" for result in results),
+            "failed": sum(result.get("status") == "failed" for result in results),
             "results": results,
             "timestamp": utc_now_iso(),
         }
