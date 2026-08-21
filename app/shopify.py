@@ -65,6 +65,12 @@ class ShopifyClient:
               title
               handle
               status
+              autoArchivedZeroStock: metafield(
+                namespace: "pos",
+                key: "auto_archived_zero_stock"
+              ) {
+                value
+              }
               vendor
               productType
               updatedAt
@@ -132,6 +138,81 @@ class ShopifyClient:
             if not products_data["pageInfo"]["hasNextPage"]:
                 return products
             cursor = products_data["pageInfo"]["endCursor"]
+
+    def get_inventory_snapshot(
+        self,
+        shop_domain: str,
+        access_token: str,
+        location_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Load every variant's available quantity at one Shopify location."""
+        query = """
+        query InventorySnapshot($first: Int!, $after: String, $locationId: ID!) {
+          inventoryItems(first: $first, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              id
+              sku
+              duplicateSkuCount
+              inventoryLevel(locationId: $locationId) {
+                updatedAt
+                quantities(names: ["available"]) {
+                  name
+                  quantity
+                }
+              }
+            }
+          }
+        }
+        """
+        normalized_location_id = normalize_gid("Location", location_id)
+        rows: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        while True:
+            payload = self.graphql(
+                shop_domain,
+                access_token,
+                query,
+                {
+                    "first": 250,
+                    "after": cursor,
+                    "locationId": normalized_location_id,
+                },
+                operation_name="InventorySnapshot",
+            )
+            items_data = payload["data"]["inventoryItems"]
+            for node in items_data["nodes"]:
+                sku = str(node.get("sku") or "").strip()
+                if not sku:
+                    continue
+                inventory_level = node.get("inventoryLevel")
+                quantities = (inventory_level or {}).get("quantities") or []
+                available = next(
+                    (
+                        quantity.get("quantity")
+                        for quantity in quantities
+                        if quantity.get("name") == "available"
+                    ),
+                    None,
+                )
+                rows.append(
+                    {
+                        "sku": sku,
+                        "quantity": int(available) if available is not None else None,
+                        "inventory_item_id": node.get("id"),
+                        "location_id": normalized_location_id,
+                        "inventory_level_updated_at": (inventory_level or {}).get("updatedAt"),
+                        "available_at_location": inventory_level is not None,
+                        "duplicate_sku_count": int(node.get("duplicateSkuCount") or 0),
+                    }
+                )
+            if not items_data["pageInfo"]["hasNextPage"]:
+                return rows
+            cursor = items_data["pageInfo"]["endCursor"]
 
     def get_inventory_item_sku(
         self,
@@ -450,7 +531,7 @@ class ShopifyClient:
 
         query = """
         query VariantBySku($query: String!) {
-          productVariants(first: 1, query: $query) {
+          productVariants(first: 10, query: $query) {
             nodes {
               id
               sku
@@ -458,6 +539,13 @@ class ShopifyClient:
               product {
                 id
                 title
+                status
+                autoArchivedZeroStock: metafield(
+                  namespace: "pos",
+                  key: "auto_archived_zero_stock"
+                ) {
+                  value
+                }
               }
               inventoryItem {
                 id
@@ -489,15 +577,30 @@ class ShopifyClient:
             operation_name="VariantBySku",
         )
         nodes = payload["data"]["productVariants"]["nodes"]
-        if not nodes:
+        exact_nodes = [
+            node
+            for node in nodes
+            if str(node.get("sku") or "").strip() == normalized_sku
+        ]
+        if not exact_nodes:
             raise SyncProcessingError(
                 f"Shopify variant not found for SKU '{normalized_sku}'.",
                 {"sku": normalized_sku, "shop": shop_domain},
                 status_code=404,
                 code="sku_not_found",
             )
+        if len(exact_nodes) > 1:
+            raise SyncProcessingError(
+                f"Shopify has more than one variant with SKU '{normalized_sku}'.",
+                {
+                    "sku": normalized_sku,
+                    "shop": shop_domain,
+                    "variant_ids": [node.get("id") for node in exact_nodes],
+                },
+                code="duplicate_shopify_sku",
+            )
 
-        mapping = _parse_variant_mapping(nodes[0])
+        mapping = _parse_variant_mapping(exact_nodes[0])
         self._set_cached_variant(shop_domain, mapping)
         return mapping
 
@@ -555,6 +658,12 @@ class ShopifyClient:
               title
               handle
               status
+              autoArchivedZeroStock: metafield(
+                namespace: "pos",
+                key: "auto_archived_zero_stock"
+              ) {
+                value
+              }
               vendor
               productType
               media(first: 10) {
@@ -623,6 +732,12 @@ class ShopifyClient:
               title
               handle
               status
+              autoArchivedZeroStock: metafield(
+                namespace: "pos",
+                key: "auto_archived_zero_stock"
+              ) {
+                value
+              }
               vendor
               productType
               updatedAt
@@ -756,18 +871,16 @@ class ShopifyClient:
                 return cached[0]
 
         query = """
-        query GetLocations {
-          locations(first: 1) {
-            nodes {
-              id
-              name
-            }
+        query GetPrimaryLocation {
+          location {
+            id
+            name
           }
         }
         """
-        payload = self.graphql(shop_domain, access_token, query, operation_name="GetLocations")
-        nodes = payload["data"]["locations"]["nodes"]
-        if not nodes:
+        payload = self.graphql(shop_domain, access_token, query, operation_name="GetPrimaryLocation")
+        location = payload["data"].get("location")
+        if not location:
             raise SyncProcessingError(
                 "No Shopify locations are available for inventory sync.",
                 {"shop": shop_domain},
@@ -776,8 +889,8 @@ class ShopifyClient:
             )
 
         with self._location_lock:
-            self._location_cache[shop_domain] = (nodes[0]["id"], nodes[0]["name"])
-        return nodes[0]["id"]
+            self._location_cache[shop_domain] = (location["id"], location["name"])
+        return location["id"]
 
     def get_shop_info(self, shop_domain: str, access_token: str) -> Dict[str, Any]:
         query = """
@@ -807,6 +920,12 @@ class ShopifyClient:
               title
               handle
               status
+              autoArchivedZeroStock: metafield(
+                namespace: "pos",
+                key: "auto_archived_zero_stock"
+              ) {
+                value
+              }
               vendor
               productType
               media(first: 10) {
@@ -902,6 +1021,12 @@ class ShopifyClient:
               title
               handle
               status
+              autoArchivedZeroStock: metafield(
+                namespace: "pos",
+                key: "auto_archived_zero_stock"
+              ) {
+                value
+              }
               vendor
               productType
               media(first: 10) {
@@ -1275,16 +1400,21 @@ class ShopifyClient:
         *,
         idempotency_key: str,
         sku: Optional[str] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         normalized_inventory_item_id = normalize_gid("InventoryItem", inventory_item_id)
         normalized_location_id = normalize_gid("Location", location_id)
         mutation = """
         mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
-          inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
-            inventoryAdjustmentGroup {
-              createdAt
-              reason
-            }
+            inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+              inventoryAdjustmentGroup {
+                createdAt
+                reason
+                changes {
+                  name
+                  delta
+                  quantityAfterChange
+                }
+              }
             userErrors {
               code
               field
@@ -1328,13 +1458,36 @@ class ShopifyClient:
                 },
             )
 
+        adjustment_group = result.get("inventoryAdjustmentGroup") or {}
+        quantity_after_change = next(
+            (
+                change.get("quantityAfterChange")
+                for change in adjustment_group.get("changes") or []
+                if change.get("name") == "available"
+            ),
+            None,
+        )
+        normalized_quantity_after_change = (
+            int(quantity_after_change)
+            if quantity_after_change is not None
+            else None
+        )
+
         cached = self._get_cached_variant(shop_domain, sku) if sku else None
         if cached is not None:
             for level in cached.inventory_levels:
                 if normalize_gid("Location", level.location_id) == normalized_location_id:
-                    level.quantity = int(level.quantity or 0) + int(delta)
+                    level.quantity = (
+                        normalized_quantity_after_change
+                        if normalized_quantity_after_change is not None
+                        else int(level.quantity or 0) + int(delta)
+                    )
                     break
             self._set_cached_variant(shop_domain, cached)
+        return {
+            "quantity_after_change": normalized_quantity_after_change,
+            "updated_at": adjustment_group.get("createdAt"),
+        }
 
     def activate_inventory(
         self,
@@ -1667,7 +1820,7 @@ class ShopifyClient:
     def _set_cached_variant(self, shop_domain: str, mapping: VariantMapping) -> None:
         with self._sku_cache_lock:
             self._sku_cache[self._cache_key(shop_domain, mapping.sku)] = {
-                "value": mapping.dict(),
+                "value": mapping.model_dump(),
                 "expires_at": utc_now().timestamp() + self.settings.shopify_sku_cache_ttl_seconds,
             }
 
@@ -1725,6 +1878,8 @@ def _safe_response_json(response: requests.Response) -> Dict[str, Any]:
 
 def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
     inventory_item = node.get("inventoryItem") or {}
+    product = node.get("product") or {}
+    auto_archived_marker = product.get("autoArchivedZeroStock") or {}
     levels = []
     for level in inventory_item.get("inventoryLevels", {}).get("nodes", []):
         quantities = level.get("quantities") or []
@@ -1742,8 +1897,12 @@ def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
     return VariantMapping(
         sku=node["sku"],
         variant_id=node["id"],
-        product_id=node["product"]["id"],
+        product_id=product["id"],
         inventory_item_id=inventory_item["id"],
+        product_status=product.get("status"),
+        auto_archived_zero_stock=(
+            str(auto_archived_marker.get("value") or "").strip().lower() == "true"
+        ),
         current_price=float(node["price"]) if node.get("price") is not None else None,
         current_cost=_extract_unit_cost(inventory_item),
         inventory_levels=levels,

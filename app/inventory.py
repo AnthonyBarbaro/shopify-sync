@@ -36,6 +36,8 @@ from app.utils import (
 
 CUSTOMER_CUSTOM_ID_NAMESPACE = "pos"
 CUSTOMER_CUSTOM_ID_KEY = "legacy_customer_id"
+AUTO_ARCHIVED_ZERO_STOCK_NAMESPACE = "pos"
+AUTO_ARCHIVED_ZERO_STOCK_KEY = "auto_archived_zero_stock"
 MATRIX_VARIANT_SKU_RE = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 
 
@@ -53,11 +55,19 @@ class InventorySyncService:
         self._customer_custom_id_ready: set[str] = set()
 
     def sync_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
-        normalized = self._apply_catalog_import_policy(self._normalize_payload(payload))
+        normalized = self._normalize_payload(payload)
+        auto_archive_requested = _should_auto_archive_zero_stock(normalized)
+        manual_archive_requested = _is_explicit_archive(normalized)
+        normalized = self._apply_catalog_import_policy(normalized)
         display_sku = normalized.sku or normalized.handle or normalized.title or "unknown-product"
 
         try:
-            result = self._sync_catalog_product(normalized, shop)
+            result = self._sync_catalog_product(
+                normalized,
+                shop,
+                auto_archive_requested=auto_archive_requested,
+                manual_archive_requested=manual_archive_requested,
+            )
         except Exception as exc:
             details = exc.details if isinstance(exc, AppError) else {"reason": str(exc)}
             failure_result = SyncResult(
@@ -257,15 +267,22 @@ class InventorySyncService:
 
         return rows
 
+    def get_inventory_snapshot(self, shop: ShopRecord) -> Dict[str, Any]:
+        location_id = self.shopify_client.get_primary_location_id(
+            shop.shop_domain,
+            shop.access_token,
+        )
+        return {
+            "location_id": normalize_gid("Location", location_id),
+            "items": self.shopify_client.get_inventory_snapshot(
+                shop.shop_domain,
+                shop.access_token,
+                location_id,
+            ),
+        }
+
     def list_inventory_snapshot(self, shop: ShopRecord) -> List[Dict[str, Any]]:
-        return [
-            {
-                "sku": row.sku,
-                "quantity": int(row.quantity or 0),
-            }
-            for row in self.list_catalog(shop)
-            if row.sku and row.quantity is not None
-        ]
+        return list(self.get_inventory_snapshot(shop)["items"])
 
     def adjust_inventory_quantity(
         self,
@@ -285,9 +302,10 @@ class InventorySyncService:
             shop.shop_domain,
             shop.access_token,
             normalized_sku,
+            force_refresh=True,
         )
         location_id = self._resolve_location_id(shop, mapping)
-        self.shopify_client.adjust_inventory(
+        adjustment_result = self.shopify_client.adjust_inventory(
             shop.shop_domain,
             shop.access_token,
             mapping.inventory_item_id,
@@ -296,6 +314,33 @@ class InventorySyncService:
             idempotency_key=idempotency_key,
             sku=normalized_sku,
         )
+        if isinstance(adjustment_result, dict):
+            quantity_after_change = adjustment_result.get("quantity_after_change")
+            inventory_updated_at = adjustment_result.get("updated_at")
+        else:
+            # Preserve compatibility with connector test doubles and older clients.
+            quantity_after_change = adjustment_result
+            inventory_updated_at = None
+        status_updated = False
+        if delta > 0:
+            refreshed_mapping = self.shopify_client.get_variant_by_sku(
+                shop.shop_domain,
+                shop.access_token,
+                normalized_sku,
+                force_refresh=True,
+            )
+            refreshed_location_id = self._resolve_location_id(shop, refreshed_mapping)
+            refreshed_quantity = self._get_inventory_quantity(
+                refreshed_mapping,
+                refreshed_location_id,
+            )
+            if refreshed_quantity is not None:
+                quantity_after_change = refreshed_quantity
+            status_updated = self._restore_auto_archived_product(
+                shop=shop,
+                mapping=refreshed_mapping,
+                resulting_quantity=quantity_after_change,
+            )
         return {
             "sku": normalized_sku,
             "delta": int(delta),
@@ -303,6 +348,9 @@ class InventorySyncService:
             "variant_id": mapping.variant_id,
             "inventory_item_id": mapping.inventory_item_id,
             "location_id": normalize_gid("Location", location_id),
+            "quantity_after_change": quantity_after_change,
+            "inventory_updated_at": inventory_updated_at,
+            "product_status_updated": status_updated,
         }
 
     def update_price_by_sku(
@@ -632,30 +680,55 @@ class InventorySyncService:
 
         return list(metafields.values())
 
-    def _sync_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
+    def _sync_catalog_product(
+        self,
+        payload: ProductSyncRequest,
+        shop: ShopRecord,
+        *,
+        auto_archive_requested: bool = False,
+        manual_archive_requested: bool = False,
+    ) -> SyncResult:
         if payload.variants:
-            return self._sync_matrix_catalog_product(payload, shop)
+            return self._sync_matrix_catalog_product(
+                payload,
+                shop,
+                auto_archive_requested=auto_archive_requested,
+                manual_archive_requested=manual_archive_requested,
+            )
 
         existing_mapping = self._find_existing_mapping(shop, payload)
         media_inputs = self._build_media_inputs(payload)
         created = existing_mapping is None
+        mark_auto_archived = _owns_auto_archive_transition(
+            auto_archive_requested=auto_archive_requested,
+            created=created,
+            existing_mapping=existing_mapping,
+        )
         product_title = payload.title or payload.sku or "POS Imported Product"
         mapping = existing_mapping
         price_updated = False
         cost_updated = False
         inventory_updated = False
-        product_status = None
+        product_status = existing_mapping.product_status if existing_mapping is not None else None
 
         if created:
             product = self.shopify_client.product_set(
                 shop.shop_domain,
                 shop.access_token,
-                input_data=self._build_new_product_input(payload, media_inputs),
+                input_data=self._build_new_product_input(
+                    payload,
+                    media_inputs,
+                    mark_auto_archived=mark_auto_archived,
+                ),
             )
             product_status = product.get("status") or _normalize_product_status(payload.status, default="DRAFT")
             mapping = self._mapping_from_product(product, payload.sku)
         else:
             product_update = self._build_product_update_input(payload, existing_mapping.product_id)
+            if mark_auto_archived:
+                product_update["metafields"] = [_auto_archive_metafield_input(value=True)]
+            elif manual_archive_requested:
+                product_update["metafields"] = [_auto_archive_metafield_input(value=False)]
             if len(product_update) > 1 or media_inputs:
                 updated_product = self.shopify_client.update_product(
                     shop.shop_domain,
@@ -713,6 +786,30 @@ class InventorySyncService:
                 sku=payload.sku,
             )
 
+        if (
+            payload.quantity is not None
+            and payload.quantity > 0
+            and not manual_archive_requested
+            and (
+                mapping.auto_archived_zero_stock
+                or (mapping.product_status or "").upper() == "ARCHIVED"
+            )
+        ):
+            refreshed_mapping = self.shopify_client.get_variant_by_sku(
+                shop.shop_domain,
+                shop.access_token,
+                payload.sku or mapping.sku,
+                force_refresh=True,
+            )
+            if self._restore_auto_archived_product(
+                shop=shop,
+                mapping=refreshed_mapping,
+                resulting_quantity=payload.quantity,
+            ):
+                product_status = "DRAFT"
+            elif refreshed_mapping.product_status:
+                product_status = refreshed_mapping.product_status
+
         if payload.sku:
             cached_quantity = payload.quantity if payload.quantity is not None else (current_quantity or 0)
             cached_price = payload.price if payload.price is not None else (mapping.current_price or 0.0)
@@ -758,10 +855,22 @@ class InventorySyncService:
             },
         )
 
-    def _sync_matrix_catalog_product(self, payload: ProductSyncRequest, shop: ShopRecord) -> SyncResult:
+    def _sync_matrix_catalog_product(
+        self,
+        payload: ProductSyncRequest,
+        shop: ShopRecord,
+        *,
+        auto_archive_requested: bool = False,
+        manual_archive_requested: bool = False,
+    ) -> SyncResult:
         existing_mapping = self._find_existing_mapping(shop, payload)
         media_inputs = self._build_media_inputs(payload)
         created = existing_mapping is None
+        mark_auto_archived = _owns_auto_archive_transition(
+            auto_archive_requested=auto_archive_requested,
+            created=created,
+            existing_mapping=existing_mapping,
+        )
         product_title = payload.title or payload.sku or "POS Imported Product"
         location_id = self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
         existing_product: Optional[Dict[str, Any]] = None
@@ -779,6 +888,10 @@ class InventorySyncService:
                     code="matrix_product_not_found",
                 )
             product_update = self._build_product_update_input(payload, existing_mapping.product_id)
+            if mark_auto_archived:
+                product_update["metafields"] = [_auto_archive_metafield_input(value=True)]
+            elif manual_archive_requested:
+                product_update["metafields"] = [_auto_archive_metafield_input(value=False)]
             if len(product_update) > 1 or media_inputs:
                 updated_product = self.shopify_client.update_product(
                     shop.shop_domain,
@@ -793,6 +906,7 @@ class InventorySyncService:
             location_id=location_id,
             media_inputs=media_inputs if created else [],
             existing_product=existing_product,
+            mark_auto_archived=mark_auto_archived,
         )
         product = self.shopify_client.product_set(
             shop.shop_domain,
@@ -809,6 +923,28 @@ class InventorySyncService:
                 shop.shop_domain,
                 shop.access_token,
                 metafield_inputs,
+            )
+
+        total_quantity = _total_inventory_quantity(payload)
+        if (
+            total_quantity is not None
+            and total_quantity > 0
+            and not manual_archive_requested
+            and (
+                mapping.auto_archived_zero_stock
+                or (mapping.product_status or "").upper() == "ARCHIVED"
+            )
+        ):
+            refreshed_mapping = self.shopify_client.get_variant_by_sku(
+                shop.shop_domain,
+                shop.access_token,
+                first_variant_sku,
+                force_refresh=True,
+            )
+            self._restore_auto_archived_product(
+                shop=shop,
+                mapping=refreshed_mapping,
+                resulting_quantity=total_quantity,
             )
 
         return SyncResult(
@@ -993,6 +1129,7 @@ class InventorySyncService:
         location_id: str,
         media_inputs: List[Dict[str, Any]],
         existing_product: Optional[Dict[str, Any]],
+        mark_auto_archived: bool = False,
     ) -> Dict[str, Any]:
         option_values_by_name: Dict[str, List[str]] = {}
         for variant in payload.variants:
@@ -1084,7 +1221,11 @@ class InventorySyncService:
                 "variants": variant_inputs,
             }
 
-        product_input = self._build_new_product_input(payload, media_inputs)
+        product_input = self._build_new_product_input(
+            payload,
+            media_inputs,
+            mark_auto_archived=mark_auto_archived,
+        )
         product_input["productOptions"] = product_options
         product_input["variants"] = variant_inputs
         return product_input
@@ -1093,6 +1234,8 @@ class InventorySyncService:
         self,
         payload: ProductSyncRequest,
         media_inputs: List[Dict[str, Any]],
+        *,
+        mark_auto_archived: bool = False,
     ) -> Dict[str, Any]:
         title = payload.title or payload.sku or "POS Imported Product"
         variant_input: Dict[str, Any] = {
@@ -1136,6 +1279,8 @@ class InventorySyncService:
             product_input["tags"] = payload.tags
         if media_inputs:
             product_input["files"] = media_inputs
+        if mark_auto_archived:
+            product_input["metafields"] = [_auto_archive_metafield_input(value=True)]
         return product_input
 
     def _build_product_update_input(
@@ -1226,9 +1371,77 @@ class InventorySyncService:
             prepared = _prepare_product_metafield(metafield, owner_id=owner_id)
             if prepared is None:
                 continue
+            if (
+                prepared["namespace"] == AUTO_ARCHIVED_ZERO_STOCK_NAMESPACE
+                and prepared["key"] == AUTO_ARCHIVED_ZERO_STOCK_KEY
+            ):
+                continue
             metafields[(prepared["namespace"], prepared["key"])] = prepared
 
         return list(metafields.values())
+
+    def _restore_auto_archived_product(
+        self,
+        *,
+        shop: ShopRecord,
+        mapping: VariantMapping,
+        resulting_quantity: Optional[int],
+    ) -> bool:
+        if not mapping.auto_archived_zero_stock or resulting_quantity is None or resulting_quantity <= 0:
+            return False
+
+        status_updated = (mapping.product_status or "").upper() == "ARCHIVED"
+        product_update: Dict[str, Any] = {
+            "id": normalize_gid("Product", mapping.product_id),
+            "metafields": [_auto_archive_metafield_input(value=False)],
+        }
+        if status_updated:
+            product_update["status"] = "DRAFT"
+        self.shopify_client.update_product(
+            shop.shop_domain,
+            shop.access_token,
+            product=product_update,
+        )
+        return status_updated
+
+    def restore_auto_archived_product_by_sku(
+        self,
+        *,
+        shop: ShopRecord,
+        sku: str,
+        expected_positive_quantity: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_sku = sku.strip()
+        mapping = self.shopify_client.get_variant_by_sku(
+            shop.shop_domain,
+            shop.access_token,
+            normalized_sku,
+            force_refresh=True,
+        )
+        location_id = self._resolve_location_id(shop, mapping)
+        quantity = self._get_inventory_quantity(mapping, location_id)
+        if (
+            expected_positive_quantity
+            and mapping.auto_archived_zero_stock
+            and (quantity is None or quantity <= 0)
+        ):
+            raise SyncProcessingError(
+                "Shopify has not exposed the positive inventory quantity yet.",
+                {"sku": normalized_sku, "quantity": quantity},
+                status_code=503,
+                code="inventory_quantity_not_ready",
+            )
+        status_updated = self._restore_auto_archived_product(
+            shop=shop,
+            mapping=mapping,
+            resulting_quantity=quantity,
+        )
+        return {
+            "sku": normalized_sku,
+            "quantity": quantity,
+            "auto_archived": mapping.auto_archived_zero_stock,
+            "product_status_updated": status_updated,
+        }
 
     def _set_inventory_with_retries(
         self,
@@ -1315,6 +1528,7 @@ class InventorySyncService:
 
         levels = []
         inventory_item = target_variant.get("inventoryItem") or {}
+        auto_archived_marker = product.get("autoArchivedZeroStock") or {}
         inventory_levels = ((inventory_item.get("inventoryLevels") or {}).get("nodes") or [])
         for level in inventory_levels:
             quantities = level.get("quantities") or []
@@ -1332,6 +1546,10 @@ class InventorySyncService:
             variant_id=target_variant["id"],
             product_id=product["id"],
             inventory_item_id=inventory_item["id"],
+            product_status=product.get("status"),
+            auto_archived_zero_stock=(
+                str(auto_archived_marker.get("value") or "").strip().lower() == "true"
+            ),
             current_price=_safe_float(target_variant.get("price")),
             current_cost=_extract_unit_cost(inventory_item),
             inventory_levels=levels,
@@ -1405,11 +1623,7 @@ class InventorySyncService:
         if payload.title and payload.title.casefold() not in {tag.casefold() for tag in tags}:
             tags.append(payload.title)
 
-        total_quantity = payload.quantity
-        if total_quantity is None and payload.variants:
-            variant_quantities = [variant.quantity for variant in payload.variants if variant.quantity is not None]
-            if variant_quantities:
-                total_quantity = sum(variant_quantities)
+        total_quantity = _total_inventory_quantity(payload)
 
         status = payload.status
         if total_quantity is not None and int(total_quantity) <= 0:
@@ -1464,10 +1678,6 @@ class InventorySyncService:
     def _resolve_location_id(self, shop: ShopRecord, mapping: VariantMapping) -> str:
         if self.settings.shopify_location_id:
             return normalize_gid("Location", self.settings.shopify_location_id)
-
-        if mapping.inventory_levels:
-            return normalize_gid("Location", mapping.inventory_levels[0].location_id)
-
         return self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
 
     @staticmethod
@@ -1536,6 +1746,55 @@ def _normalize_product_status(value: Optional[str], *, default: str) -> str:
     if normalized in {"ACTIVE", "ARCHIVED", "DRAFT"}:
         return normalized
     return default
+
+
+def _total_inventory_quantity(payload: ProductSyncRequest) -> Optional[int]:
+    if payload.quantity is not None:
+        return int(payload.quantity)
+    variant_quantities = [
+        int(variant.quantity)
+        for variant in payload.variants
+        if variant.quantity is not None
+    ]
+    return sum(variant_quantities) if variant_quantities else None
+
+
+def _should_auto_archive_zero_stock(payload: ProductSyncRequest) -> bool:
+    total_quantity = _total_inventory_quantity(payload)
+    return (
+        total_quantity is not None
+        and total_quantity <= 0
+        and (payload.status or "").strip().upper() != "ARCHIVED"
+    )
+
+
+def _is_explicit_archive(payload: ProductSyncRequest) -> bool:
+    return (payload.status or "").strip().upper() == "ARCHIVED"
+
+
+def _owns_auto_archive_transition(
+    *,
+    auto_archive_requested: bool,
+    created: bool,
+    existing_mapping: Optional[VariantMapping],
+) -> bool:
+    if not auto_archive_requested:
+        return False
+    if created or existing_mapping is None:
+        return True
+    return (
+        (existing_mapping.product_status or "").upper() != "ARCHIVED"
+        or existing_mapping.auto_archived_zero_stock
+    )
+
+
+def _auto_archive_metafield_input(*, value: bool) -> Dict[str, str]:
+    return {
+        "namespace": AUTO_ARCHIVED_ZERO_STOCK_NAMESPACE,
+        "key": AUTO_ARCHIVED_ZERO_STOCK_KEY,
+        "type": "boolean",
+        "value": "true" if value else "false",
+    }
 
 
 def _customer_custom_id_value(payload: CustomerSyncRequest) -> Optional[str]:

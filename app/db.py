@@ -92,6 +92,7 @@ class InventoryChangeRow:
     quantity: int
     version: int
     updated_at: str
+    source_updated_at: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,7 @@ class DatabaseStore:
                     shop_domain TEXT NOT NULL,
                     inventory_item_id TEXT NOT NULL,
                     sku TEXT NOT NULL,
+                    last_quantity INTEGER,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(shop_domain, inventory_item_id),
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
@@ -199,6 +201,7 @@ class DatabaseStore:
                     sku TEXT NOT NULL,
                     quantity INTEGER NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
+                    source_updated_at TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE(shop_domain, inventory_item_id, location_id),
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
@@ -325,6 +328,8 @@ class DatabaseStore:
             )
             self._ensure_column(connection, "pos_credentials", "secret_ciphertext", "TEXT")
             self._ensure_column(connection, "inventory_changes", "version", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(connection, "inventory_changes", "source_updated_at", "TEXT")
+            self._ensure_column(connection, "inventory_item_skus", "last_quantity", "INTEGER")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_credentials_api_key ON pos_credentials(api_key)"
             )
@@ -1019,6 +1024,55 @@ class DatabaseStore:
             ).fetchone()
         return row["sku"] if row else None
 
+    def get_inventory_item_last_quantity(
+        self,
+        *,
+        shop_domain: str,
+        inventory_item_id: str,
+    ) -> Optional[int]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT last_quantity
+                FROM inventory_item_skus
+                WHERE shop_domain = ? AND inventory_item_id = ?
+                """,
+                (shop_domain, inventory_item_id),
+            ).fetchone()
+        if row is None or row["last_quantity"] is None:
+            return None
+        return int(row["last_quantity"])
+
+    def upsert_inventory_item_quantity(
+        self,
+        *,
+        shop_domain: str,
+        inventory_item_id: str,
+        sku: str,
+        quantity: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO inventory_item_skus (
+                    shop_domain, inventory_item_id, sku, updated_at, last_quantity
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(shop_domain, inventory_item_id) DO UPDATE SET
+                    sku=excluded.sku,
+                    updated_at=excluded.updated_at,
+                    last_quantity=excluded.last_quantity
+                """,
+                (
+                    shop_domain,
+                    inventory_item_id,
+                    sku,
+                    utc_now_iso(),
+                    int(quantity),
+                ),
+            )
+            connection.commit()
+
     def upsert_inventory_change(
         self,
         *,
@@ -1027,21 +1081,35 @@ class DatabaseStore:
         location_id: str,
         sku: str,
         quantity: int,
+        source_updated_at: Optional[str] = None,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO inventory_changes (
-                    shop_domain, inventory_item_id, location_id, sku, quantity, version, updated_at
+                    shop_domain, inventory_item_id, location_id, sku, quantity, version,
+                    source_updated_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(shop_domain, inventory_item_id, location_id) DO UPDATE SET
                     sku=excluded.sku,
                     quantity=excluded.quantity,
                     version=inventory_changes.version + 1,
+                    source_updated_at=excluded.source_updated_at,
                     updated_at=excluded.updated_at
+                WHERE inventory_changes.source_updated_at IS NULL
+                   OR excluded.source_updated_at IS NULL
+                   OR excluded.source_updated_at >= inventory_changes.source_updated_at
                 """,
-                (shop_domain, inventory_item_id, location_id, sku, int(quantity), utc_now_iso()),
+                (
+                    shop_domain,
+                    inventory_item_id,
+                    location_id,
+                    sku,
+                    int(quantity),
+                    source_updated_at,
+                    utc_now_iso(),
+                ),
             )
             connection.commit()
 
@@ -1068,6 +1136,7 @@ class DatabaseStore:
                 quantity=int(row["quantity"]),
                 version=int(row["version"]),
                 updated_at=row["updated_at"],
+                source_updated_at=row["source_updated_at"],
             )
             for row in rows
         ]

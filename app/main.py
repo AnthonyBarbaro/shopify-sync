@@ -5,7 +5,7 @@ import json
 import secrets
 import time
 import zipfile
-from datetime import timedelta
+from datetime import timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, List, Tuple, TypeVar
@@ -2864,13 +2864,16 @@ async def acknowledge_connector_order_changes(
 async def connector_inventory_snapshot(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
-    items = run_with_shop_retry(
+    snapshot = run_with_shop_retry(
         shop,
-        lambda active_shop: inventory_service.list_inventory_snapshot(active_shop),
+        lambda active_shop: inventory_service.get_inventory_snapshot(active_shop),
     )
+    items = snapshot["items"]
     return JSONResponse(
         {
+            "schema_version": 2,
             "shop": shop.shop_domain,
+            "location_id": snapshot["location_id"],
             "total": len(items),
             "items": items,
             "timestamp": utc_now_iso(),
@@ -3043,6 +3046,7 @@ async def connector_inventory_changes(
                     "inventory_item_id": row.inventory_item_id,
                     "location_id": row.location_id,
                     "updated_at": row.updated_at,
+                    "source_updated_at": row.source_updated_at,
                 }
                 for row in rows
             ],
@@ -3410,12 +3414,23 @@ async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
 
     inventory_item_id = normalize_gid("InventoryItem", str(inventory_item_value))
     location_id = normalize_gid("Location", str(location_value))
-    if settings.shopify_location_id and location_id != normalize_gid("Location", settings.shopify_location_id):
-        return JSONResponse({"status": "ignored", "reason": "different_location"})
-
     shop = db.get_shop(shop_domain)
     if shop is None:
         return JSONResponse({"status": "ignored", "reason": "shop_not_installed"})
+    target_location_id = (
+        normalize_gid("Location", settings.shopify_location_id)
+        if settings.shopify_location_id
+        else run_with_shop_retry(
+            shop,
+            lambda active_shop: shopify_client.get_primary_location_id(
+                active_shop.shop_domain,
+                active_shop.access_token,
+            ),
+        )
+    )
+    if location_id != target_location_id:
+        return JSONResponse({"status": "ignored", "reason": "different_location"})
+
     sku = db.get_inventory_item_sku(
         shop_domain=shop_domain,
         inventory_item_id=inventory_item_id,
@@ -3437,14 +3452,50 @@ async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
             sku=sku,
         )
 
+    available_quantity = int(available)
+    source_updated_at_value = _string_or_none(payload.get("updated_at"))
+    source_updated_at_parsed = parse_iso_datetime(source_updated_at_value)
+    source_updated_at = (
+        source_updated_at_parsed.astimezone(timezone.utc).isoformat()
+        if source_updated_at_parsed is not None
+        else None
+    )
     db.upsert_inventory_change(
         shop_domain=shop_domain,
         inventory_item_id=inventory_item_id,
         location_id=location_id,
         sku=sku,
-        quantity=int(available),
+        quantity=available_quantity,
+        source_updated_at=source_updated_at,
     )
-    return JSONResponse({"status": "queued"})
+    previous_quantity = db.get_inventory_item_last_quantity(
+        shop_domain=shop_domain,
+        inventory_item_id=inventory_item_id,
+    )
+    status_repair: dict[str, Any] | None = None
+    if available_quantity > 0 and (previous_quantity is None or previous_quantity <= 0):
+        status_repair = run_with_shop_retry(
+            shop,
+            lambda active_shop: inventory_service.restore_auto_archived_product_by_sku(
+                shop=active_shop,
+                sku=sku,
+                expected_positive_quantity=True,
+            ),
+        )
+    db.upsert_inventory_item_quantity(
+        shop_domain=shop_domain,
+        inventory_item_id=inventory_item_id,
+        sku=sku,
+        quantity=available_quantity,
+    )
+    return JSONResponse(
+        {
+            "status": "queued",
+            "product_status_updated": bool(
+                status_repair and status_repair.get("product_status_updated")
+            ),
+        }
+    )
 
 
 @app.post("/webhooks/app-uninstalled")

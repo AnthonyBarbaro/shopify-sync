@@ -16,22 +16,40 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
    Those rows identify affected base SKUs; the connector then rereads their authoritative current
    quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
    It also checks the current numeric SKU sequence in `Item.dbf`. A SKU above the saved five-digit
-   high-water mark is uploaded once as a new product, normally within the next three-minute cycle.
+   high-water mark is held until its entire catalog payload is identical on two consecutive scans,
+   then uploaded once as a new product. If the clerk is still editing a copied product, any changed
+   field resets that stability check.
    It also compares the latest rows in `pricechg.dbf` with a small local snapshot. The first updated
    run establishes a baseline without replaying historical price changes; later changes update only
    the exact Shopify variant price. A base matrix SKU updates all of its matrix variants.
-5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation.
+5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation
+   against Shopify's actual inventory snapshot at the pinned inventory location. The first run after
+   this reconciliation upgrade also performs the pass immediately, even if today's nightly pass was
+   already recorded.
    If the computer was off at midnight, the first later cycle that day performs the missed pass.
    This full scan also catches new alphanumeric or out-of-sequence SKUs that the numeric fast path
-   cannot identify.
+   cannot identify, and repairs older SKUs that are missing a local baseline.
 6. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector consumes only those
-   changed quantities; it does not scan the entire Shopify catalog.
+   changed quantities. The full location-specific Shopify inventory snapshot is read only during the
+   upgrade/nightly reconciliation.
 7. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are
    preserved.
-8. Shopify adjustments use idempotency keys. POS writes use compare-before-update checks so a sale at
-   the register cannot be silently overwritten.
+8. Shopify adjustments use idempotency keys and return the actual resulting quantity. If that result
+   differs from the planned target because another Shopify change happened concurrently, the paired
+   POS write is deferred and recalculated on the next cycle. POS writes use compare-before-update
+   checks so a sale at the register cannot be silently overwritten.
 
-The connector intentionally does not archive Shopify products during unattended runs.
+The catalog import archives zero-quantity products and marks that transition as connector-owned. A
+later positive stock observation restores only a marked product to Draft and clears the marker;
+manual, unmarked archives are preserved. Recurring inventory cycles do not newly archive products.
+An automatically archived product created before this marker existed needs a one-time manual change
+to Draft after the upgraded reconciliation repairs its quantity.
+
+All snapshot reads, webhooks, and adjustments use the same Shopify inventory location. Set the
+Railway `SHOPIFY_LOCATION_ID` value for a multi-location store. Without it, Shopify's primary
+location is pinned; a later location change stops reconciliation for review instead of mixing stock
+from two locations. Duplicate Shopify SKUs and inventory items unavailable at that location are also
+blocked from unattended writes.
 
 ## Storage
 
@@ -144,6 +162,10 @@ Direct DBF write-back updates inventory quantities only. It does not create a PO
 financial transaction for an online Shopify order.
 
 ## Operations
+
+Deploy the Railway/backend release before updating the Windows connector. The upgraded connector
+requires inventory snapshot schema version 2 and will stop safely, without acknowledging queued
+inventory changes, if the older endpoint is still deployed.
 
 To update the Windows runtime, open `windows_connector\update_connector.bat` as Administrator. The
 updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_sync.py`, plus the small

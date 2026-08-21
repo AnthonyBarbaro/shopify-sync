@@ -47,6 +47,7 @@ Copy `.env.example` to `.env` and set:
 SHOPIFY_CLIENT_ID=your_client_id
 SHOPIFY_CLIENT_SECRET=your_client_secret
 SHOPIFY_API_VERSION=2026-01
+# SHOPIFY_LOCATION_ID=123456789
 APP_BASE_URL=https://your-domain.example
 APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations,read_orders
 APP_SESSION_SECRET=replace_with_a_long_random_secret
@@ -72,7 +73,23 @@ The unattended connector treats catalog data as a one-time import: zero-quantity
 archived, descriptions start empty, and the generated product name is added as a tag. After a base
 SKU is successfully imported, recurring connector traffic uses inventory and price-only endpoints.
 Shopify edits to titles, descriptions, tags, images, and other merchandising fields are preserved;
-a price changes only when `pricechg.dbf` records a newer POS price.
+a price changes only when `pricechg.dbf` records a newer POS price. Each successful product upload
+also saves its SKU/variant quantity baseline before the connector marks that product complete. New
+numeric products must produce the same complete catalog payload on two consecutive scans before
+they are uploaded, which avoids reading a product while a POS copy operation is still being edited.
+
+The first connector run after this inventory-reconciliation upgrade, and one run after local
+midnight each day, compares POS quantities with a lean Shopify inventory snapshot at one location.
+This repairs SKUs that predate a local baseline or whose webhook was missed during downtime. Set
+`SHOPIFY_LOCATION_ID` when the store has more than one inventory location; otherwise Shopify's
+primary location is pinned on the first verified snapshot. Duplicate Shopify SKUs and items that
+are unavailable at that location are blocked instead of being adjusted ambiguously.
+
+Products archived automatically because their imported quantity was zero carry the internal
+`pos.auto_archived_zero_stock` marker. A later positive stock update returns only those products to
+Draft and clears the marker; an unmarked manual archive remains archived. Products archived before
+this marker was introduced require a one-time manual change to Draft after their quantity is
+repaired.
 
 With `read_orders` authorized, Shopify order webhooks are held in a compact, version-safe Railway
 queue until the Windows connector writes them to `C:\ashpsdat_web\shopify-order-header.dbf` and
@@ -178,8 +195,10 @@ Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SK
 The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
 It starts with Windows, uploads product details only during the initial catalog import, processes new
 `invdtl.dbf` and `editvoid.dbf` events every three minutes, and runs one full quantity reconciliation
-after local midnight. It sends JSON changes rather than DBF ZIP archives and keeps only bounded state
-and rotating logs on the host computer.
+after local midnight. The first upgraded run also forces this reconciliation immediately. Deploy the
+Railway/backend update before updating the Windows connector; the connector rejects an older snapshot
+schema without acknowledging queued changes. It sends JSON changes rather than DBF ZIP archives and
+keeps only bounded state and rotating logs on the host computer.
 
 Exports:
 

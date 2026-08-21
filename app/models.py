@@ -122,6 +122,8 @@ class VariantMapping(BaseModel):
     variant_id: str
     product_id: str
     inventory_item_id: str
+    product_status: Optional[str] = None
+    auto_archived_zero_stock: bool = False
     current_price: Optional[float] = None
     current_cost: Optional[float] = None
     inventory_levels: List[InventoryLevelSnapshot] = Field(default_factory=list)

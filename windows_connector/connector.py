@@ -12,7 +12,7 @@ import struct
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -49,6 +49,9 @@ else:
 
 STATE_VERSION = 1
 MATRIX_OPTION_SCHEMA_VERSION = 2
+NEW_PRODUCT_STABLE_OBSERVATIONS = 2
+INVENTORY_RECONCILE_SCHEMA_VERSION = 2
+INVENTORY_SNAPSHOT_SCHEMA_VERSION = 2
 POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
 MATRIX_VARIANT_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 
@@ -237,17 +240,24 @@ class Connector:
             now=now,
             hour=self.nightly_full_sync_hour,
         )
+        inventory_reconcile_upgrade_due = (
+            int(state.get("inventory_reconcile_schema_version") or 0)
+            < INVENTORY_RECONCILE_SCHEMA_VERSION
+        )
         full_reconcile = (
             catalog_incomplete
             or nightly_due
             or event_file_reset
             or matrix_option_repair_due
+            or inventory_reconcile_upgrade_due
         )
         if full_reconcile:
             if catalog_incomplete:
                 read_mode = "initial"
             elif matrix_option_repair_due:
                 read_mode = "matrix-option-repair"
+            elif inventory_reconcile_upgrade_due:
+                read_mode = "inventory-reconcile-upgrade"
             else:
                 read_mode = "nightly"
         elif affected_base_skus:
@@ -294,6 +304,7 @@ class Connector:
         discovered_sku_bases = sku_base_mapping(payloads)
         if full_reconcile:
             state["sku_bases"] = discovered_sku_bases
+            sku_bases = discovered_sku_bases
         else:
             sku_bases.update(discovered_sku_bases)
         if full_reconcile:
@@ -313,9 +324,38 @@ class Connector:
             skipped_non_sellable,
         )
 
-        new_base_skus = [sku for sku in payload_by_base if sku not in known_products]
+        new_payloads = [
+            payload
+            for sku, payload in payload_by_base.items()
+            if sku not in known_products
+        ]
+        if not catalog_incomplete and new_numeric_skus:
+            numeric_payloads = [
+                payload
+                for payload in new_payloads
+                if str(payload.get("sku") or "") in new_numeric_skus
+            ]
+            stable_numeric_payloads = stable_catalog_payloads(numeric_payloads, state)
+            stable_numeric_skus = {
+                str(payload.get("sku") or "")
+                for payload in stable_numeric_payloads
+            }
+            waiting_count = len(numeric_payloads) - len(stable_numeric_payloads)
+            new_payloads = [
+                payload
+                for payload in new_payloads
+                if str(payload.get("sku") or "") not in new_numeric_skus
+                or str(payload.get("sku") or "") in stable_numeric_skus
+            ]
+            if waiting_count:
+                self.logger.info(
+                    "catalog_upload_waiting_for_stable products=%s required_observations=%s",
+                    waiting_count,
+                    NEW_PRODUCT_STABLE_OBSERVATIONS,
+                )
+        new_base_skus = [str(payload["sku"]) for payload in new_payloads]
+        uploaded_inventory_skus: set[str] = set()
         if new_base_skus and self.initial_catalog_upload:
-            new_payloads = [payload_by_base[sku] for sku in new_base_skus]
             if self.dry_run:
                 self.logger.info(
                     "catalog_upload_dry_run mode=%s products=%s",
@@ -324,17 +364,20 @@ class Connector:
                 )
             else:
                 succeeded = self._upload_catalog(new_payloads, state=state)
+                uploaded_inventory_skus = set(
+                    flatten_quantities(
+                        payload
+                        for payload in new_payloads
+                        if str(payload.get("sku") or "") in succeeded
+                    )
+                )
                 known_products.update(succeeded)
+                pending_products = state.setdefault("pending_catalog_products", {})
+                for sku in succeeded:
+                    pending_products.pop(sku, None)
                 state["catalog_products"] = sorted(known_products, key=str.casefold)
                 if catalog_incomplete:
                     state["catalog_complete"] = len(known_products) >= len(payload_by_base)
-                if catalog_incomplete and state["catalog_complete"]:
-                    quantity_entries = state.setdefault("quantities", {})
-                    for sku, quantity in local_quantities.items():
-                        quantity_entries.setdefault(
-                            sku,
-                            {"canonical": quantity, "pos_seen": quantity, "shop_seen": quantity},
-                        )
                 save_state(self.state_path, state)
                 self.logger.info(
                     "catalog_upload_complete mode=%s attempted=%s succeeded=%s remaining=%s",
@@ -372,15 +415,158 @@ class Connector:
         if self.price_sync_enabled:
             self._sync_pos_price_changes(state)
 
+        inventory_snapshot: Optional[Dict[str, Any]] = None
+        if (
+            full_reconcile
+            and not catalog_incomplete
+            and bool(state.get("catalog_complete"))
+        ):
+            inventory_snapshot = self._fetch_inventory_snapshot()
+
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
-        remote_quantities = {
-            sku: int(entry.get("shop_seen") or 0)
-            for sku, entry in entries.items()
-        }
-        for change in inventory_changes:
-            sku = str(change.get("sku") or "").strip()
-            if sku:
+        remote_quantities = (
+            {}
+            if inventory_snapshot is not None
+            else {
+                sku: int(entry.get("shop_seen") or 0)
+                for sku, entry in entries.items()
+            }
+        )
+        remote_updated_at: Dict[str, str] = {}
+        blocked_inventory_skus = set(state.get("blocked_inventory_skus") or [])
+        if inventory_snapshot is None:
+            inventory_items_by_sku: Dict[str, set[str]] = {}
+            for change in inventory_changes:
+                sku = str(change.get("sku") or "").strip()
+                inventory_item_id = str(change.get("inventory_item_id") or "").strip()
+                if sku and inventory_item_id:
+                    inventory_items_by_sku.setdefault(sku, set()).add(inventory_item_id)
+            newly_ambiguous_skus = {
+                sku
+                for sku, inventory_item_ids in inventory_items_by_sku.items()
+                if len(inventory_item_ids) > 1
+            }
+            if newly_ambiguous_skus:
+                blocked_inventory_skus.update(newly_ambiguous_skus)
+                state["blocked_inventory_skus"] = sorted(
+                    blocked_inventory_skus,
+                    key=str.casefold,
+                )
+                for sku in sorted(newly_ambiguous_skus, key=str.casefold):
+                    self.logger.error("inventory_webhook_duplicate_sku sku=%s", sku)
+            for sku in blocked_inventory_skus:
+                remote_quantities.pop(sku, None)
+            for change in inventory_changes:
+                sku = str(change.get("sku") or "").strip()
+                if not sku or sku in blocked_inventory_skus:
+                    continue
+                source_updated_at = str(change.get("source_updated_at") or "").strip()
+                previous_updated_at = remote_updated_at.get(sku) or str(
+                    (entries.get(sku) or {}).get("shop_seen_at") or ""
+                )
+                if source_updated_at and not inventory_observation_is_newer(
+                    source_updated_at,
+                    previous_updated_at,
+                ):
+                    self.logger.warning(
+                        "inventory_webhook_stale sku=%s source_updated_at=%s current_updated_at=%s",
+                        sku,
+                        source_updated_at,
+                        previous_updated_at,
+                    )
+                    continue
                 remote_quantities[sku] = int(change.get("quantity") or 0)
+                if source_updated_at:
+                    remote_updated_at[sku] = source_updated_at
+        if inventory_snapshot is not None:
+            snapshot_items = inventory_snapshot["items"]
+            snapshot_location_id = str(inventory_snapshot["location_id"])
+            previous_location_id = str(state.get("inventory_location_id") or "")
+            if previous_location_id and previous_location_id != snapshot_location_id:
+                raise RuntimeError(
+                    "Shopify inventory location changed from "
+                    f"{previous_location_id} to {snapshot_location_id}; "
+                    "review SHOPIFY_LOCATION_ID before reconciling."
+                )
+            blocked_snapshot_skus: set[str] = set()
+            snapshot_skus: set[str] = set()
+            for item in snapshot_items:
+                sku = str(item.get("sku") or "").strip()
+                if not sku:
+                    continue
+                snapshot_skus.add(sku)
+                if str(item.get("location_id") or "") != snapshot_location_id:
+                    raise RuntimeError(
+                        f"Inventory snapshot returned SKU {sku} for an unexpected location."
+                    )
+                if int(item.get("duplicate_sku_count") or 0) > 0:
+                    blocked_snapshot_skus.add(sku)
+                    remote_quantities.pop(sku, None)
+                    remote_updated_at.pop(sku, None)
+                    self.logger.error(
+                        "inventory_snapshot_duplicate_sku sku=%s count=%s",
+                        sku,
+                        item.get("duplicate_sku_count"),
+                    )
+                    continue
+                if not item.get("available_at_location") or item.get("quantity") is None:
+                    blocked_snapshot_skus.add(sku)
+                    remote_quantities.pop(sku, None)
+                    remote_updated_at.pop(sku, None)
+                    self.logger.error(
+                        "inventory_snapshot_location_unavailable sku=%s location_id=%s",
+                        sku,
+                        item.get("location_id"),
+                    )
+                    continue
+                if sku in uploaded_inventory_skus:
+                    continue
+                if sku not in blocked_snapshot_skus:
+                    snapshot_updated_at = str(
+                        item.get("inventory_level_updated_at") or ""
+                    ).strip()
+                    existing_entry = entries.get(sku) or {}
+                    existing_updated_at = str(
+                        existing_entry.get("shop_seen_at") or ""
+                    ).strip()
+                    if inventory_observation_is_older(
+                        snapshot_updated_at,
+                        existing_updated_at,
+                    ):
+                        remote_quantities[sku] = int(
+                            existing_entry.get("shop_seen") or 0
+                        )
+                        remote_updated_at[sku] = existing_updated_at
+                        self.logger.warning(
+                            "inventory_snapshot_stale sku=%s snapshot_updated_at=%s current_updated_at=%s",
+                            sku,
+                            snapshot_updated_at,
+                            existing_updated_at,
+                        )
+                        continue
+                    remote_quantities[sku] = int(item["quantity"])
+                    if snapshot_updated_at:
+                        remote_updated_at[sku] = snapshot_updated_at
+            expected_snapshot_skus = {
+                sku
+                for sku in local_quantities
+                if sku_bases.get(sku, base_sku(sku)) in known_products
+            }
+            missing_snapshot_skus = expected_snapshot_skus - snapshot_skus
+            blocked_snapshot_skus.update(missing_snapshot_skus)
+            for sku in sorted(missing_snapshot_skus, key=str.casefold):
+                self.logger.error("inventory_snapshot_missing_sku sku=%s", sku)
+            state["blocked_inventory_skus"] = sorted(
+                blocked_snapshot_skus,
+                key=str.casefold,
+            )
+            state["inventory_location_id"] = snapshot_location_id
+            self.logger.info(
+                "shopify_inventory_snapshot items=%s usable=%s blocked=%s",
+                len(snapshot_items),
+                len(remote_quantities),
+                len(blocked_snapshot_skus),
+            )
         initialized = 0
         for sku in sorted(local_quantities.keys() & remote_quantities.keys(), key=str.casefold):
             if sku in entries:
@@ -396,6 +582,8 @@ class Connector:
                 "pos_seen": pos_quantity,
                 "shop_seen": shop_quantity,
             }
+            if remote_updated_at.get(sku):
+                entries[sku]["shop_seen_at"] = remote_updated_at[sku]
             initialized += 1
 
         planned_shop: List[Dict[str, Any]] = []
@@ -414,6 +602,8 @@ class Connector:
             entry["canonical"] = target
             entry["pos_seen"] = pos_quantity
             entry["shop_seen"] = shop_quantity
+            if remote_updated_at.get(sku):
+                entry["shop_seen_at"] = remote_updated_at[sku]
             shop_adjustment = plan["shop_adjustment"]
             pos_adjustment = plan["pos_adjustment"]
             revision = int(entry.get("revision") or 0)
@@ -425,6 +615,7 @@ class Connector:
                 action = {
                     "sku": sku,
                     "delta": shop_adjustment,
+                    "target_quantity": target,
                     "idempotency_key": adjustment_key(
                         "shopify", sku, revision, previous_pos, pos_quantity, previous_shop, shop_quantity, target
                     ),
@@ -435,6 +626,7 @@ class Connector:
                 action = {
                     "sku": sku,
                     "delta": pos_adjustment,
+                    "target_quantity": target,
                     "expected_quantity": pos_quantity,
                     "idempotency_key": adjustment_key(
                         "pos", sku, revision, previous_pos, pos_quantity, previous_shop, shop_quantity, target
@@ -453,14 +645,23 @@ class Connector:
             )
             return
 
-        if full_reconcile:
+        if inventory_snapshot is not None:
             state["last_full_reconcile_date"] = now.date().isoformat()
+            state["inventory_reconcile_schema_version"] = INVENTORY_RECONCILE_SCHEMA_VERSION
         save_state(self.state_path, state)
+        deferred_pos_skus: set[str] = set()
         if planned_shop:
-            self._apply_shopify_adjustments(state, planned_shop)
+            deferred_pos_skus = self._apply_shopify_adjustments(state, planned_shop) or set()
         if planned_pos:
             if self.writeback_mode == "vfp-oledb":
-                self._apply_pos_adjustments(state, planned_pos)
+                current_pos_actions = [
+                    action
+                    for action in planned_pos
+                    if action["sku"] not in deferred_pos_skus
+                    and (state["quantities"].get(action["sku"]) or {}).get("pending_pos") == action
+                ]
+                if current_pos_actions:
+                    self._apply_pos_adjustments(state, current_pos_actions)
             else:
                 self.logger.warning(
                     "pos_writeback_not_applied mode=%s adjustments=%s",
@@ -525,6 +726,14 @@ class Connector:
             for row in dbf_pos_sync.iter_dbf_rows(item_path)
             if str(row.get("SKU") or "").strip()
         ]
+        item_sku_set = set(item_skus)
+        pending_products: Dict[str, Dict[str, Any]] = state.setdefault(
+            "pending_catalog_products",
+            {},
+        )
+        for pending_sku in list(pending_products):
+            if pending_sku in known_products or pending_sku not in item_sku_set:
+                pending_products.pop(pending_sku, None)
         candidates, high_water, digit_width = numeric_sku_increases(
             item_skus,
             known_products=known_products,
@@ -533,11 +742,15 @@ class Connector:
         )
         state["numeric_sku_high_water"] = high_water
         state["numeric_sku_digit_width"] = digit_width
-        if candidates:
+        detected_candidates = set(candidates)
+        for candidate in detected_candidates:
+            pending_products.setdefault(candidate, {})
+        candidates.update(pending_products)
+        if detected_candidates:
             self.logger.info(
                 "new_numeric_products_detected new_high=%s skus=%s",
                 high_water,
-                ",".join(sorted(candidates, key=int)),
+                ",".join(sorted(detected_candidates, key=int)),
             )
         return candidates
 
@@ -608,6 +821,16 @@ class Connector:
                     base_sku = str(payload["sku"])
                     succeeded.add(base_sku)
                     known_products.add(base_sku)
+                    quantity_entries = state.setdefault("quantities", {})
+                    for inventory_sku, quantity in flatten_quantities([payload]).items():
+                        quantity_entries.setdefault(
+                            inventory_sku,
+                            {
+                                "canonical": quantity,
+                                "pos_seen": quantity,
+                                "shop_seen": quantity,
+                            },
+                        )
                 else:
                     self.logger.error("catalog_product_failed sku=%s message=%s", payload.get("sku"), result.get("message"))
             state["catalog_products"] = sorted(known_products, key=str.casefold)
@@ -630,6 +853,24 @@ class Connector:
         response = self.session.get(f"{self.base_url}/sync/inventory/changes?limit=5000", timeout=self.timeout)
         response.raise_for_status()
         return list(response.json().get("items") or [])
+
+    def _fetch_inventory_snapshot(self) -> Dict[str, Any]:
+        response = self.session.get(f"{self.base_url}/sync/inventory", timeout=self.timeout)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("Inventory snapshot response must be a JSON object.")
+        if int(body.get("schema_version") or 0) != INVENTORY_SNAPSHOT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "Inventory snapshot API schema is incompatible with this connector."
+            )
+        location_id = str(body.get("location_id") or "").strip()
+        items = body.get("items")
+        if not location_id or not isinstance(items, list):
+            raise RuntimeError("Inventory snapshot response is missing its location or items.")
+        if any(not isinstance(item, dict) for item in items):
+            raise RuntimeError("Inventory snapshot contains an invalid item row.")
+        return {"location_id": location_id, "items": items}
 
     def _repair_matrix_options(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
         summary = {"updated": 0, "already_correct": 0, "failed": 0}
@@ -896,17 +1137,22 @@ class Connector:
     def _retry_pending(self, state: Dict[str, Any]) -> None:
         entries = state.get("quantities") or {}
         shop_actions = [entry["pending_shop"] for entry in entries.values() if entry.get("pending_shop")]
-        pos_actions = [entry["pending_pos"] for entry in entries.values() if entry.get("pending_pos")]
         if shop_actions:
             self.logger.warning("retrying_pending_shopify_adjustments count=%s", len(shop_actions))
             self._apply_shopify_adjustments(state, shop_actions)
+        pos_actions = [entry["pending_pos"] for entry in entries.values() if entry.get("pending_pos")]
         if pos_actions and self.writeback_mode == "vfp-oledb":
             self.logger.warning("retrying_pending_pos_adjustments count=%s", len(pos_actions))
             self._apply_pos_adjustments(state, pos_actions)
 
-    def _apply_shopify_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
+    def _apply_shopify_adjustments(
+        self,
+        state: Dict[str, Any],
+        actions: List[Dict[str, Any]],
+    ) -> set[str]:
         endpoint = f"{self.base_url}/sync/inventory/adjustments"
         entries = state["quantities"]
+        deferred_pos_skus: set[str] = set()
         for chunk in chunks(actions, min(self.batch_size, 250)):
             response = self.session.post(endpoint, json={"adjustments": chunk}, timeout=self.timeout)
             response.raise_for_status()
@@ -921,9 +1167,37 @@ class Connector:
                     )
                     continue
                 entry = entries[action["sku"]]
-                entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
+                quantity_after_change = result.get("quantity_after_change")
+                inventory_updated_at = str(result.get("inventory_updated_at") or "").strip()
+                if inventory_updated_at:
+                    entry["shop_seen_at"] = inventory_updated_at
+                if quantity_after_change is None:
+                    entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
+                    if entry.pop("pending_pos", None) is not None:
+                        deferred_pos_skus.add(action["sku"])
+                    self.logger.warning(
+                        "pos_adjustment_deferred_after_unconfirmed_shopify_result sku=%s",
+                        action["sku"],
+                    )
+                else:
+                    entry["shop_seen"] = int(quantity_after_change)
+                    entry["canonical"] = int(quantity_after_change)
+                    target_quantity = action.get("target_quantity")
+                    if (
+                        target_quantity is not None
+                        and int(quantity_after_change) != int(target_quantity)
+                    ):
+                        if entry.pop("pending_pos", None) is not None:
+                            deferred_pos_skus.add(action["sku"])
+                        self.logger.warning(
+                            "pos_adjustment_deferred_after_shopify_race sku=%s planned=%s actual=%s",
+                            action["sku"],
+                            target_quantity,
+                            quantity_after_change,
+                        )
                 entry.pop("pending_shop", None)
             save_state(self.state_path, state)
+        return deferred_pos_skus
 
     def _apply_pos_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
         if not self.writer_script.exists():
@@ -1332,6 +1606,46 @@ def catalog_upload_priority(payload: Dict[str, Any]) -> int:
     return 0 if catalog_total_quantity(payload) > 0 else 1
 
 
+def stable_catalog_payloads(
+    payloads: Iterable[Dict[str, Any]],
+    state: Dict[str, Any],
+    *,
+    required_observations: int = NEW_PRODUCT_STABLE_OBSERVATIONS,
+) -> List[Dict[str, Any]]:
+    """Delay newly copied products until their complete payload is stable."""
+    pending_products: Dict[str, Dict[str, Any]] = state.setdefault(
+        "pending_catalog_products",
+        {},
+    )
+    ready: List[Dict[str, Any]] = []
+    for payload in payloads:
+        sku = str(payload.get("sku") or "").strip()
+        if not sku:
+            continue
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                payload,
+                default=str,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        previous = pending_products.get(sku) or {}
+        observations = (
+            int(previous.get("observations") or 0) + 1
+            if previous.get("fingerprint") == fingerprint
+            else 1
+        )
+        pending_products[sku] = {
+            "fingerprint": fingerprint,
+            "observations": observations,
+        }
+        if observations >= max(1, int(required_observations)):
+            ready.append(payload)
+    return ready
+
+
 def negative_catalog_money_field(payload: Dict[str, Any]) -> Optional[str]:
     for field in ("price", "compare_at_price", "cost"):
         value = payload.get(field)
@@ -1367,6 +1681,41 @@ def merge_quantity(
         "shop_adjustment": target - int(shop_quantity),
         "pos_adjustment": target - int(pos_quantity),
     }
+
+
+def parse_inventory_observation_timestamp(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def inventory_observation_is_newer(candidate: str, current: str) -> bool:
+    if not current:
+        return True
+    candidate_time = parse_inventory_observation_timestamp(candidate)
+    current_time = parse_inventory_observation_timestamp(current)
+    if candidate_time is not None and current_time is not None:
+        return candidate_time > current_time
+    return candidate > current
+
+
+def inventory_observation_is_older(candidate: str, current: str) -> bool:
+    if not candidate or not current:
+        return False
+    candidate_time = parse_inventory_observation_timestamp(candidate)
+    current_time = parse_inventory_observation_timestamp(current)
+    if candidate_time is not None and current_time is not None:
+        return candidate_time < current_time
+    return candidate < current
 
 
 def adjustment_key(system: str, sku: str, *values: int) -> str:
@@ -1418,6 +1767,8 @@ def load_state(path: Path) -> Dict[str, Any]:
                 data.setdefault("quantities", {})
                 data.setdefault("event_cursors", {})
                 data.setdefault("sku_bases", {})
+                data.setdefault("pending_catalog_products", {})
+                data.setdefault("blocked_inventory_skus", [])
                 return data
         except (OSError, ValueError, json.JSONDecodeError):
             continue
@@ -1428,6 +1779,8 @@ def load_state(path: Path) -> Dict[str, Any]:
         "quantities": {},
         "event_cursors": {},
         "sku_bases": {},
+        "pending_catalog_products": {},
+        "blocked_inventory_skus": [],
     }
 
 

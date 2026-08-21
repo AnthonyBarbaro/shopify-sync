@@ -1,4 +1,5 @@
 import io
+import json
 import sqlite3
 import struct
 import subprocess
@@ -15,9 +16,10 @@ from unittest import mock
 from app.db import DatabaseStore
 from app.db import ShopRecord
 from app.inventory import InventorySyncService
-from app.models import InventoryLevelSnapshot, VariantMapping
+from app.models import InventoryLevelSnapshot, ProductSyncRequest, VariantMapping
 from app.pos_archive import save_uploaded_archive
 from app.shopify import ShopifyClient
+from app.utils import SyncProcessingError
 from windows_connector.order_dbf import (
     DETAIL_FIELDS,
     HEADER_FIELDS,
@@ -37,6 +39,8 @@ from windows_connector.connector import (
     detect_price_changes,
     flatten_quantities,
     iter_selected_dbf_rows,
+    inventory_observation_is_newer,
+    inventory_observation_is_older,
     matrix_variant_sku_for_row,
     matrix_length_repair_candidates,
     merge_quantity,
@@ -44,7 +48,9 @@ from windows_connector.connector import (
     nightly_full_sync_due,
     numeric_sku_increases,
     read_appended_dbf_rows,
+    save_state,
     sku_base_mapping,
+    stable_catalog_payloads,
     upsert_order_changes,
     validate_order_dbf_paths,
 )
@@ -112,6 +118,18 @@ class QuantityMergeTests(unittest.TestCase):
         later = adjustment_key("shopify", "ABC", 3, 10, 9, 10, 10, 9)
         self.assertNotEqual(first, later)
 
+    def test_inventory_source_timestamps_reject_delayed_observations(self):
+        current = "2026-08-21T12:00:00Z"
+        self.assertTrue(
+            inventory_observation_is_newer("2026-08-21T12:01:00+00:00", current)
+        )
+        self.assertFalse(
+            inventory_observation_is_newer("2026-08-21T11:59:00Z", current)
+        )
+        self.assertTrue(
+            inventory_observation_is_older("2026-08-21T11:59:00Z", current)
+        )
+
 
 class CatalogUploadPriorityTests(unittest.TestCase):
     def test_negative_price_products_are_not_eligible_for_shopify_upload(self):
@@ -155,6 +173,28 @@ class CatalogUploadPriorityTests(unittest.TestCase):
         self.assertEqual(catalog_total_quantity(matrix), 2)
         self.assertEqual(catalog_upload_priority(matrix), 0)
 
+    def test_new_product_waits_for_two_identical_complete_payloads(self):
+        state = {}
+        first = {"sku": "22392", "quantity": 0, "price": 195}
+        finished = {"sku": "22392", "quantity": 6, "price": 195}
+
+        self.assertEqual(stable_catalog_payloads([first], state), [])
+        self.assertEqual(stable_catalog_payloads([finished], state), [])
+        self.assertEqual(stable_catalog_payloads([finished], state), [finished])
+        self.assertEqual(
+            state["pending_catalog_products"]["22392"]["observations"],
+            2,
+        )
+
+    def test_new_product_stability_uses_the_entire_payload(self):
+        state = {}
+        first = {"sku": "22391", "quantity": 4, "title": "Copied shirt"}
+        edited = {"sku": "22391", "quantity": 4, "title": "Black shirt"}
+
+        stable_catalog_payloads([first], state)
+        self.assertEqual(stable_catalog_payloads([edited], state), [])
+        self.assertEqual(stable_catalog_payloads([edited], state), [edited])
+
     def test_matrix_length_repair_candidates_include_variant_skus(self):
         candidates = matrix_length_repair_candidates(
             [
@@ -192,6 +232,78 @@ class CatalogUploadPriorityTests(unittest.TestCase):
                 }
             ],
         )
+
+
+class CatalogUploadBaselineTests(unittest.TestCase):
+    def test_successful_incremental_upload_persists_every_quantity_baseline(self):
+        class Response:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "results": [
+                        {"success": True},
+                        {"success": True},
+                        {"success": False, "message": "rejected"},
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector = Connector.__new__(Connector)
+            connector.base_url = "https://sync.example"
+            connector.batch_size = 25
+            connector.timeout = 30
+            connector.state_path = Path(temporary_directory) / "state.json"
+            connector.order_sync_enabled = False
+            connector.logger = mock.Mock()
+            connector.session = mock.Mock()
+            connector.session.post.return_value = Response()
+            state = {
+                "version": 1,
+                "catalog_products": [],
+                "quantities": {
+                    "MATRIX. 1 1": {
+                        "canonical": 9,
+                        "pos_seen": 9,
+                        "shop_seen": 9,
+                        "pending_shop": {"delta": 1},
+                    }
+                },
+            }
+            payloads = [
+                {"sku": "ZERO", "quantity": 0},
+                {
+                    "sku": "MATRIX",
+                    "variants": [
+                        {"sku": "MATRIX. 1 1", "quantity": 4},
+                        {"sku": "MATRIX. 1 2", "quantity": 2},
+                    ],
+                },
+                {"sku": "FAILED", "quantity": 7},
+            ]
+
+            succeeded = connector._upload_catalog(payloads, state=state)
+
+            self.assertEqual(succeeded, {"ZERO", "MATRIX"})
+            self.assertEqual(state["catalog_products"], ["MATRIX", "ZERO"])
+            self.assertEqual(
+                state["quantities"]["ZERO"],
+                {"canonical": 0, "pos_seen": 0, "shop_seen": 0},
+            )
+            self.assertEqual(
+                state["quantities"]["MATRIX. 1 2"],
+                {"canonical": 2, "pos_seen": 2, "shop_seen": 2},
+            )
+            self.assertEqual(state["quantities"]["MATRIX. 1 1"]["canonical"], 9)
+            self.assertIn("pending_shop", state["quantities"]["MATRIX. 1 1"])
+            self.assertNotIn("FAILED", state["quantities"])
+
+            persisted = connector.state_path.read_text(encoding="utf-8")
+            self.assertIn('"ZERO":{"canonical":0', persisted)
 
 
 class PriceChangeDetectionTests(unittest.TestCase):
@@ -361,6 +473,285 @@ class IncrementalPosEventTests(unittest.TestCase):
         self.assertFalse(nightly_full_sync_due("2026-07-22", now=after_midnight, hour=2))
 
 
+class FullInventoryReconciliationTests(unittest.TestCase):
+    def test_nightly_snapshot_repairs_skus_missing_connector_baselines(self):
+        for shopify_quantity, expected_delta in ((0, 6), (4, 2)):
+            with self.subTest(shopify_quantity=shopify_quantity):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    connector = Connector.__new__(Connector)
+                    connector.dry_run = False
+                    connector.order_sync_enabled = False
+                    connector.price_sync_enabled = False
+                    connector.initial_catalog_upload = True
+                    connector.nightly_full_sync_hour = 0
+                    connector.writeback_mode = "dry-run"
+                    connector.state_path = Path(temporary_directory) / "state.json"
+                    connector.logger = mock.Mock()
+                    connector._retry_pending = mock.Mock()
+                    connector._fetch_inventory_changes = mock.Mock(
+                        return_value=[
+                            {
+                                "id": 1,
+                                "version": 1,
+                                "sku": "22392",
+                                "quantity": 1,
+                                "inventory_item_id": "gid://shopify/InventoryItem/3",
+                            }
+                        ]
+                    )
+                    connector._collect_pos_event_skus = mock.Mock(return_value=(set(), False))
+                    connector._collect_new_numeric_product_skus = mock.Mock(return_value=set())
+                    connector._reader_args = mock.Mock(return_value=SimpleNamespace())
+                    connector._fetch_inventory_snapshot = mock.Mock(
+                        return_value={
+                            "location_id": "gid://shopify/Location/4",
+                            "items": [
+                                {
+                                    "sku": "22392",
+                                    "quantity": shopify_quantity,
+                                    "location_id": "gid://shopify/Location/4",
+                                    "available_at_location": True,
+                                    "duplicate_sku_count": 0,
+                                }
+                            ],
+                        }
+                    )
+                    connector._acknowledge_inventory_changes = mock.Mock()
+                    applied_actions = []
+
+                    def apply_adjustments(state, actions):
+                        applied_actions.extend(actions)
+                        for action in actions:
+                            entry = state["quantities"][action["sku"]]
+                            entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
+                            entry.pop("pending_shop", None)
+                        save_state(connector.state_path, state)
+
+                    connector._apply_shopify_adjustments = apply_adjustments
+                    save_state(
+                        connector.state_path,
+                        {
+                            "version": 1,
+                            "catalog_complete": True,
+                            "catalog_products": ["22392"],
+                            "quantities": {},
+                            "event_cursors": {},
+                            "sku_bases": {"22392": "22392"},
+                            "pending_catalog_products": {},
+                            "matrix_option_schema_version": 2,
+                            "last_full_reconcile_date": datetime.now().date().isoformat(),
+                        },
+                    )
+                    prepared = SimpleNamespace(payload={"sku": "22392", "quantity": 6})
+                    stats = SimpleNamespace(skipped_non_sellable=0)
+
+                    with mock.patch.object(
+                        sys.modules["windows_connector.connector"].dbf_pos_sync,
+                        "load_products",
+                        return_value=([prepared], stats),
+                    ):
+                        connector.run_cycle()
+
+                    self.assertEqual(len(applied_actions), 1)
+                    self.assertEqual(applied_actions[0]["sku"], "22392")
+                    self.assertEqual(applied_actions[0]["delta"], expected_delta)
+                    persisted = json.loads(connector.state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        {
+                            key: persisted["quantities"]["22392"][key]
+                            for key in ("canonical", "pos_seen", "shop_seen")
+                        },
+                        {"canonical": 6, "pos_seen": 6, "shop_seen": 6},
+                    )
+                    self.assertNotIn("pending_shop", persisted["quantities"]["22392"])
+                    self.assertEqual(persisted["inventory_reconcile_schema_version"], 2)
+                    self.assertEqual(
+                        persisted["inventory_location_id"],
+                        "gid://shopify/Location/4",
+                    )
+
+    def test_duplicate_snapshot_sku_is_blocked_from_all_adjustments(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector = Connector.__new__(Connector)
+            connector.dry_run = False
+            connector.order_sync_enabled = False
+            connector.price_sync_enabled = False
+            connector.initial_catalog_upload = True
+            connector.nightly_full_sync_hour = 0
+            connector.writeback_mode = "vfp-oledb"
+            connector.state_path = Path(temporary_directory) / "state.json"
+            connector.logger = mock.Mock()
+            connector._retry_pending = mock.Mock()
+            connector._fetch_inventory_changes = mock.Mock(return_value=[])
+            connector._collect_pos_event_skus = mock.Mock(return_value=(set(), False))
+            connector._collect_new_numeric_product_skus = mock.Mock(return_value=set())
+            connector._reader_args = mock.Mock(return_value=SimpleNamespace())
+            connector._fetch_inventory_snapshot = mock.Mock(
+                return_value={
+                    "location_id": "gid://shopify/Location/4",
+                    "items": [
+                        {
+                            "sku": "DUP",
+                            "quantity": 0,
+                            "location_id": "gid://shopify/Location/4",
+                            "available_at_location": True,
+                            "duplicate_sku_count": 1,
+                        }
+                    ],
+                }
+            )
+            connector._apply_shopify_adjustments = mock.Mock()
+            connector._apply_pos_adjustments = mock.Mock()
+            connector._acknowledge_inventory_changes = mock.Mock()
+            save_state(
+                connector.state_path,
+                {
+                    "version": 1,
+                    "catalog_complete": True,
+                    "catalog_products": ["DUP"],
+                    "quantities": {
+                        "DUP": {"canonical": 6, "pos_seen": 6, "shop_seen": 6}
+                    },
+                    "event_cursors": {},
+                    "sku_bases": {"DUP": "DUP"},
+                    "pending_catalog_products": {},
+                    "matrix_option_schema_version": 2,
+                    "last_full_reconcile_date": datetime.now().date().isoformat(),
+                },
+            )
+            prepared = SimpleNamespace(payload={"sku": "DUP", "quantity": 6})
+            stats = SimpleNamespace(skipped_non_sellable=0)
+
+            with mock.patch.object(
+                sys.modules["windows_connector.connector"].dbf_pos_sync,
+                "load_products",
+                return_value=([prepared], stats),
+            ):
+                connector.run_cycle()
+
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+            persisted = json.loads(connector.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["blocked_inventory_skus"], ["DUP"])
+
+    def test_snapshot_client_rejects_an_old_response_schema(self):
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.timeout = 30
+        connector.session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {"items": [{"sku": "ABC", "quantity": 1}]}
+        connector.session.get.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "schema is incompatible"):
+            connector._fetch_inventory_snapshot()
+
+        response.raise_for_status.assert_called_once()
+
+    def test_actual_shopify_result_cancels_a_stale_paired_pos_adjustment(self):
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.timeout = 30
+        connector.batch_size = 25
+        connector.logger = mock.Mock()
+        connector.state_path = Path("unused-state.json")
+        connector.session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {
+            "results": [
+                {
+                    "success": True,
+                    "sku": "ABC",
+                    "quantity_after_change": 9,
+                }
+            ]
+        }
+        connector.session.post.return_value = response
+        shop_action = {
+            "sku": "ABC",
+            "delta": -1,
+            "target_quantity": 8,
+            "idempotency_key": "shop-key",
+        }
+        pos_action = {
+            "sku": "ABC",
+            "delta": -1,
+            "target_quantity": 8,
+            "expected_quantity": 9,
+            "idempotency_key": "pos-key",
+        }
+        state = {
+            "quantities": {
+                "ABC": {
+                    "canonical": 8,
+                    "pos_seen": 9,
+                    "shop_seen": 9,
+                    "pending_shop": shop_action,
+                    "pending_pos": pos_action,
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector.state_path = Path(temporary_directory) / "state.json"
+            deferred = connector._apply_shopify_adjustments(state, [shop_action])
+
+        self.assertEqual(deferred, {"ABC"})
+        self.assertEqual(state["quantities"]["ABC"]["canonical"], 9)
+        self.assertEqual(state["quantities"]["ABC"]["shop_seen"], 9)
+        self.assertNotIn("pending_shop", state["quantities"]["ABC"])
+        self.assertNotIn("pending_pos", state["quantities"]["ABC"])
+
+    def test_unconfirmed_shopify_result_defers_a_paired_pos_adjustment(self):
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.timeout = 30
+        connector.batch_size = 25
+        connector.logger = mock.Mock()
+        connector.session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {
+            "results": [
+                {
+                    "success": True,
+                    "sku": "ABC",
+                    "quantity_after_change": None,
+                }
+            ]
+        }
+        connector.session.post.return_value = response
+        shop_action = {
+            "sku": "ABC",
+            "delta": -1,
+            "target_quantity": 8,
+            "idempotency_key": "shop-key",
+        }
+        state = {
+            "quantities": {
+                "ABC": {
+                    "canonical": 8,
+                    "pos_seen": 9,
+                    "shop_seen": 9,
+                    "pending_shop": shop_action,
+                    "pending_pos": {
+                        "sku": "ABC",
+                        "delta": -1,
+                        "target_quantity": 8,
+                        "expected_quantity": 9,
+                        "idempotency_key": "pos-key",
+                    },
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector.state_path = Path(temporary_directory) / "state.json"
+            deferred = connector._apply_shopify_adjustments(state, [shop_action])
+
+        self.assertEqual(deferred, {"ABC"})
+        self.assertNotIn("pending_pos", state["quantities"]["ABC"])
+
+
 class DatabaseRetentionTests(unittest.TestCase):
     def test_feed_and_request_history_are_bounded(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -508,6 +899,82 @@ class DatabaseRetentionTests(unittest.TestCase):
                 1,
             )
 
+    def test_inventory_item_quantity_observation_survives_queue_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(str(Path(temporary_directory) / "sync.sqlite3"), "test-secret")
+            item_id = "gid://shopify/InventoryItem/1"
+            store.upsert_inventory_item_quantity(
+                shop_domain="example.myshopify.com",
+                inventory_item_id=item_id,
+                sku="ABC",
+                quantity=0,
+            )
+            store.upsert_inventory_change(
+                shop_domain="example.myshopify.com",
+                inventory_item_id=item_id,
+                location_id="gid://shopify/Location/2",
+                sku="ABC",
+                quantity=6,
+            )
+            queued = store.list_inventory_changes(shop_domain="example.myshopify.com")[0]
+            store.acknowledge_inventory_changes(
+                shop_domain="example.myshopify.com",
+                changes=[(queued.id, queued.version)],
+            )
+
+            self.assertEqual(
+                store.get_inventory_item_last_quantity(
+                    shop_domain="example.myshopify.com",
+                    inventory_item_id=item_id,
+                ),
+                0,
+            )
+            store.upsert_inventory_item_quantity(
+                shop_domain="example.myshopify.com",
+                inventory_item_id=item_id,
+                sku="ABC",
+                quantity=6,
+            )
+            self.assertEqual(
+                store.get_inventory_item_last_quantity(
+                    shop_domain="example.myshopify.com",
+                    inventory_item_id=item_id,
+                ),
+                6,
+            )
+
+    def test_delayed_inventory_webhook_does_not_replace_a_newer_queued_value(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = DatabaseStore(str(Path(temporary_directory) / "sync.sqlite3"), "test-secret")
+            common = {
+                "shop_domain": "example.myshopify.com",
+                "inventory_item_id": "gid://shopify/InventoryItem/1",
+                "location_id": "gid://shopify/Location/2",
+                "sku": "ABC",
+            }
+            store.upsert_inventory_change(
+                **common,
+                quantity=6,
+                source_updated_at="2026-08-21T12:00:00Z",
+            )
+            store.upsert_inventory_change(
+                **common,
+                quantity=5,
+                source_updated_at="2026-08-21T12:02:00Z",
+            )
+            store.upsert_inventory_change(
+                **common,
+                quantity=4,
+                source_updated_at="2026-08-21T12:01:00Z",
+            )
+
+            queued = store.list_inventory_changes(
+                shop_domain="example.myshopify.com"
+            )[0]
+            self.assertEqual(queued.quantity, 5)
+            self.assertEqual(queued.version, 2)
+            self.assertEqual(queued.source_updated_at, "2026-08-21T12:02:00Z")
+
     def test_order_change_ack_does_not_delete_a_newer_webhook(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             store = DatabaseStore(
@@ -649,6 +1116,185 @@ class ShopifyScopeTests(unittest.TestCase):
             scopes = client.get_access_scopes("example.myshopify.com", "token")
 
         self.assertEqual(scopes, {"read_products", "read_orders"})
+
+    def test_inventory_snapshot_paginates_and_preserves_unavailable_levels(self):
+        client = ShopifyClient(SimpleNamespace())
+        pages = [
+            {
+                "data": {
+                    "inventoryItems": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+                        "nodes": [
+                            {
+                                "id": "gid://shopify/InventoryItem/1",
+                                "sku": "ZERO",
+                                "duplicateSkuCount": 0,
+                                "inventoryLevel": {
+                                    "updatedAt": "2026-08-21T10:00:00Z",
+                                    "quantities": [{"name": "available", "quantity": 0}],
+                                },
+                            },
+                            {
+                                "id": "gid://shopify/InventoryItem/2",
+                                "sku": "UNAVAILABLE",
+                                "duplicateSkuCount": 0,
+                                "inventoryLevel": None,
+                            },
+                        ],
+                    }
+                }
+            },
+            {
+                "data": {
+                    "inventoryItems": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "id": "gid://shopify/InventoryItem/3",
+                                "sku": "DUPLICATE",
+                                "duplicateSkuCount": 1,
+                                "inventoryLevel": {
+                                    "updatedAt": "2026-08-21T10:01:00Z",
+                                    "quantities": [{"name": "available", "quantity": 4}],
+                                },
+                            }
+                        ],
+                    }
+                }
+            },
+        ]
+
+        with mock.patch.object(client, "graphql", side_effect=pages) as graphql:
+            rows = client.get_inventory_snapshot(
+                "example.myshopify.com",
+                "token",
+                "4",
+            )
+
+        self.assertEqual([row["sku"] for row in rows], ["ZERO", "UNAVAILABLE", "DUPLICATE"])
+        self.assertEqual(rows[0]["quantity"], 0)
+        self.assertEqual(rows[0]["inventory_level_updated_at"], "2026-08-21T10:00:00Z")
+        self.assertIsNone(rows[1]["quantity"])
+        self.assertFalse(rows[1]["available_at_location"])
+        self.assertEqual(rows[2]["duplicate_sku_count"], 1)
+        self.assertIsNone(graphql.call_args_list[0].args[3]["after"])
+        self.assertEqual(graphql.call_args_list[1].args[3]["after"], "next")
+
+    def test_primary_location_query_is_cached(self):
+        client = ShopifyClient(SimpleNamespace(shopify_location_id=None))
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "location": {
+                        "id": "gid://shopify/Location/4",
+                        "name": "Primary",
+                    }
+                }
+            },
+        ) as graphql:
+            first = client.get_primary_location_id("example.myshopify.com", "token")
+            second = client.get_primary_location_id("example.myshopify.com", "token")
+
+        self.assertEqual(first, "gid://shopify/Location/4")
+        self.assertEqual(second, first)
+        graphql.assert_called_once()
+        self.assertEqual(graphql.call_args.kwargs["operation_name"], "GetPrimaryLocation")
+
+    @staticmethod
+    def _variant_node(sku: str, variant_id: str) -> dict:
+        return {
+            "id": variant_id,
+            "sku": sku,
+            "price": "195.00",
+            "product": {
+                "id": "gid://shopify/Product/2",
+                "title": "Shirt",
+                "status": "DRAFT",
+                "autoArchivedZeroStock": None,
+            },
+            "inventoryItem": {
+                "id": f"gid://shopify/InventoryItem/{variant_id.rsplit('/', 1)[-1]}",
+                "unitCost": None,
+                "inventoryLevels": {"nodes": []},
+            },
+        }
+
+    def test_variant_lookup_uses_only_the_exact_case_sensitive_sku(self):
+        client = ShopifyClient(SimpleNamespace(shopify_sku_cache_ttl_seconds=60))
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "productVariants": {
+                        "nodes": [
+                            self._variant_node("ABC-OLD", "gid://shopify/ProductVariant/1"),
+                            self._variant_node("ABC", "gid://shopify/ProductVariant/2"),
+                        ]
+                    }
+                }
+            },
+        ):
+            mapping = client.get_variant_by_sku("example.myshopify.com", "token", "ABC")
+
+        self.assertEqual(mapping.variant_id, "gid://shopify/ProductVariant/2")
+
+    def test_variant_lookup_rejects_duplicate_exact_skus(self):
+        client = ShopifyClient(SimpleNamespace(shopify_sku_cache_ttl_seconds=60))
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "productVariants": {
+                        "nodes": [
+                            self._variant_node("ABC", "gid://shopify/ProductVariant/1"),
+                            self._variant_node("ABC", "gid://shopify/ProductVariant/2"),
+                        ]
+                    }
+                }
+            },
+        ), self.assertRaises(SyncProcessingError) as raised:
+            client.get_variant_by_sku("example.myshopify.com", "token", "ABC")
+
+        self.assertEqual(raised.exception.code, "duplicate_shopify_sku")
+
+    def test_inventory_adjustment_returns_shopifys_actual_resulting_quantity(self):
+        client = ShopifyClient(SimpleNamespace())
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "inventoryAdjustQuantities": {
+                        "inventoryAdjustmentGroup": {
+                            "createdAt": "2026-08-21T12:00:00Z",
+                            "changes": [
+                                {
+                                    "name": "available",
+                                    "delta": 2,
+                                    "quantityAfterChange": 6,
+                                }
+                            ]
+                        },
+                        "userErrors": [],
+                    }
+                }
+            },
+        ):
+            result = client.adjust_inventory(
+                "example.myshopify.com",
+                "token",
+                "3",
+                "4",
+                2,
+                idempotency_key="stable-key",
+            )
+
+        self.assertEqual(result["quantity_after_change"], 6)
+        self.assertEqual(result["updated_at"], "2026-08-21T12:00:00Z")
 
 
 class LocalOrderInboxTests(unittest.TestCase):
@@ -1769,7 +2415,8 @@ class InventoryAdjustmentTests(unittest.TestCase):
             def __init__(self):
                 self.adjustment = None
 
-            def get_variant_by_sku(self, shop_domain, access_token, sku):
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                self.force_refresh = force_refresh
                 return VariantMapping(
                     sku=sku,
                     variant_id="gid://shopify/ProductVariant/1",
@@ -1784,8 +2431,12 @@ class InventoryAdjustmentTests(unittest.TestCase):
                     ],
                 )
 
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
             def adjust_inventory(self, *args, **kwargs):
                 self.adjustment = (args, kwargs)
+                return 9
 
         client = FakeShopifyClient()
         service = InventorySyncService(
@@ -1802,11 +2453,306 @@ class InventoryAdjustmentTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["delta"], -1)
+        self.assertTrue(client.force_refresh)
+        self.assertEqual(result["quantity_after_change"], 9)
         args, kwargs = client.adjustment
         self.assertEqual(args[2], "gid://shopify/InventoryItem/3")
         self.assertEqual(args[3], "gid://shopify/Location/4")
         self.assertEqual(args[4], -1)
         self.assertEqual(kwargs["idempotency_key"], "stable-key")
+
+    def test_positive_adjustment_restores_only_an_auto_archived_product(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.lookups = 0
+                self.product_update = None
+
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                self.lookups += 1
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    product_status="ARCHIVED",
+                    auto_archived_zero_stock=True,
+                    inventory_levels=[
+                        InventoryLevelSnapshot(
+                            location_id="gid://shopify/Location/4",
+                            location_name="Store",
+                            quantity=0 if self.lookups == 1 else 6,
+                        )
+                    ],
+                )
+
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
+            def adjust_inventory(self, *args, **kwargs):
+                return 6
+
+            def update_product(self, shop_domain, access_token, *, product, media=None):
+                self.product_update = product
+                return {"id": product["id"], "status": product.get("status")}
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(
+            client,
+            SimpleNamespace(shopify_location_id=None),
+            None,
+        )
+
+        result = service.adjust_inventory_quantity(
+            sku="22392",
+            delta=6,
+            idempotency_key="restock-key",
+            shop=ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+        )
+
+        self.assertEqual(client.lookups, 2)
+        self.assertTrue(result["product_status_updated"])
+        self.assertEqual(result["quantity_after_change"], 6)
+        self.assertEqual(
+            client.product_update,
+            {
+                "id": "gid://shopify/Product/2",
+                "status": "DRAFT",
+                "metafields": [
+                    {
+                        "namespace": "pos",
+                        "key": "auto_archived_zero_stock",
+                        "type": "boolean",
+                        "value": "false",
+                    }
+                ],
+            },
+        )
+
+    def test_positive_adjustment_preserves_a_manual_archive(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.product_updates = []
+
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    product_status="ARCHIVED",
+                    auto_archived_zero_stock=False,
+                    inventory_levels=[
+                        InventoryLevelSnapshot(
+                            location_id="gid://shopify/Location/4",
+                            location_name="Store",
+                            quantity=6,
+                        )
+                    ],
+                )
+
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
+            def adjust_inventory(self, *args, **kwargs):
+                return 6
+
+            def update_product(self, *args, **kwargs):
+                self.product_updates.append((args, kwargs))
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(
+            client,
+            SimpleNamespace(shopify_location_id=None),
+            None,
+        )
+
+        result = service.adjust_inventory_quantity(
+            sku="MANUAL",
+            delta=6,
+            idempotency_key="manual-key",
+            shop=ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+        )
+
+        self.assertFalse(result["product_status_updated"])
+        self.assertEqual(client.product_updates, [])
+
+    def test_webhook_status_repair_retries_while_positive_quantity_is_not_visible(self):
+        class FakeShopifyClient:
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    product_status="ARCHIVED",
+                    auto_archived_zero_stock=True,
+                    inventory_levels=[
+                        InventoryLevelSnapshot(
+                            location_id="gid://shopify/Location/4",
+                            location_name="Store",
+                            quantity=0,
+                        )
+                    ],
+                )
+
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
+        service = InventorySyncService(
+            FakeShopifyClient(),
+            SimpleNamespace(shopify_location_id=None),
+            None,
+        )
+
+        with self.assertRaises(SyncProcessingError) as raised:
+            service.restore_auto_archived_product_by_sku(
+                shop=ShopRecord(
+                    shop_domain="example.myshopify.com",
+                    access_token="token",
+                ),
+                sku="22392",
+                expected_positive_quantity=True,
+            )
+
+        self.assertEqual(raised.exception.code, "inventory_quantity_not_ready")
+
+    def test_explicit_catalog_archive_clears_existing_automatic_marker(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.product_updates = []
+
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    product_status="ARCHIVED",
+                    auto_archived_zero_stock=True,
+                    inventory_levels=[
+                        InventoryLevelSnapshot(
+                            location_id="gid://shopify/Location/4",
+                            location_name="Store",
+                            quantity=0,
+                        )
+                    ],
+                )
+
+            def update_product(self, shop_domain, access_token, *, product, media=None):
+                self.product_updates.append(product)
+                return {"id": product["id"], "title": "Shirt", "status": "ARCHIVED"}
+
+            def update_variant_fields(self, *args, **kwargs):
+                return {}
+
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
+            def update_cached_variant(self, *args, **kwargs):
+                return None
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(
+            client,
+            SimpleNamespace(shopify_location_id=None),
+            None,
+        )
+        payload = service._apply_catalog_import_policy(
+            service._normalize_payload(
+                ProductSyncRequest(sku="MANUAL", quantity=0, status="archived")
+            )
+        )
+
+        service._sync_catalog_product(
+            payload,
+            ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+            manual_archive_requested=True,
+        )
+
+        self.assertEqual(client.product_updates[0]["status"], "ARCHIVED")
+        self.assertEqual(
+            client.product_updates[0]["metafields"],
+            [
+                {
+                    "namespace": "pos",
+                    "key": "auto_archived_zero_stock",
+                    "type": "boolean",
+                    "value": "false",
+                }
+            ],
+        )
+
+    def test_positive_catalog_sync_restores_an_automatically_archived_product(self):
+        class FakeShopifyClient:
+            def __init__(self):
+                self.product_updates = []
+                self.lookups = 0
+
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
+                self.lookups += 1
+                return VariantMapping(
+                    sku=sku,
+                    variant_id="gid://shopify/ProductVariant/1",
+                    product_id="gid://shopify/Product/2",
+                    inventory_item_id="gid://shopify/InventoryItem/3",
+                    product_status="ARCHIVED",
+                    auto_archived_zero_stock=True,
+                    inventory_levels=[
+                        InventoryLevelSnapshot(
+                            location_id="gid://shopify/Location/4",
+                            location_name="Store",
+                            quantity=0 if self.lookups == 1 else 6,
+                        )
+                    ],
+                )
+
+            def update_product(self, shop_domain, access_token, *, product, media=None):
+                self.product_updates.append(product)
+                return {"id": product["id"], "title": "Shirt", "status": product.get("status")}
+
+            def update_variant_fields(self, *args, **kwargs):
+                return {}
+
+            def get_primary_location_id(self, shop_domain, access_token):
+                return "gid://shopify/Location/4"
+
+            def update_inventory(self, *args, **kwargs):
+                return None
+
+            def update_cached_variant(self, *args, **kwargs):
+                return None
+
+        client = FakeShopifyClient()
+        service = InventorySyncService(
+            client,
+            SimpleNamespace(shopify_location_id=None),
+            None,
+        )
+        payload = service._apply_catalog_import_policy(
+            service._normalize_payload(ProductSyncRequest(sku="RESTOCK", quantity=6))
+        )
+
+        result = service._sync_catalog_product(
+            payload,
+            ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
+        )
+
+        self.assertEqual(result.details["product_status"], "DRAFT")
+        self.assertEqual(
+            client.product_updates[-1],
+            {
+                "id": "gid://shopify/Product/2",
+                "status": "DRAFT",
+                "metafields": [
+                    {
+                        "namespace": "pos",
+                        "key": "auto_archived_zero_stock",
+                        "type": "boolean",
+                        "value": "false",
+                    }
+                ],
+            },
+        )
 
     def test_price_update_changes_only_variant_id_and_price(self):
         class FakeShopifyClient:

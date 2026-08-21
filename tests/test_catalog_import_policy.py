@@ -8,8 +8,17 @@ if "dotenv" not in sys.modules:
     dotenv_stub.load_dotenv = lambda *args, **kwargs: None
     sys.modules["dotenv"] = dotenv_stub
 
-from app.inventory import InventorySyncService
-from app.models import ProductSyncRequest, ProductVariantSyncInput
+from app.inventory import (
+    InventorySyncService,
+    _owns_auto_archive_transition,
+    _should_auto_archive_zero_stock,
+)
+from app.models import (
+    ProductMetafieldInput,
+    ProductSyncRequest,
+    ProductVariantSyncInput,
+    VariantMapping,
+)
 
 
 class CatalogImportPolicyTests(unittest.TestCase):
@@ -41,6 +50,25 @@ class CatalogImportPolicyTests(unittest.TestCase):
         self.assertEqual(create_input["status"], "ARCHIVED")
         self.assertNotIn("descriptionHtml", create_input)
 
+        marked_input = self.service._build_new_product_input(
+            payload,
+            [],
+            mark_auto_archived=_should_auto_archive_zero_stock(
+                ProductSyncRequest(sku="1001", quantity=0)
+            ),
+        )
+        self.assertEqual(
+            marked_input["metafields"],
+            [
+                {
+                    "namespace": "pos",
+                    "key": "auto_archived_zero_stock",
+                    "type": "boolean",
+                    "value": "true",
+                }
+            ],
+        )
+
     def test_matrix_total_quantity_controls_zero_stock_archive(self):
         payload = self.apply_policy(
             ProductSyncRequest(
@@ -66,6 +94,26 @@ class CatalogImportPolicyTests(unittest.TestCase):
             "DRAFT",
         )
 
+    def test_explicit_or_existing_manual_archive_is_not_marked_automatic(self):
+        explicit_archive = ProductSyncRequest(sku="1004", quantity=0, status="archived")
+        self.assertFalse(_should_auto_archive_zero_stock(explicit_archive))
+
+        existing_manual_archive = VariantMapping(
+            sku="1004",
+            variant_id="gid://shopify/ProductVariant/1",
+            product_id="gid://shopify/Product/2",
+            inventory_item_id="gid://shopify/InventoryItem/3",
+            product_status="ARCHIVED",
+            auto_archived_zero_stock=False,
+        )
+        self.assertFalse(
+            _owns_auto_archive_transition(
+                auto_archive_requested=True,
+                created=False,
+                existing_mapping=existing_manual_archive,
+            )
+        )
+
     def test_import_can_clear_an_existing_description(self):
         payload = self.apply_policy(
             ProductSyncRequest(
@@ -81,6 +129,32 @@ class CatalogImportPolicyTests(unittest.TestCase):
             "gid://shopify/Product/10",
         )
         self.assertEqual(update_input["descriptionHtml"], "")
+
+    def test_internal_auto_archive_marker_cannot_be_overridden_by_catalog_input(self):
+        payload = ProductSyncRequest(
+            sku="1005",
+            metafields=[
+                ProductMetafieldInput(
+                    namespace="pos",
+                    key="auto_archived_zero_stock",
+                    type="boolean",
+                    value="true",
+                ),
+                ProductMetafieldInput(
+                    namespace="pos",
+                    key="department",
+                    value="Shirts",
+                ),
+            ],
+        )
+
+        inputs = self.service._build_metafield_inputs(
+            payload,
+            "gid://shopify/Product/10",
+        )
+
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(inputs[0]["key"], "department")
 
 
 if __name__ == "__main__":
