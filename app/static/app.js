@@ -8,11 +8,9 @@ const state = {
   config: null,
   health: null,
   bridge: null,
-  connection: null,
-  connectionLoading: false,
   error: null,
+  downloadingInstaller: false,
   refreshing: false,
-  rotating: false,
   testing: false,
 }
 
@@ -27,12 +25,6 @@ document.addEventListener("click", async (event) => {
     return
   }
 
-  const copyButton = event.target.closest("[data-copy]")
-  if (copyButton) {
-    await copyValue(copyButton.dataset.copy || "")
-    return
-  }
-
   if (event.target.closest("[data-refresh]")) {
     await refreshBridge(true)
     return
@@ -43,8 +35,9 @@ document.addEventListener("click", async (event) => {
     return
   }
 
-  if (event.target.closest("[data-rotate]")) {
-    await rotateCredentials()
+  if (event.target.closest("[data-download-installer]")) {
+    await downloadConnectorInstaller()
+    return
   }
 })
 
@@ -86,31 +79,6 @@ async function refreshBridge(showMessage) {
   }
 }
 
-async function ensureConnection() {
-  if (state.connection || state.connectionLoading) return
-  state.connectionLoading = true
-  try {
-    state.connection = await fetchJson("/api/connection-settings")
-  } finally {
-    state.connectionLoading = false
-  }
-}
-
-async function rotateCredentials() {
-  if (!window.confirm("Create a new connector key and secret? The current Windows connector will stop until its settings are updated.")) return
-  state.rotating = true
-  render()
-  try {
-    state.connection = await fetchJson("/api/connection-settings/rotate", { method: "POST" })
-    showToast("New connector credentials created.", "success")
-  } catch (error) {
-    showToast(error.message, "error")
-  } finally {
-    state.rotating = false
-    render()
-  }
-}
-
 async function testShopify() {
   state.testing = true
   render()
@@ -127,12 +95,6 @@ async function testShopify() {
 
 function navigate(path) {
   window.history.pushState({}, "", `${path}${window.location.search}`)
-  if (path === "/app/settings") {
-    ensureConnection().then(render).catch((error) => {
-      state.error = error
-      render()
-    })
-  }
   render()
   window.scrollTo({ top: 0, behavior: "smooth" })
 }
@@ -140,15 +102,8 @@ function navigate(path) {
 function render() {
   const app = document.getElementById("app")
   const route = normalizeRoute(window.location.pathname)
-  document.title = `${routes[route]} · POS Bridge`
+  document.title = `${routes[route]} · Inventory Sync POS Bridge`
   updateTabs(route)
-
-  if (route === "/app/settings" && !state.connection && !state.connectionLoading && !state.error) {
-    ensureConnection().then(render).catch((error) => {
-      state.error = error
-      render()
-    })
-  }
 
   app.innerHTML = route === "/app/orders"
     ? renderOrders()
@@ -171,7 +126,7 @@ function renderOverview() {
       <div class="welcome">
         <div>
           <p class="kicker">${escapeHtml(storeName)}</p>
-          <h1>${bridgeActive ? "Your POS bridge is active" : "Waiting for your POS bridge"}</h1>
+          <h1>${bridgeActive ? "Your Inventory Sync POS Bridge is active" : "Waiting for Inventory Sync POS Bridge"}</h1>
           <p>${bridgeActive
             ? "Inventory and Shopify orders are moving through the connector automatically."
             : "The Windows connector has not checked in during the last 8 minutes."}</p>
@@ -205,7 +160,7 @@ function renderOverview() {
           active: orders.active && orders.authorized,
           activeText: "Order sync is active",
           inactiveText: orders.authorized === false ? "Order access needs approval" : "No recent order check-in",
-          detail: `${number(orders.queued_orders)} order${number(orders.queued_orders) === 1 ? "" : "s"} waiting to be written to the POS computer`,
+          detail: `${number(orders.queued_orders)} order${number(orders.queued_orders) === 1 ? "" : "s"} waiting to be written to the Cash Register Express computer`,
           lastSeen: orders.last_poll_at,
         })}
       </div>
@@ -269,7 +224,7 @@ function renderOrders() {
         <div>
           <p class="kicker">Order sync</p>
           <h1>Recent Shopify orders</h1>
-          <p>Only small order summaries are kept here. Full order details are delivered to <code>shopify-order-header.dbf</code> and <code>shopify-order-detail.dbf</code> on the POS computer.</p>
+          <p>Only small order summaries are kept here. Full order details are delivered to <code>shopify-order-header.dbf</code> and <code>shopify-order-detail.dbf</code> on the Cash Register Express computer.</p>
         </div>
         <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>${state.refreshing ? "Checking…" : "Refresh"}</button>
       </div>
@@ -349,52 +304,76 @@ function renderPriceChangeList(items) {
 }
 
 function renderSettings() {
-  const connection = state.connection
+  const connector = state.bridge?.connector || {}
+  const replacingLegacyConnector = connector.mode === "legacy"
+  const ordersAuthorized = state.bridge?.orders?.authorized === true
+  const shop = state.config?.shop || "this Shopify store"
   return `
     <section class="page narrow">
       <div class="page-head">
         <div>
           <p class="kicker">Settings</p>
-          <h1>Windows connector</h1>
-          <p>These values connect the computer at the store to this Shopify app.</p>
+          <h1>Inventory Sync POS Bridge</h1>
+          <p>Connect the store's Cash Register Express computer with one download. No keys or configuration files to copy.</p>
         </div>
         <button class="button secondary" type="button" data-test-shopify ${state.testing ? "disabled" : ""}>${state.testing ? "Testing…" : "Test Shopify"}</button>
       </div>
 
-      <section class="panel">
-        <div class="panel-head">
+      <section class="panel setup-panel">
+        <div class="setup-intro">
+          <span class="setup-icon">↓</span>
           <div>
-            <p class="kicker">Connection details</p>
-            <h2>POS Bridge credentials</h2>
+            <p class="kicker">About 10 minutes</p>
+            <h2>${replacingLegacyConnector
+              ? "Replace the legacy Cash Register Express connector"
+              : connector.installed
+                ? "Reinstall or move the Cash Register Express connector"
+                : "Install the Cash Register Express connector"}</h2>
+            <p>The installer is prepared only for <strong>${escapeHtml(shop)}</strong>. Its pairing code works once and expires after 15 minutes.</p>
           </div>
         </div>
-        ${connection ? `
-          <div class="setting-list">
-            ${settingRow("Server URL", connection.base_url)}
-            ${settingRow("Product path", connection.product_sync_path)}
-            ${settingRow("API key", connection.api_key)}
-            ${settingRow("API secret", connection.api_secret || connection.api_secret_masked)}
-          </div>
-          <div class="settings-actions">
-            <button class="button secondary" type="button" data-copy="${escapeAttribute(connectionText(connection))}">Copy all settings</button>
-            <button class="button danger" type="button" data-rotate ${state.rotating ? "disabled" : ""}>${state.rotating ? "Creating…" : "Create new key"}</button>
-          </div>
-        ` : `<div class="empty"><span class="spinner"></span><strong>Loading connector settings…</strong></div>`}
+
+        <div class="setup-steps">
+          <div><span>1</span><strong>Download</strong><small>Save the personalized BAT file on the Cash Register Express computer.</small></div>
+          <div><span>2</span><strong>Open it</strong><small>Double-click it and approve the Windows Administrator prompt.</small></div>
+          <div><span>3</span><strong>Done</strong><small>The installer finds <code>ashpsdat</code>, validates the connection, and starts automatically.</small></div>
+        </div>
+
+        <div class="installer-action">
+          <button class="button primary" type="button" data-download-installer ${state.downloadingInstaller ? "disabled" : ""}>
+            ${state.downloadingInstaller ? "Preparing installer…" : "Download Windows installer"}
+          </button>
+          <small>${replacingLegacyConnector
+            ? "Completing setup replaces the legacy shared credentials."
+            : connector.installed
+              ? `Current connector${connector.version ? ` version ${escapeHtml(connector.version)}` : ""}.`
+              : "Works on Windows 10 or 11. Internet access is required during setup."}</small>
+        </div>
+
+        <div class="notice warning">
+          <strong>Use only the newest download.</strong> Downloading another installer immediately cancels every earlier unfinished setup. Completing setup on a different computer disables the active managed connector. Completing managed setup also revokes legacy shared credentials for this shop.
+        </div>
       </section>
 
-      <div class="notice neutral">
-        Inventory and POS price changes are checked every 3 minutes. A full inventory reconciliation runs nightly. Order payloads are removed from Railway after the Windows connector confirms they were written.
+      ${connector.installed ? `
+        <section class="panel compact-panel">
+          <div class="panel-head">
+            <div>
+              <p class="kicker">Installed computer</p>
+              <h2>${connector.active ? "Connector is online" : "Connector is installed but offline"}</h2>
+            </div>
+            ${statusBadge(connector.active ? "Active" : "Offline", connector.active ? "success" : "danger")}
+          </div>
+          <p>${connector.last_seen_at ? `Last check-in ${escapeHtml(relativeTime(connector.last_seen_at))}.` : "It has not checked in yet."}</p>
+        </section>
+      ` : ""}
+
+      <div class="notice warning">
+        The connector starts inventory, catalog, and price syncing after installation. ${ordersAuthorized
+          ? "Shopify order syncing also starts because order access is approved."
+          : "Shopify order syncing starts only after order access is approved."} New connector installs start Shopify-to-Cash Register Express quantity writing in safe dry-run mode. A verified replacement preserves the existing write-back mode.
       </div>
     </section>
-  `
-}
-
-function settingRow(label, value) {
-  return `
-    <div class="setting-row">
-      <div><span>${escapeHtml(label)}</span><code>${escapeHtml(value || "Not available")}</code></div>
-      <button type="button" data-copy="${escapeAttribute(value || "")}" ${value ? "" : "disabled"}>Copy</button>
-    </div>
   `
 }
 
@@ -402,12 +381,40 @@ function statusBadge(text, tone, large = false) {
   return `<span class="badge ${tone} ${large ? "large" : ""}"><i></i>${escapeHtml(text)}</span>`
 }
 
-function connectionText(connection) {
-  return [
-    `CONNECTOR_BASE_URL=${connection.base_url || ""}`,
-    `CONNECTOR_API_KEY=${connection.api_key || ""}`,
-    `CONNECTOR_API_SECRET=${connection.api_secret || "ROTATE_TO_REVEAL_FULL_SECRET"}`,
-  ].join("\n")
+async function downloadConnectorInstaller() {
+  if (state.downloadingInstaller) return
+  state.downloadingInstaller = true
+  render()
+  try {
+    const response = await fetch("/api/connector-installer", { method: "POST" })
+    if (!response.ok) {
+      let payload = null
+      try {
+        payload = await response.json()
+      } catch (_error) {
+        payload = null
+      }
+      throw new Error(payload?.error?.message || "The Windows installer could not be prepared.")
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get("content-disposition") || ""
+    const filenameMatch = disposition.match(/filename="([^"]+)"/i)
+    const filename = filenameMatch?.[1] || "Install-Inventory-Sync-POS-Bridge.bat"
+    const objectUrl = URL.createObjectURL(blob)
+    const link = document.createElement("a")
+    link.href = objectUrl
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+    showToast("Installer downloaded. Open the newest file on the Cash Register Express computer within 15 minutes.", "success")
+  } catch (error) {
+    showToast(error.message, "error")
+  } finally {
+    state.downloadingInstaller = false
+    render()
+  }
 }
 
 function normalizeRoute(path) {
@@ -434,15 +441,6 @@ async function fetchJson(url, options = {}) {
     throw new Error(detail.message || "Request failed.")
   }
   return payload
-}
-
-async function copyValue(value) {
-  try {
-    await navigator.clipboard.writeText(value)
-    showToast("Copied.", "success")
-  } catch (_error) {
-    showToast("Could not copy.", "error")
-  }
 }
 
 function showToast(message, tone) {
@@ -495,8 +493,4 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;")
-}
-
-function escapeAttribute(value) {
-  return escapeHtml(value)
 }

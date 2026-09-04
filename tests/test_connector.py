@@ -910,9 +910,14 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             self.assertEqual(
                 {
                     key: shop_actions[0][key]
-                    for key in ("sku", "delta", "target_quantity")
+                    for key in ("sku", "delta", "target_quantity", "expected_quantity")
                 },
-                {"sku": "ABC", "delta": 1, "target_quantity": 6},
+                {
+                    "sku": "ABC",
+                    "delta": 1,
+                    "target_quantity": 6,
+                    "expected_quantity": 5,
+                },
             )
             self.assertEqual(
                 {
@@ -1944,6 +1949,70 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         self.assertNotIn("pending_shop", state["quantities"]["ABC"])
         self.assertNotIn("pending_pos", state["quantities"]["ABC"])
 
+    def test_compare_and_swap_stale_result_discards_actions_for_replanning(self):
+        connector = Connector.__new__(Connector)
+        connector.base_url = "https://sync.example"
+        connector.timeout = 30
+        connector.batch_size = 25
+        connector.logger = mock.Mock()
+        connector.session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {
+            "results": [
+                {
+                    "success": False,
+                    "sku": "ABC",
+                    "message": "Shopify rejected the inventory adjustment.",
+                    "details": {
+                        "user_errors": [
+                            {
+                                "code": "CHANGE_FROM_QUANTITY_STALE",
+                                "message": "The inventory quantity changed.",
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        connector.session.post.return_value = response
+        shop_action = {
+            "sku": "ABC",
+            "delta": -1,
+            "target_quantity": 8,
+            "expected_quantity": 9,
+            "idempotency_key": "shop-key",
+        }
+        state = {
+            "quantities": {
+                "ABC": {
+                    "canonical": 8,
+                    "pos_seen": 9,
+                    "shop_seen": 9,
+                    "pending_shop": shop_action,
+                    "pending_pos": {
+                        "sku": "ABC",
+                        "delta": -1,
+                        "target_quantity": 8,
+                        "expected_quantity": 9,
+                        "idempotency_key": "pos-key",
+                    },
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            connector.state_path = Path(temporary_directory) / "state.json"
+            blocked = connector._apply_shopify_adjustments(state, [shop_action])
+
+        self.assertEqual(blocked, {"ABC"})
+        self.assertNotIn("pending_shop", state["quantities"]["ABC"])
+        self.assertNotIn("pending_pos", state["quantities"]["ABC"])
+        connector.logger.warning.assert_called_once_with(
+            "shopify_adjustment_stale_replan sku=%s expected=%s",
+            "ABC",
+            9,
+        )
+
     def test_shopify_race_synthesizes_a_guarded_pos_correction(self):
         connector = Connector.__new__(Connector)
         connector.base_url = "https://sync.example"
@@ -2581,7 +2650,7 @@ class ShopifyScopeTests(unittest.TestCase):
                     }
                 }
             },
-        ):
+        ) as graphql:
             result = client.adjust_inventory(
                 "example.myshopify.com",
                 "token",
@@ -2589,10 +2658,48 @@ class ShopifyScopeTests(unittest.TestCase):
                 "4",
                 2,
                 idempotency_key="stable-key",
+                change_from_quantity=4,
             )
 
         self.assertEqual(result["quantity_after_change"], 6)
         self.assertEqual(result["updated_at"], "2026-08-21T12:00:00Z")
+        mutation = graphql.call_args.args[2]
+        variables = graphql.call_args.args[3]
+        self.assertIn("@idempotent(key: $idempotencyKey)", mutation)
+        self.assertEqual(variables["idempotencyKey"], "stable-key")
+        self.assertEqual(
+            variables["input"]["changes"][0]["changeFromQuantity"],
+            4,
+        )
+
+    def test_legacy_adjustment_explicitly_opts_out_of_compare_and_swap(self):
+        client = ShopifyClient(SimpleNamespace())
+        with mock.patch.object(
+            client,
+            "graphql",
+            return_value={
+                "data": {
+                    "inventoryAdjustQuantities": {
+                        "inventoryAdjustmentGroup": None,
+                        "userErrors": [],
+                    }
+                }
+            },
+        ) as graphql:
+            client.adjust_inventory(
+                "example.myshopify.com",
+                "token",
+                "3",
+                "4",
+                -1,
+                idempotency_key="legacy-stable-key",
+            )
+
+        variables = graphql.call_args.args[3]
+        self.assertIn("changeFromQuantity", variables["input"]["changes"][0])
+        self.assertIsNone(
+            variables["input"]["changes"][0]["changeFromQuantity"]
+        )
 
 
 class LocalOrderInboxTests(unittest.TestCase):
@@ -3746,6 +3853,7 @@ class InventoryAdjustmentTests(unittest.TestCase):
             sku="ABC",
             delta=-1,
             idempotency_key="stable-key",
+            change_from_quantity=10,
             shop=ShopRecord(shop_domain="example.myshopify.com", access_token="token"),
         )
 
@@ -3758,6 +3866,7 @@ class InventoryAdjustmentTests(unittest.TestCase):
         self.assertEqual(args[3], "gid://shopify/Location/4")
         self.assertEqual(args[4], -1)
         self.assertEqual(kwargs["idempotency_key"], "stable-key")
+        self.assertEqual(kwargs["change_from_quantity"], 10)
 
     def test_positive_adjustment_restores_only_an_auto_archived_product(self):
         class FakeShopifyClient:

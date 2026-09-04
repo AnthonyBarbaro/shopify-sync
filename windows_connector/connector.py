@@ -48,7 +48,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.1"
+CONNECTOR_VERSION = "1.2.0"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -65,6 +65,11 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--config", default=str(CONNECTOR_DIR / "connector.env"))
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Read and compare without changing either system.")
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Quickly verify the POS folder, credentials, and server without starting a sync.",
+    )
     return parser.parse_args()
 
 
@@ -78,6 +83,71 @@ def env_bool(name: str, default: bool) -> bool:
 def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     value = int((os.getenv(name) or str(default)).strip())
     return max(minimum, min(maximum, value))
+
+
+def bind_state_identity(
+    state: Dict[str, Any],
+    *,
+    shop_domain: str,
+    installation_id: str,
+    allow_unbound_history: bool = False,
+) -> bool:
+    changed = False
+    if shop_domain:
+        state_shop = str(state.get("shop_domain") or "").strip().lower()
+        if state_shop and state_shop != shop_domain:
+            raise RuntimeError(
+                f"Connector state belongs to {state_shop}, not {shop_domain}. "
+                "Do not reuse one shop's inventory state for another shop."
+            )
+        if not state_shop:
+            if state_has_sync_history(state) and not allow_unbound_history:
+                raise RuntimeError(
+                    "Connector state contains inventory history but has no shop identity. "
+                    "Contact support before assigning it to a Shopify shop."
+                )
+            state["shop_domain"] = shop_domain
+            changed = True
+    if installation_id:
+        state_installation = str(state.get("installation_id") or "").strip()
+        if state_installation and state_installation != installation_id:
+            raise RuntimeError(
+                "Connector state belongs to a different Windows installation. "
+                "Contact support before replacing its inventory baselines."
+            )
+        if not state_installation:
+            state["installation_id"] = installation_id
+            changed = True
+    return changed
+
+
+def state_has_sync_history(state: Dict[str, Any]) -> bool:
+    collection_keys = (
+        "catalog_products",
+        "quantities",
+        "event_cursors",
+        "sku_bases",
+        "pending_catalog_products",
+        "pending_matrix_structure_repairs",
+        "matrix_structure_probe_skus",
+        "matrix_structure_probe_not_before",
+        "blocked_inventory_skus",
+        "price_snapshot",
+    )
+    if any(bool(state.get(key)) for key in collection_keys):
+        return True
+    scalar_keys = (
+        "catalog_complete",
+        "catalog_structure_schema_version",
+        "inventory_location_id",
+        "inventory_reconcile_schema_version",
+        "last_cycle_epoch",
+        "last_full_reconcile_date",
+        "matrix_option_schema_version",
+        "numeric_sku_digit_width",
+        "numeric_sku_high_water",
+    )
+    return any(state.get(key) not in (None, "", False, 0) for key in scalar_keys)
 
 
 def has_active_matrix_structure_repairs(state: Dict[str, Any]) -> bool:
@@ -156,6 +226,10 @@ class Connector:
         self.base_url = self._required("SHOPIFY_SYNC_BASE_URL").rstrip("/")
         self.api_key = self._required("SHOPIFY_SYNC_API_KEY")
         self.api_secret = self._required("SHOPIFY_SYNC_API_SECRET")
+        self.shop_domain = (os.getenv("CONNECTOR_SHOP_DOMAIN") or "").strip().lower()
+        self.installation_id = (os.getenv("CONNECTOR_INSTALLATION_ID") or "").strip()
+        self.startup_nonce = (os.getenv("CONNECTOR_STARTUP_NONCE") or "").strip()
+        self.allow_legacy_state_adoption = env_bool("CONNECTOR_ALLOW_LEGACY_STATE_ADOPTION", False)
         self.interval_seconds = env_int("SYNC_INTERVAL_SECONDS", 180, minimum=30, maximum=86400)
         self.nightly_full_sync_hour = env_int("NIGHTLY_FULL_SYNC_HOUR", 0, minimum=0, maximum=23)
         self.batch_size = env_int("CONNECTOR_BATCH_SIZE", 25, minimum=1, maximum=100)
@@ -208,6 +282,7 @@ class Connector:
         data_dir = Path(os.getenv("CONNECTOR_DATA_DIR") or (CONNECTOR_DIR / "data")).expanduser().resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = data_dir / "state.json"
+        self.startup_ready_path = data_dir / "startup.ready.json"
         self.log_path = data_dir / "connector.log"
         self.writer_script = Path(
             os.getenv("POS_WRITEBACK_SCRIPT") or (CONNECTOR_DIR / "write_pos_quantity.ps1")
@@ -235,6 +310,109 @@ class Connector:
             raise ValueError(f"Missing required connector setting: {name}")
         return value
 
+    def validate_installation(self) -> None:
+        item_path = self._validate_pos_directory()
+        if not self.base_url.lower().startswith("https://") and not self.base_url.lower().startswith(
+            ("http://localhost", "http://127.0.0.1")
+        ):
+            raise ValueError("SHOPIFY_SYNC_BASE_URL must use HTTPS.")
+
+        _payload, remote_shop = self._fetch_connector_status()
+        validation_state = load_state(self.state_path)
+        identity_changed = bind_state_identity(
+            validation_state,
+            shop_domain=remote_shop,
+            installation_id=self.installation_id,
+            allow_unbound_history=self.allow_legacy_state_adoption,
+        )
+        if identity_changed and self.allow_legacy_state_adoption:
+            save_state(self.state_path, validation_state)
+        print(f"Connector validation passed for {remote_shop} using {item_path}.")
+
+    def _validate_pos_directory(self) -> Path:
+        if not self.dbf_dir.is_dir():
+            raise FileNotFoundError(f"POS data folder not found: {self.dbf_dir}")
+        item_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "Item.dbf", recursive=False)
+        if item_path is None:
+            raise FileNotFoundError(f"Expected Item.dbf in {self.dbf_dir}")
+        dbf_record_count(item_path)
+        return item_path
+
+    def _fetch_connector_status(self) -> tuple[Dict[str, Any], str]:
+        response = self.session.get(
+            f"{self.base_url}/api/connector/verify",
+            timeout=min(self.timeout, 30),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        remote_shop = str(payload.get("shop") or "").strip().lower()
+        if not remote_shop:
+            raise RuntimeError("The connector server did not return a Shopify shop identity.")
+        if self.shop_domain and remote_shop != self.shop_domain:
+            raise RuntimeError(
+                f"Connector credentials belong to {remote_shop}, not {self.shop_domain}."
+            )
+        remote_installation = str(payload.get("installation_id") or "").strip()
+        if self.installation_id:
+            if not remote_installation:
+                raise RuntimeError("The connector server did not return a Windows installation identity.")
+            if remote_installation != self.installation_id:
+                raise RuntimeError("Connector credentials belong to a different Windows installation.")
+        if int(payload.get("connector_api_version") or 0) != 1:
+            raise RuntimeError("The connector server API is incompatible with this connector.")
+        return payload, remote_shop
+
+    def _wait_for_device_activation(self) -> None:
+        if not self.api_key.startswith("dev_"):
+            return
+        self._validate_pos_directory()
+        pending_logged = False
+        while True:
+            try:
+                payload, remote_shop = self._fetch_connector_status()
+                validation_state = load_state(self.state_path)
+                bind_state_identity(
+                    validation_state,
+                    shop_domain=remote_shop,
+                    installation_id=self.installation_id,
+                )
+                status = str(payload.get("device_status") or "").strip().lower()
+                if status == "active":
+                    if not pending_logged:
+                        self._write_startup_ready(remote_shop=remote_shop, device_status=status)
+                    self.logger.info("connector_device_active shop=%s", remote_shop)
+                    return
+                if status != "pending":
+                    raise RuntimeError(f"Unexpected connector device status: {status or 'missing'}")
+                if not pending_logged:
+                    self._write_startup_ready(remote_shop=remote_shop, device_status=status)
+                    self.logger.info("connector_waiting_for_activation shop=%s", remote_shop)
+                    pending_logged = True
+                time.sleep(2)
+            except Exception:
+                self.logger.exception("connector_activation_check_failed")
+                time.sleep(30)
+
+    def _write_startup_ready(self, *, remote_shop: str, device_status: str) -> None:
+        temporary = self.startup_ready_path.with_name(
+            f"{self.startup_ready_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(
+                {
+                    "shop": remote_shop,
+                    "installation_id": self.installation_id,
+                    "device_status": device_status,
+                    "startup_nonce": self.startup_nonce,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.startup_ready_path)
+
     def run_forever(self, *, once: bool = False) -> int:
         self.logger.info(
             "connector_started version=%s dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
@@ -245,6 +423,7 @@ class Connector:
             self.price_sync_enabled,
             self.dry_run,
         )
+        self._wait_for_device_activation()
         while True:
             started = time.monotonic()
             try:
@@ -260,6 +439,13 @@ class Connector:
 
     def run_cycle(self) -> None:
         state = load_state(self.state_path)
+        identity_changed = bind_state_identity(
+            state,
+            shop_domain=getattr(self, "shop_domain", ""),
+            installation_id=getattr(self, "installation_id", ""),
+        )
+        if identity_changed and not self.dry_run:
+            save_state(self.state_path, state)
         now = datetime.now()
         if not self.dry_run:
             protected_pending_skus = pending_matrix_structure_skus(state)
@@ -787,6 +973,7 @@ class Connector:
                     "sku": sku,
                     "delta": shop_adjustment,
                     "target_quantity": target,
+                    "expected_quantity": shop_quantity,
                     "idempotency_key": adjustment_key(
                         "shopify", sku, revision, previous_pos, pos_quantity, previous_shop, shop_quantity, target
                     ),
@@ -1915,6 +2102,21 @@ class Connector:
             results = response.json().get("results") or []
             for action, result in zip(chunk, results):
                 if not result.get("success"):
+                    user_errors = (result.get("details") or {}).get("user_errors") or []
+                    if any(
+                        isinstance(error, dict)
+                        and error.get("code") == "CHANGE_FROM_QUANTITY_STALE"
+                        for error in user_errors
+                    ):
+                        entry = entries[action["sku"]]
+                        entry.pop("pending_shop", None)
+                        entry.pop("pending_pos", None)
+                        self.logger.warning(
+                            "shopify_adjustment_stale_replan sku=%s expected=%s",
+                            action["sku"],
+                            action.get("expected_quantity"),
+                        )
+                        continue
                     self.logger.error(
                         "shopify_adjustment_failed sku=%s delta=%s message=%s",
                         action["sku"],
@@ -2698,6 +2900,9 @@ def main() -> int:
     args = parse_cli()
     try:
         connector = Connector(config_path=Path(args.config).expanduser().resolve(), dry_run=args.dry_run)
+        if args.validate:
+            connector.validate_installation()
+            return 0
         return connector.run_forever(once=args.once)
     except Exception as exc:
         print(f"Connector failed to start: {exc}", file=sys.stderr)

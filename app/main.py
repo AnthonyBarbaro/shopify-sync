@@ -7,12 +7,13 @@ import secrets
 import time
 import zipfile
 from datetime import timedelta, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, List, Tuple, TypeVar
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,12 +35,28 @@ from app.auth import (
     verify_shopify_webhook_hmac,
 )
 from app.config import get_settings
-from app.db import DatabaseStore, PosCredentialRecord, ShopRecord
+from app.db import (
+    DatabaseStore,
+    InventoryWebhookEventRecord,
+    PosCredentialRecord,
+    ShopRecord,
+)
+from app.installer import (
+    CONNECTOR_ARTIFACT_VERSION,
+    build_personalized_installer_bat,
+    build_runtime_archive,
+    installer_filename,
+    setup_script_bytes,
+    sha256_hex,
+)
 from app.inventory import InventorySyncService
 from app.models import (
     BulkSyncResponse,
     CatalogResponse,
     ConnectionSettingsResponse,
+    ConnectorActivationResponse,
+    ConnectorEnrollmentRequest,
+    ConnectorEnrollmentResponse,
     CustomerBulkSyncResponse,
     CustomerSyncRequest,
     CustomerSyncResult,
@@ -87,12 +104,17 @@ db = DatabaseStore(
     order_event_retention_rows=settings.order_event_retention_rows,
     recent_order_retention_rows=settings.recent_order_retention_rows,
 )
+if settings.shopify_location_id:
+    db.seed_single_shop_inventory_location(settings.shopify_location_id)
 session_manager = AppSessionManager(settings)
 shopify_client = ShopifyClient(settings)
 activity_store = SyncActivityStore(limit=400)
 inventory_service = InventorySyncService(shopify_client, settings, activity_store)
 woo_nonce_store = WooNonceStore()
 granted_scope_cache: dict[str, tuple[float, set[str]]] = {}
+inventory_webhook_worker_task: asyncio.Task[None] | None = None
+connector_webhook_registration_task: asyncio.Task[None] | None = None
+inventory_webhook_drain_lock = Lock()
 
 app = FastAPI(
     title="Shopify Inventory Sync",
@@ -143,7 +165,24 @@ def ensure_order_webhooks(shop: ShopRecord) -> None:
 
 @app.on_event("startup")
 async def ensure_connector_webhooks_on_startup() -> None:
-    for shop in db.list_shops():
+    global connector_webhook_registration_task
+    if (
+        connector_webhook_registration_task is None
+        or connector_webhook_registration_task.done()
+    ):
+        connector_webhook_registration_task = asyncio.create_task(
+            asyncio.to_thread(_ensure_connector_webhooks_for_all_shops),
+            name="connector-webhook-registration",
+        )
+
+
+def _ensure_connector_webhooks_for_all_shops() -> None:
+    try:
+        shops = db.list_shops()
+    except Exception:
+        logger.exception("connector_webhook_shop_listing_failed")
+        return
+    for shop in shops:
         try:
             ensure_inventory_webhook(shop)
         except Exception as exc:
@@ -158,6 +197,33 @@ async def ensure_connector_webhooks_on_startup() -> None:
                 "order_webhook_registration_failed %s",
                 safe_json_dumps({"shop": shop.shop_domain, "message": str(exc)}),
             )
+
+
+@app.on_event("startup")
+async def start_inventory_webhook_worker() -> None:
+    global inventory_webhook_worker_task
+    if inventory_webhook_worker_task is None or inventory_webhook_worker_task.done():
+        inventory_webhook_worker_task = asyncio.create_task(
+            _inventory_webhook_worker_loop(),
+            name="inventory-webhook-worker",
+        )
+
+
+@app.on_event("shutdown")
+async def stop_inventory_webhook_worker() -> None:
+    global connector_webhook_registration_task, inventory_webhook_worker_task
+    task = inventory_webhook_worker_task
+    inventory_webhook_worker_task = None
+    registration_task = connector_webhook_registration_task
+    connector_webhook_registration_task = None
+    for background_task in (task, registration_task):
+        if background_task is None:
+            continue
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            pass
 
 
 def _asset_version() -> str:
@@ -431,6 +497,19 @@ def _get_session_context(request: Request) -> Tuple[ShopRecord, dict]:
     return ensure_fresh_shop(shop), session
 
 
+def _require_same_origin(request: Request) -> None:
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return
+    expected = urlsplit(settings.normalized_app_base_url)
+    received = urlsplit(origin)
+    if (received.scheme.lower(), received.netloc.lower()) != (
+        expected.scheme.lower(),
+        expected.netloc.lower(),
+    ):
+        raise AuthorizationError("This action must be started from the Shopify app.")
+
+
 def ensure_fresh_shop(shop: ShopRecord, *, force_refresh: bool = False) -> ShopRecord:
     expires_at = parse_iso_datetime(shop.access_token_expires_at)
     refresh_needed = force_refresh
@@ -521,6 +600,10 @@ def require_pos_shop(
 ) -> ShopRecord:
     api_key, api_secret = extract_pos_credentials(credentials, x_api_key, x_api_secret)
     if api_key and api_secret:
+        if api_key.startswith("dev_"):
+            shop, device = db.verify_connector_device_credentials(api_key, api_secret)
+            request.state.connector_device_id = device.device_id
+            return shop
         return db.verify_pos_credentials(api_key, api_secret)
 
     query_key, query_secret = extract_woo_query_credentials(request)
@@ -552,6 +635,29 @@ def require_pos_shop(
             "query_names": ["consumer_key", "consumer_secret", "oauth_*"],
         },
     )
+
+
+def require_connector_setup_shop(
+    request: Request,
+    credentials: HTTPBasicCredentials | None = Depends(pos_basic_security),
+    x_api_key: str | None = Header(default=None),
+    x_api_secret: str | None = Header(default=None),
+) -> ShopRecord:
+    api_key, api_secret = extract_pos_credentials(credentials, x_api_key, x_api_secret)
+    if not api_key or not api_secret:
+        raise AuthorizationError("Connector credentials are required.")
+    if api_key.startswith("dev_"):
+        shop, device = db.verify_connector_device_credentials(
+            api_key,
+            api_secret,
+            allow_pending=True,
+        )
+        request.state.connector_device_id = device.device_id
+        request.state.connector_device_status = device.status
+        request.state.connector_installation_id = device.installation_id
+        return shop
+    request.state.connector_device_status = "legacy"
+    return db.verify_pos_credentials(api_key, api_secret)
 
 
 def build_connection_settings_response(
@@ -1083,6 +1189,9 @@ def _extract_api_key_for_logging(request: Request) -> str | None:
 def _resolve_request_log_shop(api_key: str | None) -> str | None:
     if not api_key or api_key == "basic-auth":
         return None
+    device = db.get_connector_device_for_api_key(api_key)
+    if device:
+        return device.shop_domain
     auth_record = db.get_pos_auth_record(api_key)
     return auth_record.shop_domain if auth_record else None
 
@@ -1092,6 +1201,16 @@ def _string_or_none(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _normalize_source_updated_at(value: Any) -> str | None:
+    normalized = _string_or_none(value)
+    parsed = parse_iso_datetime(
+        f"{normalized[:-1]}+00:00"
+        if normalized and normalized.endswith("Z")
+        else normalized
+    )
+    return parsed.astimezone(timezone.utc).isoformat() if parsed is not None else None
 
 
 def _as_float(value: Any) -> float | None:
@@ -1471,6 +1590,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     token_payload = exchange_authorization_code(settings, shop=shop, code=code)
     shop_info = shopify_client.get_shop_info(shop, token_payload["access_token"])
     shop_domain = validate_shop_domain(shop_info.get("myshopifyDomain") or shop)
+    was_installed = db.get_shop(shop_domain) is not None
     saved_shop = db.upsert_shop(
         shop_domain=shop_domain,
         access_token=token_payload["access_token"],
@@ -1481,7 +1601,30 @@ async def auth_callback(request: Request) -> RedirectResponse:
         shop_name=shop_info.get("name"),
         myshopify_domain=shop_info.get("myshopifyDomain"),
     )
-    _, raw_secret = db.ensure_pos_credentials(saved_shop.shop_domain)
+    if settings.shopify_location_id:
+        db.seed_single_shop_inventory_location(settings.shopify_location_id)
+        saved_shop = db.get_shop(saved_shop.shop_domain) or saved_shop
+    if not saved_shop.inventory_location_id:
+        try:
+            primary_location_id = run_with_shop_retry(
+                saved_shop,
+                lambda active_shop: shopify_client.get_primary_location_id(
+                    active_shop.shop_domain,
+                    active_shop.access_token,
+                ),
+            )
+            db.set_shop_inventory_location(
+                shop_domain=saved_shop.shop_domain,
+                location_id=normalize_gid("Location", primary_location_id),
+            )
+            saved_shop = db.get_shop(saved_shop.shop_domain) or saved_shop
+        except Exception as exc:
+            logger.warning(
+                "inventory_location_persistence_failed %s",
+                safe_json_dumps(
+                    {"shop": saved_shop.shop_domain, "message": str(exc)}
+                ),
+            )
     try:
         ensure_inventory_webhook(saved_shop)
     except Exception as exc:
@@ -1499,7 +1642,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 
     host = request.query_params.get("host") or oauth_state.get("host")
     return_to = oauth_state.get("return_to") or "/app"
-    redirect_path = "/app/settings" if raw_secret else return_to
+    redirect_path = return_to if was_installed else "/app/settings"
     params = [("shop", saved_shop.shop_domain)]
     if host:
         params.append(("host", host))
@@ -1513,8 +1656,6 @@ async def auth_callback(request: Request) -> RedirectResponse:
     redirect = RedirectResponse(url=redirect_url, status_code=303)
     session_manager.set_app_session(redirect, shop=saved_shop.shop_domain, host=host)
     session_manager.clear_oauth_state(redirect)
-    if raw_secret:
-        session_manager.set_secret_flash(redirect, shop=saved_shop.shop_domain, api_secret=raw_secret)
     return redirect
 
 
@@ -1603,7 +1744,7 @@ async def ui_config(request: Request) -> UiConfigResponse:
         embedded_app_ready=bool(settings.shopify_client_id),
         authenticated=True,
         app_base_url=resolve_base_url(request),
-        location_override=settings.shopify_location_id,
+        location_override=shop.inventory_location_id,
         timestamp=utc_now_iso(),
     )
 
@@ -1631,21 +1772,37 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         shop_domain=shop.shop_domain,
         limit=10,
     )
+    active_device = db.get_active_connector_device(shop.shop_domain)
+    legacy_credentials = db.get_pos_credentials_for_shop(shop.shop_domain)
+    connector_mode = (
+        "managed"
+        if active_device is not None
+        else "legacy"
+        if legacy_credentials is not None
+        else None
+    )
+    connector_installed = connector_mode is not None
     return JSONResponse(
         {
             "shop": shop.shop_domain,
             "connector": {
-                "active": is_active(heartbeat["last_seen_at"]),
+                "active": connector_installed and is_active(heartbeat["last_seen_at"]),
                 "last_seen_at": heartbeat["last_seen_at"],
+                "installed": connector_installed,
+                "mode": connector_mode,
+                "device_id": active_device.device_id if active_device else None,
+                "installation_id": active_device.installation_id if active_device else None,
+                "version": active_device.connector_version if active_device else None,
+                "activated_at": active_device.activated_at if active_device else None,
             },
             "inventory": {
-                "active": is_active(heartbeat["last_seen_at"]),
+                "active": connector_installed and is_active(heartbeat["last_seen_at"]),
                 "last_poll_at": heartbeat["last_inventory_poll_at"],
                 "last_catalog_sync_at": heartbeat["last_catalog_sync_at"],
                 "queued_changes": db.inventory_change_count(shop_domain=shop.shop_domain),
             },
             "orders": {
-                "active": is_active(heartbeat["last_order_poll_at"]),
+                "active": connector_installed and is_active(heartbeat["last_order_poll_at"]),
                 "authorized": "read_orders" in scopes,
                 "last_poll_at": heartbeat["last_order_poll_at"],
                 "queued_orders": db.order_change_count(shop_domain=shop.shop_domain),
@@ -1691,6 +1848,12 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
 @app.get("/api/connection-settings", response_model=ConnectionSettingsResponse)
 async def connection_settings(request: Request, response: Response) -> ConnectionSettingsResponse:
     shop, _session = _get_session_context(request)
+    if db.get_active_connector_device(shop.shop_domain) is not None:
+        raise SyncProcessingError(
+            "This shop uses the managed Windows installer. Download a replacement installer instead of creating shared credentials.",
+            status_code=409,
+            code="managed_connector_credentials",
+        )
     credentials, created_secret = db.ensure_pos_credentials(shop.shop_domain)
     return build_connection_settings_response(
         request,
@@ -1703,7 +1866,14 @@ async def connection_settings(request: Request, response: Response) -> Connectio
 
 @app.post("/api/connection-settings/rotate", response_model=ConnectionSettingsResponse)
 async def rotate_connection_settings(request: Request, response: Response) -> ConnectionSettingsResponse:
+    _require_same_origin(request)
     shop, _session = _get_session_context(request)
+    if db.get_active_connector_device(shop.shop_domain) is not None:
+        raise SyncProcessingError(
+            "This shop uses the managed Windows installer. Download a replacement installer instead of rotating shared credentials.",
+            status_code=409,
+            code="managed_connector_credentials",
+        )
     credentials, raw_secret = db.rotate_pos_credentials(shop.shop_domain)
     return build_connection_settings_response(
         request,
@@ -1711,6 +1881,162 @@ async def rotate_connection_settings(request: Request, response: Response) -> Co
         shop=shop,
         credentials=credentials,
         raw_secret=raw_secret,
+    )
+
+
+@app.get("/api/connector/setup.ps1", include_in_schema=False)
+async def connector_setup_script() -> Response:
+    return Response(
+        content=setup_script_bytes(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/api/connector/runtime.zip", include_in_schema=False)
+async def connector_runtime_archive() -> StreamingResponse:
+    runtime = build_runtime_archive()
+    return StreamingResponse(
+        BytesIO(runtime),
+        media_type="application/zip",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="shopify-pos-connector-{CONNECTOR_ARTIFACT_VERSION}.zip"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/connector-installer", include_in_schema=False)
+async def download_connector_installer(request: Request) -> Response:
+    _require_same_origin(request)
+    shop, _session = _get_session_context(request)
+    setup_payload = setup_script_bytes()
+    runtime_payload = build_runtime_archive()
+    enrollment = db.create_connector_enrollment(
+        shop.shop_domain,
+        artifact_version=CONNECTOR_ARTIFACT_VERSION,
+        ttl_seconds=15 * 60,
+    )
+    try:
+        installer = build_personalized_installer_bat(
+            base_url=settings.normalized_app_base_url,
+            shop_domain=shop.shop_domain,
+            enrollment_token=enrollment.token,
+            setup_sha256=sha256_hex(setup_payload),
+            runtime_sha256=sha256_hex(runtime_payload),
+        )
+    except ValueError as exc:
+        raise SyncProcessingError(
+            str(exc),
+            status_code=500,
+            code="connector_installer_configuration_error",
+        ) from exc
+    return Response(
+        content=installer,
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "Content-Disposition": f'attachment; filename="{installer_filename(shop.shop_domain)}"',
+            "X-Content-Type-Options": "nosniff",
+            "X-Installer-Expires-At": enrollment.expires_at,
+        },
+    )
+
+
+@app.post(
+    "/connector/v1/enroll",
+    response_model=ConnectorEnrollmentResponse,
+    responses={401: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+async def enroll_connector_device(
+    payload: ConnectorEnrollmentRequest,
+    response: Response,
+) -> ConnectorEnrollmentResponse:
+    device = db.redeem_connector_enrollment(
+        token=payload.enrollment_token,
+        installation_id=payload.installation_id,
+        device_secret=payload.device_secret,
+        connector_version=payload.connector_version,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return ConnectorEnrollmentResponse(
+        status=device.status,
+        shop=device.shop_domain,
+        installation_id=device.installation_id,
+        api_key=device.api_key,
+        connector_version=device.connector_version,
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.post(
+    "/connector/v1/activate",
+    response_model=ConnectorActivationResponse,
+    responses={401: {"model": ErrorResponse}},
+)
+async def activate_connector_device(
+    response: Response,
+    x_api_key: str | None = Header(default=None),
+    x_api_secret: str | None = Header(default=None),
+) -> ConnectorActivationResponse:
+    if not x_api_key or not x_api_secret or not x_api_key.startswith("dev_"):
+        raise AuthorizationError("Connector credentials are required.")
+    device = db.activate_connector_device(api_key=x_api_key, device_secret=x_api_secret)
+    response.headers["Cache-Control"] = "no-store"
+    return ConnectorActivationResponse(
+        status=device.status,
+        shop=device.shop_domain,
+        installation_id=device.installation_id,
+        connector_version=device.connector_version,
+        timestamp=utc_now_iso(),
+    )
+
+
+@app.get("/api/connector/verify", response_model=None)
+async def verify_connector_installation(
+    request: Request,
+    shop: ShopRecord = Depends(require_connector_setup_shop),
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "shop": shop.shop_domain,
+            "device_status": getattr(request.state, "connector_device_status", "legacy"),
+            "installation_id": getattr(request.state, "connector_installation_id", None),
+            "connector_api_version": 1,
+            "timestamp": utc_now_iso(),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/connector/devices/{device_id}/revoke", response_model=None)
+async def revoke_connector_installation(request: Request, device_id: str) -> JSONResponse:
+    _require_same_origin(request)
+    shop, _session = _get_session_context(request)
+    if not db.revoke_connector_device(
+        shop_domain=shop.shop_domain,
+        device_id=device_id,
+    ):
+        raise SyncProcessingError(
+            "Connector device not found.",
+            status_code=404,
+            code="connector_device_not_found",
+        )
+    return JSONResponse(
+        {
+            "status": "revoked",
+            "shop": shop.shop_domain,
+            "device_id": device_id,
+            "timestamp": utc_now_iso(),
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -2864,6 +3190,9 @@ async def repair_catalog_matrix_structure(
                         inventory_item_id=normalize_gid("InventoryItem", inventory_item_id),
                         sku=sku,
                         quantity=int(quantity),
+                        source_updated_at=_normalize_source_updated_at(
+                            variant.get("inventory_level_updated_at")
+                        ),
                     )
         results.append(result)
 
@@ -3210,7 +3539,15 @@ async def connector_inventory_adjustments(
         sku = _string_or_none(raw_adjustment.get("sku")) or ""
         try:
             delta = int(raw_adjustment.get("delta"))
-            idempotency_key = _string_or_none(raw_adjustment.get("idempotency_key")) or secrets.token_hex(16)
+            raw_change_from_quantity = raw_adjustment.get("expected_quantity")
+            change_from_quantity = (
+                int(raw_change_from_quantity)
+                if raw_change_from_quantity is not None
+                else None
+            )
+            idempotency_key = _string_or_none(raw_adjustment.get("idempotency_key"))
+            if idempotency_key is None:
+                raise ValueError("idempotency_key is required")
             if len(idempotency_key) > 128:
                 raise ValueError("idempotency_key must be 128 characters or fewer")
             result = run_with_shop_retry(
@@ -3219,6 +3556,7 @@ async def connector_inventory_adjustments(
                     sku=sku,
                     delta=delta,
                     idempotency_key=idempotency_key,
+                    change_from_quantity=change_from_quantity,
                     shop=active_shop,
                 ),
             )
@@ -3499,42 +3837,52 @@ async def orders_webhook(request: Request) -> JSONResponse:
     return JSONResponse({"status": "queued", "order_id": str(order_id)})
 
 
-@app.post("/webhooks/inventory-levels-update")
-async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
-    body = await request.body()
-    shop_domain = verify_webhook_request(request, body)
+def _process_inventory_webhook_event(event: InventoryWebhookEventRecord) -> str:
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise SyncProcessingError("Inventory webhook body is not valid JSON.", code="invalid_inventory_webhook") from exc
+        payload = json.loads(event.raw_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "ignored:invalid_json"
+    if not isinstance(payload, dict):
+        return "ignored:invalid_payload"
 
     inventory_item_value = payload.get("inventory_item_id")
     location_value = payload.get("location_id")
     available = payload.get("available")
     if inventory_item_value in (None, "") or location_value in (None, "") or available is None:
-        return JSONResponse({"status": "ignored", "reason": "missing_inventory_fields"})
+        return "ignored:missing_inventory_fields"
+    try:
+        available_quantity = int(available)
+    except (TypeError, ValueError):
+        return "ignored:invalid_available_quantity"
 
     inventory_item_id = normalize_gid("InventoryItem", str(inventory_item_value))
     location_id = normalize_gid("Location", str(location_value))
-    shop = db.get_shop(shop_domain)
+    shop = db.get_shop(event.shop_domain)
     if shop is None:
-        return JSONResponse({"status": "ignored", "reason": "shop_not_installed"})
-    target_location_id = (
-        normalize_gid("Location", settings.shopify_location_id)
-        if settings.shopify_location_id
-        else run_with_shop_retry(
+        return "ignored:shop_not_installed"
+
+    if shop.inventory_location_id:
+        target_location_id = normalize_gid("Location", shop.inventory_location_id)
+    else:
+        target_location_id = run_with_shop_retry(
             shop,
             lambda active_shop: shopify_client.get_primary_location_id(
                 active_shop.shop_domain,
                 active_shop.access_token,
             ),
         )
-    )
+        target_location_id = normalize_gid("Location", target_location_id)
+        if not db.set_shop_inventory_location(
+            shop_domain=shop.shop_domain,
+            location_id=target_location_id,
+        ):
+            return "ignored:shop_not_installed"
+
     if location_id != target_location_id:
-        return JSONResponse({"status": "ignored", "reason": "different_location"})
+        return "ignored:different_location"
 
     sku = db.get_inventory_item_sku(
-        shop_domain=shop_domain,
+        shop_domain=event.shop_domain,
         inventory_item_id=inventory_item_id,
     )
     if not sku:
@@ -3547,33 +3895,31 @@ async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
             ),
         )
         if not sku:
-            return JSONResponse({"status": "ignored", "reason": "inventory_item_has_no_sku"})
+            return "ignored:inventory_item_has_no_sku"
         db.upsert_inventory_item_sku(
-            shop_domain=shop_domain,
+            shop_domain=event.shop_domain,
             inventory_item_id=inventory_item_id,
             sku=sku,
         )
 
-    available_quantity = int(available)
-    source_updated_at_value = _string_or_none(payload.get("updated_at"))
-    source_updated_at_parsed = parse_iso_datetime(source_updated_at_value)
-    source_updated_at = (
-        source_updated_at_parsed.astimezone(timezone.utc).isoformat()
-        if source_updated_at_parsed is not None
-        else None
+    source_updated_at = _normalize_source_updated_at(payload.get("updated_at"))
+    source_updated_at_parsed = parse_iso_datetime(source_updated_at)
+    previous_quantity, previous_source_updated_at = (
+        db.get_inventory_item_quantity_observation(
+            shop_domain=event.shop_domain,
+            inventory_item_id=inventory_item_id,
+        )
     )
-    db.upsert_inventory_change(
-        shop_domain=shop_domain,
-        inventory_item_id=inventory_item_id,
-        location_id=location_id,
-        sku=sku,
-        quantity=available_quantity,
-        source_updated_at=source_updated_at,
-    )
-    previous_quantity = db.get_inventory_item_last_quantity(
-        shop_domain=shop_domain,
-        inventory_item_id=inventory_item_id,
-    )
+    previous_source_parsed = parse_iso_datetime(previous_source_updated_at)
+    if source_updated_at_parsed is None and previous_source_parsed is not None:
+        return "ignored:unversioned_inventory_event"
+    if (
+        source_updated_at_parsed is not None
+        and previous_source_parsed is not None
+        and source_updated_at_parsed < previous_source_parsed
+    ):
+        return "ignored:stale_inventory_event"
+
     status_repair: dict[str, Any] | None = None
     if available_quantity > 0 and (previous_quantity is None or previous_quantity <= 0):
         status_repair = run_with_shop_retry(
@@ -3584,19 +3930,118 @@ async def inventory_levels_update_webhook(request: Request) -> JSONResponse:
                 expected_positive_quantity=True,
             ),
         )
+
+    db.upsert_inventory_change(
+        shop_domain=event.shop_domain,
+        inventory_item_id=inventory_item_id,
+        location_id=location_id,
+        sku=sku,
+        quantity=available_quantity,
+        source_updated_at=source_updated_at,
+    )
     db.upsert_inventory_item_quantity(
-        shop_domain=shop_domain,
+        shop_domain=event.shop_domain,
         inventory_item_id=inventory_item_id,
         sku=sku,
         quantity=available_quantity,
+        source_updated_at=source_updated_at,
+    )
+    return (
+        "queued:product_status_updated"
+        if status_repair and status_repair.get("product_status_updated")
+        else "queued"
+    )
+
+
+def drain_inventory_webhook_events(
+    *,
+    shop_domain: str | None = None,
+    limit: int = 25,
+) -> dict[str, int]:
+    if not inventory_webhook_drain_lock.acquire(blocking=False):
+        return {"claimed": 0, "completed": 0, "retried": 0}
+    try:
+        events = db.claim_inventory_webhook_events(
+            shop_domain=shop_domain,
+            limit=limit,
+        )
+        completed = 0
+        retried = 0
+        for event in events:
+            if not event.lease_token:
+                continue
+            try:
+                result = _process_inventory_webhook_event(event)
+            except Exception as exc:
+                retry_delay = min(300, 2 ** min(max(event.attempts, 1), 8))
+                if db.retry_inventory_webhook_event(
+                    event_id=event.id,
+                    lease_token=event.lease_token,
+                    error=str(exc),
+                    retry_delay_seconds=retry_delay,
+                ):
+                    retried += 1
+                logger.warning(
+                    "inventory_webhook_processing_retry %s",
+                    safe_json_dumps(
+                        {
+                            "event_id": event.id,
+                            "shop": event.shop_domain,
+                            "attempt": event.attempts,
+                            "retry_delay_seconds": retry_delay,
+                            "message": str(exc),
+                        }
+                    ),
+                )
+                continue
+            if db.complete_inventory_webhook_event(
+                event_id=event.id,
+                lease_token=event.lease_token,
+                result=result,
+            ):
+                completed += 1
+        return {"claimed": len(events), "completed": completed, "retried": retried}
+    finally:
+        inventory_webhook_drain_lock.release()
+
+
+async def _inventory_webhook_worker_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(drain_inventory_webhook_events)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("inventory_webhook_worker_failed")
+        await asyncio.sleep(5)
+
+
+@app.post("/webhooks/inventory-levels-update")
+async def inventory_levels_update_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    body = await request.body()
+    shop_domain = verify_webhook_request(request, body)
+    if db.get_shop(shop_domain) is None:
+        return JSONResponse({"status": "ignored", "reason": "shop_not_installed"})
+
+    event, created = db.enqueue_inventory_webhook_event(
+        shop_domain=shop_domain,
+        webhook_id=request.headers.get("x-shopify-webhook-id"),
+        raw_payload=body,
+    )
+    background_tasks.add_task(
+        drain_inventory_webhook_events,
+        shop_domain=shop_domain,
+        limit=10,
     )
     return JSONResponse(
         {
-            "status": "queued",
-            "product_status_updated": bool(
-                status_repair and status_repair.get("product_status_updated")
-            ),
-        }
+            "status": "queued" if created else "duplicate",
+            "event_id": event.id,
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 

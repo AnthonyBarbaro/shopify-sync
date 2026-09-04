@@ -4,13 +4,24 @@ import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from app.utils import AuthorizationError, setup_logging, utc_now_iso
+from app.utils import (
+    AuthorizationError,
+    SyncProcessingError,
+    parse_iso_datetime,
+    setup_logging,
+    utc_now,
+    utc_now_iso,
+)
+
+
+CONNECTOR_ACTIVATION_TTL_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,7 @@ class ShopRecord:
     installed_at: Optional[str] = None
     updated_at: Optional[str] = None
     uninstalled_at: Optional[str] = None
+    inventory_location_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,28 @@ class PosAuthRecord:
     secret_salt: str
     secret_hash: str
     secret_ciphertext: Optional[str]
+
+
+@dataclass(frozen=True)
+class ConnectorEnrollmentRecord:
+    enrollment_id: str
+    shop_domain: str
+    token: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ConnectorDeviceRecord:
+    device_id: str
+    shop_domain: str
+    installation_id: str
+    api_key: str
+    status: str
+    connector_version: str
+    created_at: str
+    activated_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+    activation_expires_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +127,23 @@ class InventoryChangeRow:
     version: int
     updated_at: str
     source_updated_at: Optional[str]
+
+
+@dataclass(frozen=True)
+class InventoryWebhookEventRecord:
+    id: int
+    shop_domain: str
+    webhook_id: Optional[str]
+    raw_payload: bytes
+    status: str
+    attempts: int
+    received_at: str
+    next_attempt_at: str
+    lease_token: Optional[str] = None
+    locked_until: Optional[str] = None
+    processed_at: Optional[str] = None
+    last_error: Optional[str] = None
+    result: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +236,7 @@ class DatabaseStore:
                     inventory_item_id TEXT NOT NULL,
                     sku TEXT NOT NULL,
                     last_quantity INTEGER,
+                    last_quantity_source_updated_at TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(shop_domain, inventory_item_id),
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
@@ -204,6 +256,28 @@ class DatabaseStore:
                     source_updated_at TEXT,
                     updated_at TEXT NOT NULL,
                     UNIQUE(shop_domain, inventory_item_id, location_id),
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inventory_webhook_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    webhook_id TEXT,
+                    raw_payload BLOB NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    received_at TEXT NOT NULL,
+                    next_attempt_at TEXT NOT NULL,
+                    lease_token TEXT,
+                    locked_until TEXT,
+                    processed_at TEXT,
+                    last_error TEXT,
+                    result TEXT,
+                    UNIQUE(shop_domain, dedupe_key),
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
                 )
                 """
@@ -287,6 +361,45 @@ class DatabaseStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS connector_devices (
+                    device_id TEXT PRIMARY KEY,
+                    shop_domain TEXT NOT NULL,
+                    installation_id TEXT NOT NULL,
+                    api_key TEXT UNIQUE NOT NULL,
+                    secret_salt TEXT NOT NULL,
+                    secret_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    connector_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    activation_expires_at TEXT,
+                    activated_at TEXT,
+                    last_used_at TEXT,
+                    revoked_at TEXT,
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connector_enrollments (
+                    enrollment_id TEXT PRIMARY KEY,
+                    shop_domain TEXT NOT NULL,
+                    token_digest TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL,
+                    installation_id TEXT,
+                    device_id TEXT,
+                    artifact_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    redeemed_at TEXT,
+                    revoked_at TEXT,
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain),
+                    FOREIGN KEY(device_id) REFERENCES connector_devices(device_id)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS feed_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shop_domain TEXT NOT NULL,
@@ -330,6 +443,15 @@ class DatabaseStore:
             self._ensure_column(connection, "inventory_changes", "version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "inventory_changes", "source_updated_at", "TEXT")
             self._ensure_column(connection, "inventory_item_skus", "last_quantity", "INTEGER")
+            self._ensure_column(
+                connection,
+                "inventory_item_skus",
+                "last_quantity_source_updated_at",
+                "TEXT",
+            )
+            self._ensure_column(connection, "shops", "inventory_location_id", "TEXT")
+            self._ensure_column(connection, "connector_devices", "activation_expires_at", "TEXT")
+            self._migrate_connector_device_installation_constraint(connection)
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_credentials_api_key ON pos_credentials(api_key)"
             )
@@ -343,6 +465,14 @@ class DatabaseStore:
                 "CREATE INDEX IF NOT EXISTS idx_inventory_changes_shop_id ON inventory_changes(shop_domain, id)"
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inventory_webhook_events_due "
+                "ON inventory_webhook_events(status, next_attempt_at, locked_until)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inventory_webhook_events_processed "
+                "ON inventory_webhook_events(status, processed_at)"
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_order_changes_shop_id ON order_changes(shop_domain, id)"
             )
             connection.execute(
@@ -352,6 +482,18 @@ class DatabaseStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recent_prices_shop_changed "
                 "ON recent_price_changes(shop_domain, changed_at DESC)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_devices_one_active_shop "
+                "ON connector_devices(shop_domain) WHERE status = 'active'"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_connector_devices_shop_installation "
+                "ON connector_devices(shop_domain, installation_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_connector_enrollments_shop_created "
+                "ON connector_enrollments(shop_domain, created_at DESC)"
             )
             for row in connection.execute("SELECT DISTINCT shop_domain FROM feed_events").fetchall():
                 self._trim_shop_rows(
@@ -442,6 +584,70 @@ class DatabaseStore:
             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
         )
 
+    @staticmethod
+    def _migrate_connector_device_installation_constraint(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Allow multiple credential generations for one physical installation."""
+        has_unique_installation_index = False
+        for index in connection.execute("PRAGMA index_list(connector_devices)").fetchall():
+            if not index["unique"]:
+                continue
+            columns = [
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                    (index["name"],),
+                ).fetchall()
+            ]
+            if columns == ["installation_id"]:
+                has_unique_installation_index = True
+                break
+        if not has_unique_installation_index:
+            return
+
+        connection.execute("DROP TABLE IF EXISTS connector_devices_rotation_v2")
+        connection.execute(
+            """
+            CREATE TABLE connector_devices_rotation_v2 (
+                device_id TEXT PRIMARY KEY,
+                shop_domain TEXT NOT NULL,
+                installation_id TEXT NOT NULL,
+                api_key TEXT UNIQUE NOT NULL,
+                secret_salt TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                connector_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                activation_expires_at TEXT,
+                activated_at TEXT,
+                last_used_at TEXT,
+                revoked_at TEXT,
+                FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO connector_devices_rotation_v2 (
+                device_id, shop_domain, installation_id, api_key,
+                secret_salt, secret_hash, status, connector_version,
+                created_at, activation_expires_at, activated_at,
+                last_used_at, revoked_at
+            )
+            SELECT
+                device_id, shop_domain, installation_id, api_key,
+                secret_salt, secret_hash, status, connector_version,
+                created_at, activation_expires_at, activated_at,
+                last_used_at, revoked_at
+            FROM connector_devices
+            """
+        )
+        connection.execute("DROP TABLE connector_devices")
+        connection.execute(
+            "ALTER TABLE connector_devices_rotation_v2 RENAME TO connector_devices"
+        )
+
     def upsert_shop(
         self,
         *,
@@ -520,6 +726,22 @@ class DatabaseStore:
             )
             connection.commit()
 
+    def set_shop_inventory_location(self, *, shop_domain: str, location_id: str) -> bool:
+        normalized = str(location_id or "").strip()
+        if not normalized:
+            return False
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE shops
+                SET inventory_location_id = ?, updated_at = ?
+                WHERE shop_domain = ? AND uninstalled_at IS NULL
+                """,
+                (normalized, utc_now_iso(), shop_domain),
+            )
+            connection.commit()
+        return updated.rowcount == 1
+
     def shop_count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(
@@ -534,10 +756,446 @@ class DatabaseStore:
             ).fetchall()
         return [shop for row in rows if (shop := self._row_to_shop(row)) is not None]
 
+    def seed_single_shop_inventory_location(self, location_id: str) -> bool:
+        """Migrate the legacy global location override onto its existing shop."""
+        normalized = str(location_id or "").strip()
+        if not normalized:
+            return False
+        with self._lock:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT shop_domain, inventory_location_id
+                    FROM shops
+                    WHERE uninstalled_at IS NULL
+                    """
+                ).fetchall()
+                if len(rows) != 1 or rows[0]["inventory_location_id"]:
+                    return False
+                connection.execute(
+                    "UPDATE shops SET inventory_location_id = ? WHERE shop_domain = ?",
+                    (normalized, rows[0]["shop_domain"]),
+                )
+                connection.commit()
+        return True
+
+    def create_connector_enrollment(
+        self,
+        shop_domain: str,
+        *,
+        artifact_version: str,
+        ttl_seconds: int = 900,
+    ) -> ConnectorEnrollmentRecord:
+        shop = self.get_shop(shop_domain)
+        if shop is None:
+            raise AuthorizationError("This shop is not installed or has been disconnected.")
+
+        enrollment_id = f"enr_{secrets.token_hex(16)}"
+        token = f"pair_{secrets.token_urlsafe(32)}"
+        token_digest = _token_digest(token)
+        created_at = utc_now_iso()
+        expires_at = (utc_now() + timedelta(seconds=max(60, int(ttl_seconds)))).isoformat()
+
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    UPDATE connector_devices
+                    SET status = 'revoked', revoked_at = ?
+                    WHERE shop_domain = ? AND status = 'pending'
+                    """,
+                    (created_at, shop_domain),
+                )
+                connection.execute(
+                    """
+                    UPDATE connector_enrollments
+                    SET status = 'revoked', revoked_at = ?
+                    WHERE shop_domain = ? AND status = 'pending'
+                    """,
+                    (created_at, shop_domain),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM connector_enrollments
+                    WHERE expires_at <= ? AND status != 'pending'
+                    """,
+                    (created_at,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO connector_enrollments (
+                        enrollment_id, shop_domain, token_digest, status,
+                        artifact_version, created_at, expires_at
+                    )
+                    VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        enrollment_id,
+                        shop_domain,
+                        token_digest,
+                        artifact_version,
+                        created_at,
+                        expires_at,
+                    ),
+                )
+                connection.commit()
+
+        return ConnectorEnrollmentRecord(
+            enrollment_id=enrollment_id,
+            shop_domain=shop_domain,
+            token=token,
+            expires_at=expires_at,
+        )
+
+    def redeem_connector_enrollment(
+        self,
+        *,
+        token: str,
+        installation_id: str,
+        device_secret: str,
+        connector_version: str,
+    ) -> ConnectorDeviceRecord:
+        token_digest = _token_digest(token)
+        now = utc_now()
+        now_iso = now.isoformat()
+        activation_expires_at = (
+            now + timedelta(seconds=CONNECTOR_ACTIVATION_TTL_SECONDS)
+        ).isoformat()
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT
+                        enrollment_id, connector_enrollments.shop_domain AS shop_domain,
+                        connector_enrollments.status AS enrollment_status,
+                        connector_enrollments.installation_id AS enrollment_installation_id,
+                        connector_enrollments.device_id AS enrollment_device_id,
+                        expires_at, shops.uninstalled_at,
+                        connector_devices.api_key AS device_api_key,
+                        connector_devices.secret_salt AS device_secret_salt,
+                        connector_devices.secret_hash AS device_secret_hash,
+                        connector_devices.status AS device_status,
+                        connector_devices.connector_version AS device_connector_version,
+                        connector_devices.created_at AS device_created_at,
+                        connector_devices.activation_expires_at AS device_activation_expires_at,
+                        connector_devices.activated_at AS device_activated_at,
+                        connector_devices.last_used_at AS device_last_used_at
+                    FROM connector_enrollments
+                    JOIN shops ON shops.shop_domain = connector_enrollments.shop_domain
+                    LEFT JOIN connector_devices
+                        ON connector_devices.device_id = connector_enrollments.device_id
+                    WHERE token_digest = ?
+                    """,
+                    (token_digest,),
+                ).fetchone()
+
+                if row is None or row["uninstalled_at"] is not None:
+                    raise _invalid_connector_enrollment()
+
+                if row["enrollment_status"] == "redeemed":
+                    same_device = (
+                        row["enrollment_installation_id"] == installation_id
+                        and row["enrollment_device_id"]
+                        and row["device_secret_salt"]
+                        and row["device_secret_hash"]
+                        and _verify_secret(
+                            device_secret,
+                            salt_hex=row["device_secret_salt"],
+                            secret_hash=row["device_secret_hash"],
+                        )
+                    )
+                    if not same_device or row["device_status"] not in {"pending", "active"}:
+                        raise _invalid_connector_enrollment()
+                    if row["device_status"] == "pending":
+                        pending_expires_at = parse_iso_datetime(
+                            row["device_activation_expires_at"]
+                        )
+                        if pending_expires_at is None or pending_expires_at <= now:
+                            connection.execute(
+                                """
+                                UPDATE connector_devices
+                                SET status = 'revoked', revoked_at = ?
+                                WHERE device_id = ? AND status = 'pending'
+                                """,
+                                (now_iso, row["enrollment_device_id"]),
+                            )
+                            connection.commit()
+                            raise _invalid_connector_enrollment()
+                    return ConnectorDeviceRecord(
+                        device_id=row["enrollment_device_id"],
+                        shop_domain=row["shop_domain"],
+                        installation_id=installation_id,
+                        api_key=row["device_api_key"],
+                        status=row["device_status"],
+                        connector_version=row["device_connector_version"],
+                        created_at=row["device_created_at"],
+                        activation_expires_at=row["device_activation_expires_at"],
+                        activated_at=row["device_activated_at"],
+                        last_used_at=row["device_last_used_at"],
+                    )
+
+                expires_at = parse_iso_datetime(row["expires_at"])
+                if row["enrollment_status"] != "pending" or expires_at is None or expires_at <= now:
+                    raise _invalid_connector_enrollment()
+
+                device_id = f"device_{secrets.token_hex(16)}"
+                api_key = f"dev_{secrets.token_hex(16)}"
+                salt, secret_hash = _hash_secret(device_secret)
+                connection.execute(
+                    """
+                    INSERT INTO connector_devices (
+                        device_id, shop_domain, installation_id, api_key,
+                        secret_salt, secret_hash, status, connector_version,
+                        created_at, activation_expires_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        device_id,
+                        row["shop_domain"],
+                        installation_id,
+                        api_key,
+                        salt,
+                        secret_hash,
+                        connector_version,
+                        now_iso,
+                        activation_expires_at,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE connector_enrollments
+                    SET status = 'redeemed', installation_id = ?, device_id = ?, redeemed_at = ?
+                    WHERE enrollment_id = ? AND status = 'pending'
+                    """,
+                    (installation_id, device_id, now_iso, row["enrollment_id"]),
+                )
+                if updated.rowcount != 1:
+                    raise _invalid_connector_enrollment()
+                connection.commit()
+
+        return ConnectorDeviceRecord(
+            device_id=device_id,
+            shop_domain=row["shop_domain"],
+            installation_id=installation_id,
+            api_key=api_key,
+            status="pending",
+            connector_version=connector_version,
+            created_at=now_iso,
+            activation_expires_at=activation_expires_at,
+        )
+
+    def activate_connector_device(
+        self,
+        *,
+        api_key: str,
+        device_secret: str,
+    ) -> ConnectorDeviceRecord:
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT connector_devices.*, shops.uninstalled_at
+                    FROM connector_devices
+                    JOIN shops ON shops.shop_domain = connector_devices.shop_domain
+                    WHERE api_key = ?
+                    """,
+                    (api_key,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["uninstalled_at"] is not None
+                    or row["status"] not in {"pending", "active"}
+                    or not _verify_secret(
+                        device_secret,
+                        salt_hex=row["secret_salt"],
+                        secret_hash=row["secret_hash"],
+                    )
+                ):
+                    raise AuthorizationError("Invalid connector credentials.")
+
+                if row["status"] == "pending":
+                    now = utc_now()
+                    now_iso = now.isoformat()
+                    expires_at = parse_iso_datetime(row["activation_expires_at"])
+                    if expires_at is None or expires_at <= now:
+                        connection.execute(
+                            """
+                            UPDATE connector_devices
+                            SET status = 'revoked', revoked_at = ?
+                            WHERE device_id = ? AND status = 'pending'
+                            """,
+                            (now_iso, row["device_id"]),
+                        )
+                        connection.commit()
+                        raise AuthorizationError(
+                            "Connector activation expired. Download a new installer from Shopify."
+                        )
+                    connection.execute(
+                        """
+                        UPDATE connector_devices
+                        SET status = 'revoked', revoked_at = ?
+                        WHERE shop_domain = ? AND status = 'active' AND device_id != ?
+                        """,
+                        (now_iso, row["shop_domain"], row["device_id"]),
+                    )
+                    activated = connection.execute(
+                        """
+                        UPDATE connector_devices
+                        SET status = 'active', activated_at = ?
+                        WHERE device_id = ? AND status = 'pending'
+                        """,
+                        (now_iso, row["device_id"]),
+                    )
+                    if activated.rowcount != 1:
+                        raise AuthorizationError("Connector activation failed.")
+                    # A newly activated device replaces the legacy shared shop key.
+                    connection.execute(
+                        "DELETE FROM pos_credentials WHERE shop_domain = ?",
+                        (row["shop_domain"],),
+                    )
+                    # Heartbeats are shop-scoped, so an old device's online state
+                    # must not carry over to a replacement credential generation.
+                    connection.execute(
+                        "DELETE FROM connector_heartbeats WHERE shop_domain = ?",
+                        (row["shop_domain"],),
+                    )
+                    connection.commit()
+
+        device = self.get_connector_device_for_api_key(api_key)
+        if device is None:
+            raise AuthorizationError("Connector activation failed.")
+        return device
+
+    def get_connector_device_for_api_key(self, api_key: str) -> Optional[ConnectorDeviceRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT device_id, shop_domain, installation_id, api_key, status,
+                       connector_version, created_at, activation_expires_at,
+                       activated_at, last_used_at
+                FROM connector_devices
+                WHERE api_key = ?
+                """,
+                (api_key,),
+            ).fetchone()
+        return self._row_to_connector_device(row)
+
+    def get_active_connector_device(self, shop_domain: str) -> Optional[ConnectorDeviceRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT device_id, shop_domain, installation_id, api_key, status,
+                       connector_version, created_at, activation_expires_at,
+                       activated_at, last_used_at
+                FROM connector_devices
+                WHERE shop_domain = ? AND status = 'active'
+                """,
+                (shop_domain,),
+            ).fetchone()
+        return self._row_to_connector_device(row)
+
+    def verify_connector_device_credentials(
+        self,
+        api_key: str,
+        device_secret: str,
+        *,
+        allow_pending: bool = False,
+    ) -> Tuple[ShopRecord, ConnectorDeviceRecord]:
+        allowed_statuses = ("active", "pending") if allow_pending else ("active",)
+        placeholders = ",".join("?" for _ in allowed_statuses)
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    f"""
+                    SELECT connector_devices.*, shops.uninstalled_at
+                    FROM connector_devices
+                    JOIN shops ON shops.shop_domain = connector_devices.shop_domain
+                    WHERE api_key = ? AND connector_devices.status IN ({placeholders})
+                    """,
+                    (api_key, *allowed_statuses),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["uninstalled_at"] is not None
+                    or not _verify_secret(
+                        device_secret,
+                        salt_hex=row["secret_salt"],
+                        secret_hash=row["secret_hash"],
+                    )
+                ):
+                    raise AuthorizationError("Invalid connector credentials.")
+
+                used_at = utc_now_iso()
+                if row["status"] == "pending":
+                    expires_at = parse_iso_datetime(row["activation_expires_at"])
+                    if expires_at is None or expires_at <= utc_now():
+                        connection.execute(
+                            """
+                            UPDATE connector_devices
+                            SET status = 'revoked', revoked_at = ?
+                            WHERE device_id = ? AND status = 'pending'
+                            """,
+                            (used_at, row["device_id"]),
+                        )
+                        connection.commit()
+                        raise AuthorizationError(
+                            "Connector activation expired. Download a new installer from Shopify."
+                        )
+                connection.execute(
+                    "UPDATE connector_devices SET last_used_at = ? WHERE device_id = ?",
+                    (used_at, row["device_id"]),
+                )
+                connection.commit()
+        shop = self.get_shop(row["shop_domain"])
+        if shop is None:
+            raise AuthorizationError("This shop is not installed or has been disconnected.")
+        device = self.get_connector_device_for_api_key(api_key)
+        if device is None:
+            raise AuthorizationError("Invalid connector credentials.")
+        return shop, device
+
+    def revoke_connector_device(self, *, shop_domain: str, device_id: str) -> bool:
+        now = utc_now_iso()
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT status
+                    FROM connector_devices
+                    WHERE shop_domain = ? AND device_id = ?
+                    """,
+                    (shop_domain, device_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                connection.execute(
+                    """
+                    UPDATE connector_devices
+                    SET status = 'revoked', revoked_at = ?
+                    WHERE shop_domain = ? AND device_id = ? AND status != 'revoked'
+                    """,
+                    (now, shop_domain, device_id),
+                )
+                if row["status"] == "active":
+                    connection.execute(
+                        "DELETE FROM connector_heartbeats WHERE shop_domain = ?",
+                        (shop_domain,),
+                    )
+                connection.commit()
+        return True
+
     def ensure_pos_credentials(
         self,
         shop_domain: str,
     ) -> Tuple[PosCredentialRecord, Optional[str]]:
+        if self.get_active_connector_device(shop_domain) is not None:
+            raise _managed_connector_credentials_error()
         existing = self.get_pos_credentials_for_shop(shop_domain)
         if existing is not None:
             return existing, None
@@ -558,6 +1216,17 @@ class DatabaseStore:
 
         with self._lock:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                active_device = connection.execute(
+                    """
+                    SELECT 1
+                    FROM connector_devices
+                    WHERE shop_domain = ? AND status = 'active'
+                    """,
+                    (shop_domain,),
+                ).fetchone()
+                if active_device is not None:
+                    raise _managed_connector_credentials_error()
                 connection.execute(
                     """
                     INSERT INTO pos_credentials (
@@ -961,7 +1630,7 @@ class DatabaseStore:
                     """
                     SELECT *
                     FROM request_logs
-                    WHERE shop_domain = ? OR shop_domain IS NULL
+                    WHERE shop_domain = ?
                     ORDER BY created_at DESC, id DESC
                     LIMIT ?
                     """,
@@ -983,13 +1652,196 @@ class DatabaseStore:
         with self._connect() as connection:
             if shop_domain:
                 row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM request_logs WHERE shop_domain = ? OR shop_domain IS NULL",
+                    "SELECT COUNT(*) AS count FROM request_logs WHERE shop_domain = ?",
                     (shop_domain,),
                 ).fetchone()
             else:
                 row = connection.execute(
                     "SELECT COUNT(*) AS count FROM request_logs"
                 ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def enqueue_inventory_webhook_event(
+        self,
+        *,
+        shop_domain: str,
+        webhook_id: Optional[str],
+        raw_payload: bytes,
+    ) -> Tuple[InventoryWebhookEventRecord, bool]:
+        payload = bytes(raw_payload)
+        normalized_webhook_id = str(webhook_id or "").strip() or None
+        dedupe_material = (
+            b"id\0" + normalized_webhook_id.encode("utf-8")
+            if normalized_webhook_id
+            else b"payload\0" + payload
+        )
+        dedupe_key = hashlib.sha256(dedupe_material).hexdigest()
+        now_iso = utc_now_iso()
+
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                inserted = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO inventory_webhook_events (
+                        shop_domain, dedupe_key, webhook_id, raw_payload,
+                        status, attempts, received_at, next_attempt_at
+                    )
+                    VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                    """,
+                    (
+                        shop_domain,
+                        dedupe_key,
+                        normalized_webhook_id,
+                        sqlite3.Binary(payload),
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM inventory_webhook_events
+                    WHERE shop_domain = ? AND dedupe_key = ?
+                    """,
+                    (shop_domain, dedupe_key),
+                ).fetchone()
+                connection.commit()
+
+        event = self._row_to_inventory_webhook_event(row)
+        if event is None:
+            raise sqlite3.DatabaseError("Inventory webhook enqueue did not persist an event.")
+        return event, inserted.rowcount == 1
+
+    def claim_inventory_webhook_events(
+        self,
+        *,
+        shop_domain: Optional[str] = None,
+        limit: int = 25,
+        lease_seconds: int = 300,
+    ) -> list[InventoryWebhookEventRecord]:
+        safe_limit = max(1, min(int(limit), 100))
+        now = utc_now()
+        now_iso = now.isoformat()
+        locked_until = (now + timedelta(seconds=max(30, int(lease_seconds)))).isoformat()
+        shop_clause = "AND shop_domain = ?" if shop_domain else ""
+        parameters: tuple[object, ...] = (
+            (now_iso, now_iso, shop_domain, safe_limit)
+            if shop_domain
+            else (now_iso, now_iso, safe_limit)
+        )
+
+        claimed: list[InventoryWebhookEventRecord] = []
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    f"""
+                    SELECT id
+                    FROM inventory_webhook_events
+                    WHERE (
+                        (status = 'pending' AND next_attempt_at <= ?)
+                        OR (status = 'processing' AND locked_until <= ?)
+                    )
+                    {shop_clause}
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
+                for row in rows:
+                    lease_token = f"lease_{secrets.token_hex(16)}"
+                    connection.execute(
+                        """
+                        UPDATE inventory_webhook_events
+                        SET status = 'processing', attempts = attempts + 1,
+                            lease_token = ?, locked_until = ?
+                        WHERE id = ?
+                        """,
+                        (lease_token, locked_until, row["id"]),
+                    )
+                    claimed_row = connection.execute(
+                        "SELECT * FROM inventory_webhook_events WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    event = self._row_to_inventory_webhook_event(claimed_row)
+                    if event is not None:
+                        claimed.append(event)
+                connection.commit()
+        return claimed
+
+    def complete_inventory_webhook_event(
+        self,
+        *,
+        event_id: int,
+        lease_token: str,
+        result: str,
+    ) -> bool:
+        now = utc_now()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE inventory_webhook_events
+                SET status = 'completed', processed_at = ?, result = ?,
+                    lease_token = NULL, locked_until = NULL, last_error = NULL
+                WHERE id = ? AND status = 'processing' AND lease_token = ?
+                """,
+                (now.isoformat(), str(result)[:500], int(event_id), lease_token),
+            )
+            connection.execute(
+                """
+                DELETE FROM inventory_webhook_events
+                WHERE status = 'completed' AND processed_at < ?
+                """,
+                ((now - timedelta(days=7)).isoformat(),),
+            )
+            connection.commit()
+        return updated.rowcount == 1
+
+    def retry_inventory_webhook_event(
+        self,
+        *,
+        event_id: int,
+        lease_token: str,
+        error: str,
+        retry_delay_seconds: int,
+    ) -> bool:
+        next_attempt_at = (
+            utc_now() + timedelta(seconds=max(0, int(retry_delay_seconds)))
+        ).isoformat()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE inventory_webhook_events
+                SET status = 'pending', next_attempt_at = ?, last_error = ?,
+                    lease_token = NULL, locked_until = NULL
+                WHERE id = ? AND status = 'processing' AND lease_token = ?
+                """,
+                (next_attempt_at, str(error)[:2000], int(event_id), lease_token),
+            )
+            connection.commit()
+        return updated.rowcount == 1
+
+    def inventory_webhook_event_count(
+        self,
+        *,
+        shop_domain: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if shop_domain:
+            clauses.append("shop_domain = ?")
+            parameters.append(shop_domain)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM inventory_webhook_events{where_clause}",
+                parameters,
+            ).fetchone()
         return int(row["count"]) if row else 0
 
     def upsert_inventory_item_sku(
@@ -1043,6 +1895,30 @@ class DatabaseStore:
             return None
         return int(row["last_quantity"])
 
+    def get_inventory_item_quantity_observation(
+        self,
+        *,
+        shop_domain: str,
+        inventory_item_id: str,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT last_quantity, last_quantity_source_updated_at
+                FROM inventory_item_skus
+                WHERE shop_domain = ? AND inventory_item_id = ?
+                """,
+                (shop_domain, inventory_item_id),
+            ).fetchone()
+        if row is None:
+            return None, None
+        quantity = (
+            int(row["last_quantity"])
+            if row["last_quantity"] is not None
+            else None
+        )
+        return quantity, row["last_quantity_source_updated_at"]
+
     def upsert_inventory_item_quantity(
         self,
         *,
@@ -1050,18 +1926,27 @@ class DatabaseStore:
         inventory_item_id: str,
         sku: str,
         quantity: int,
-    ) -> None:
+        source_updated_at: Optional[str] = None,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
+            updated = connection.execute(
                 """
                 INSERT INTO inventory_item_skus (
-                    shop_domain, inventory_item_id, sku, updated_at, last_quantity
+                    shop_domain, inventory_item_id, sku, updated_at,
+                    last_quantity, last_quantity_source_updated_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(shop_domain, inventory_item_id) DO UPDATE SET
                     sku=excluded.sku,
                     updated_at=excluded.updated_at,
-                    last_quantity=excluded.last_quantity
+                    last_quantity=excluded.last_quantity,
+                    last_quantity_source_updated_at=COALESCE(
+                        excluded.last_quantity_source_updated_at,
+                        inventory_item_skus.last_quantity_source_updated_at
+                    )
+                WHERE inventory_item_skus.last_quantity_source_updated_at IS NULL
+                   OR excluded.last_quantity_source_updated_at IS NULL
+                   OR excluded.last_quantity_source_updated_at >= inventory_item_skus.last_quantity_source_updated_at
                 """,
                 (
                     shop_domain,
@@ -1069,9 +1954,11 @@ class DatabaseStore:
                     sku,
                     utc_now_iso(),
                     int(quantity),
+                    source_updated_at,
                 ),
             )
             connection.commit()
+        return updated.rowcount == 1
 
     def upsert_inventory_change(
         self,
@@ -1095,11 +1982,16 @@ class DatabaseStore:
                     sku=excluded.sku,
                     quantity=excluded.quantity,
                     version=inventory_changes.version + 1,
-                    source_updated_at=excluded.source_updated_at,
+                    source_updated_at=COALESCE(
+                        excluded.source_updated_at,
+                        inventory_changes.source_updated_at
+                    ),
                     updated_at=excluded.updated_at
                 WHERE inventory_changes.source_updated_at IS NULL
-                   OR excluded.source_updated_at IS NULL
-                   OR excluded.source_updated_at >= inventory_changes.source_updated_at
+                   OR (
+                        excluded.source_updated_at IS NOT NULL
+                        AND excluded.source_updated_at >= inventory_changes.source_updated_at
+                   )
                 """,
                 (
                     shop_domain,
@@ -1494,7 +2386,27 @@ class DatabaseStore:
                 (shop_domain,),
             )
             connection.execute(
+                """
+                UPDATE connector_devices
+                SET status = 'revoked', revoked_at = ?
+                WHERE shop_domain = ? AND status != 'revoked'
+                """,
+                (utc_now_iso(), shop_domain),
+            )
+            connection.execute(
+                """
+                UPDATE connector_enrollments
+                SET status = 'revoked', revoked_at = ?
+                WHERE shop_domain = ? AND status = 'pending'
+                """,
+                (utc_now_iso(), shop_domain),
+            )
+            connection.execute(
                 "DELETE FROM inventory_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM inventory_webhook_events WHERE shop_domain = ?",
                 (shop_domain,),
             )
             connection.execute(
@@ -1532,6 +2444,46 @@ class DatabaseStore:
             installed_at=row["installed_at"],
             updated_at=row["updated_at"],
             uninstalled_at=row["uninstalled_at"],
+            inventory_location_id=row["inventory_location_id"],
+        )
+
+    @staticmethod
+    def _row_to_connector_device(row: Optional[sqlite3.Row]) -> Optional[ConnectorDeviceRecord]:
+        if row is None:
+            return None
+        return ConnectorDeviceRecord(
+            device_id=row["device_id"],
+            shop_domain=row["shop_domain"],
+            installation_id=row["installation_id"],
+            api_key=row["api_key"],
+            status=row["status"],
+            connector_version=row["connector_version"],
+            created_at=row["created_at"],
+            activation_expires_at=row["activation_expires_at"],
+            activated_at=row["activated_at"],
+            last_used_at=row["last_used_at"],
+        )
+
+    @staticmethod
+    def _row_to_inventory_webhook_event(
+        row: Optional[sqlite3.Row],
+    ) -> Optional[InventoryWebhookEventRecord]:
+        if row is None:
+            return None
+        return InventoryWebhookEventRecord(
+            id=int(row["id"]),
+            shop_domain=row["shop_domain"],
+            webhook_id=row["webhook_id"],
+            raw_payload=bytes(row["raw_payload"]),
+            status=row["status"],
+            attempts=int(row["attempts"]),
+            received_at=row["received_at"],
+            next_attempt_at=row["next_attempt_at"],
+            lease_token=row["lease_token"],
+            locked_until=row["locked_until"],
+            processed_at=row["processed_at"],
+            last_error=row["last_error"],
+            result=row["result"],
         )
 
     @staticmethod
@@ -1576,6 +2528,24 @@ def _hash_secret(secret: str) -> Tuple[str, str]:
     salt = secrets.token_bytes(16)
     secret_hash = hashlib.scrypt(secret.encode("utf-8"), salt=salt, n=16384, r=8, p=1)
     return salt.hex(), secret_hash.hex()
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(str(token or "").strip().encode("utf-8")).hexdigest()
+
+
+def _invalid_connector_enrollment() -> AuthorizationError:
+    return AuthorizationError(
+        "This setup file has expired or was already used. Download a new installer from Shopify."
+    )
+
+
+def _managed_connector_credentials_error() -> SyncProcessingError:
+    return SyncProcessingError(
+        "This shop uses the managed Windows installer. Revoke it before creating shared credentials.",
+        status_code=409,
+        code="managed_connector_credentials",
+    )
 
 
 def _verify_secret(secret: str, *, salt_hex: str, secret_hash: str) -> bool:

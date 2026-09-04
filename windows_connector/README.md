@@ -1,7 +1,7 @@
-# Windows POS Inventory Connector
+# Inventory Sync POS Bridge for Cash Register Express
 
-This connector runs continuously on the Windows POS computer. It checks the live POS event tables
-every three minutes but sends no DBF files or ZIP archives to Railway.
+The Cash Register Express connector runs continuously on the store's Windows computer. It checks the
+live POS event tables every three minutes but sends no DBF files or ZIP archives to Railway.
 
 ## Sync behavior
 
@@ -55,11 +55,11 @@ manual, unmarked archives are preserved. Recurring inventory cycles do not newly
 An automatically archived product created before this marker existed needs a one-time manual change
 to Draft after the upgraded reconciliation repairs its quantity.
 
-All snapshot reads, webhooks, and adjustments use the same Shopify inventory location. Set the
-Railway `SHOPIFY_LOCATION_ID` value for a multi-location store. Without it, Shopify's primary
-location is pinned; a later location change stops reconciliation for review instead of mixing stock
-from two locations. Duplicate Shopify SKUs and inventory items unavailable at that location are also
-blocked from unattended writes.
+All snapshot reads, webhooks, and adjustments use the same inventory location for each shop. A
+legacy Railway `SHOPIFY_LOCATION_ID` value is migrated onto the sole existing shop. Additional shops
+use their own Shopify primary location. A later location change stops reconciliation for review
+instead of mixing stock from two locations. Duplicate Shopify SKUs and inventory items unavailable
+at that location are also blocked from unattended writes.
 
 ## Storage
 
@@ -83,12 +83,13 @@ results. The server separately caps its feed and request history using
 
 ## Shopify order inbox
 
-When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete
-events before each inventory cycle and writes genuine dBASE III files at
-`C:\ashpsdat_web\shopify-order-header.dbf` and `C:\ashpsdat_web\shopify-order-detail.dbf` by default
-when `POS_DBF_DIR=C:\ashpsdat`. The connector creates the separate folder and both files when they do
-not exist. These isolated inbox files mirror the useful shape of the POS `Ordhdr.dbf` and `Orddtl.dbf`
-files but never modify, copy, or insert into those native FoxPro tables.
+When `ORDER_SYNC_ENABLED=true` and the Shopify app has `read_orders` access, the connector pulls
+queued Shopify order create, update, cancel, and delete events before each inventory cycle and writes
+genuine dBASE III files at `C:\ashpsdat_web\shopify-order-header.dbf` and
+`C:\ashpsdat_web\shopify-order-detail.dbf` by default when `POS_DBF_DIR=C:\ashpsdat`. The connector
+creates the separate folder and both files when they do not exist. These isolated inbox files mirror
+the useful shape of the POS `Ordhdr.dbf` and `Orddtl.dbf` files but never modify, copy, or insert into
+those native FoxPro tables.
 
 - `shopify-order-header.dbf`: order/invoice identifiers, customer name, email, phone, billing address, shipping
   address, shipping method and charge, subtotal, discount, tax, total, fulfillment/financial state,
@@ -125,23 +126,34 @@ The POS developer handoff, field list, and import queries are in
 
 ## Install
 
-1. Copy `connector.env.example` to `connector.env`.
-2. Enter the local `ashpsdat` path, sync URL, POS key, and POS secret.
-3. Keep `POS_WRITEBACK_MODE=dry-run` initially.
-4. In PowerShell, test one read-only cycle:
+The normal installation is one file:
 
-   ```powershell
-   py windows_connector\connector.py --config windows_connector\connector.env --once --dry-run
-   ```
+1. Open the Inventory Sync app's **Settings** page inside Shopify.
+2. Select **Download Windows installer**.
+3. Move the downloaded BAT file to the Cash Register Express computer and open it within 15 minutes.
+4. Approve the Windows Administrator prompt. If `ashpsdat` is not found uniquely at the root of a
+   fixed local drive, select the live folder when asked.
 
-5. Open PowerShell as Administrator and install the startup task:
+The BAT contains a short-lived, one-use pairing code, not a permanent API secret. Downloading another
+BAT immediately revokes every earlier unused pairing code, so use only the newest download. The BAT
+verifies the setup script and runtime archive, installs into `C:\ProgramData\ShopifyPosConnector`,
+creates an isolated Python environment, performs a fast credential and `Item.dbf` check, registers
+the task as Windows `SYSTEM`, and starts it. If Python 3.10 or newer is missing, setup downloads the
+official, digitally signed Python runtime. Internet access is required during installation.
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File windows_connector\install.ps1
-   ```
+Only one Cash Register Express connector can be active for a shop. Successfully installing a
+replacement revokes the prior device and any legacy shared POS credentials. Existing inventory state
+is bound to its Shopify shop and Windows installation so it cannot silently be reused for a different
+store. New installs start with `POS_WRITEBACK_MODE=dry-run`; a verified replacement preserves the
+existing write-back mode.
 
-The task runs as Windows `SYSTEM`, starts one minute after boot, restarts after failures, and prevents
-overlapping instances. Use a local drive or UNC path for `POS_DBF_DIR`; mapped drive letters are not
+For development-only manual setup, copy `connector.env.example` to `connector.env`, fill every
+required value, then run `install.ps1` from an Administrator PowerShell window. `--validate` performs
+the same fast preflight without scanning the full catalog or recording an operational heartbeat.
+
+The task runs as Windows `SYSTEM`, starts immediately after one-click setup and one minute after each
+later boot, restarts after failures, and prevents overlapping instances. The one-click installer
+requires a fixed local POS data drive; it rejects UNC and mapped-drive paths because those are not
 normally available to `SYSTEM`.
 
 ## POS quantity write-back
@@ -155,10 +167,10 @@ The live mode is:
 POS_WRITEBACK_MODE=vfp-oledb
 ```
 
-It requires the Microsoft Visual FoxPro OLE DB provider (`VFPOLEDB.1`) on the POS computer. The writer
-uses the 32-bit Windows PowerShell host, FoxPro transactions, relative quantity adjustments, and an
-expected-quantity condition. Matrix adjustments update both the exact `Itemmqty` cell and the
-aggregate `Item` quantity.
+It requires the Microsoft Visual FoxPro OLE DB provider (`VFPOLEDB.1`) on the Cash Register Express
+computer. The writer uses the 32-bit Windows PowerShell host, FoxPro transactions, relative quantity
+adjustments, and an expected-quantity condition. Matrix adjustments update both the exact `Itemmqty`
+cell and the aggregate `Item` quantity.
 
 Before enabling live write-back:
 
@@ -173,16 +185,16 @@ financial transaction for an online Shopify order.
 
 ## Operations
 
-Deploy the Railway/backend release before updating the Windows connector. The upgraded connector
-requires inventory snapshot schema version 2 and will stop safely, without acknowledging queued
-inventory changes, if the older endpoint is still deployed.
-
-To update the Windows runtime, open `windows_connector\update_connector.bat` as Administrator. The
-updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_sync.py`, plus the small
-supporting runtime files. It preserves `connector.env`, connector state, logs, Shopify order DBFs,
-native POS DBFs, and any legacy Shopify order SQLite database.
+Deploy the Railway/backend release before updating Inventory Sync POS Bridge. To update or repair a
+one-click installation, download a fresh installer from the Inventory Sync Settings page inside
+Shopify and open it on the same computer. It preserves the shop-bound config and inventory state,
+verifies the complete runtime, and recreates the scheduled task. The older raw-GitHub updater is
+retained only for legacy installs that still live at `C:\ShopifySync`; do not use it for the
+ProgramData installation.
 
 Start or stop the task:
+
+The scheduled task retains its legacy internal name for compatibility:
 
 ```powershell
 Start-ScheduledTask -TaskName "Shopify POS Inventory Connector"

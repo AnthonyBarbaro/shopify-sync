@@ -273,10 +273,7 @@ class InventorySyncService:
         return rows
 
     def get_inventory_snapshot(self, shop: ShopRecord) -> Dict[str, Any]:
-        location_id = self.shopify_client.get_primary_location_id(
-            shop.shop_domain,
-            shop.access_token,
-        )
+        location_id = self._shop_location_id(shop)
         return {
             "location_id": normalize_gid("Location", location_id),
             "items": self.shopify_client.get_inventory_snapshot(
@@ -295,6 +292,7 @@ class InventorySyncService:
         sku: str,
         delta: int,
         idempotency_key: str,
+        change_from_quantity: Optional[int] = None,
         shop: ShopRecord,
     ) -> Dict[str, Any]:
         normalized_sku = sku.strip()
@@ -317,6 +315,7 @@ class InventorySyncService:
             location_id,
             int(delta),
             idempotency_key=idempotency_key,
+            change_from_quantity=change_from_quantity,
             sku=normalized_sku,
         )
         if isinstance(adjustment_result, dict):
@@ -877,7 +876,7 @@ class InventorySyncService:
             existing_mapping=existing_mapping,
         )
         product_title = payload.title or payload.sku or "POS Imported Product"
-        location_id = self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
+        location_id = self._shop_location_id(shop)
         existing_product: Optional[Dict[str, Any]] = None
 
         if existing_mapping is not None:
@@ -2127,8 +2126,12 @@ class InventorySyncService:
         )
 
     def _resolve_location_id(self, shop: ShopRecord, mapping: VariantMapping) -> str:
-        if self.settings is not None and self.settings.shopify_location_id:
-            return normalize_gid("Location", self.settings.shopify_location_id)
+        return self._shop_location_id(shop)
+
+    def _shop_location_id(self, shop: ShopRecord) -> str:
+        override = getattr(shop, "inventory_location_id", None)
+        if override:
+            return normalize_gid("Location", override)
         return self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
 
     @staticmethod

@@ -972,9 +972,6 @@ class ShopifyClient:
         return product
 
     def get_primary_location_id(self, shop_domain: str, access_token: str) -> str:
-        if self.settings.shopify_location_id:
-            return normalize_gid("Location", self.settings.shopify_location_id)
-
         with self._location_lock:
             cached = self._location_cache.get(shop_domain)
             if cached is not None:
@@ -1510,6 +1507,7 @@ class ShopifyClient:
         delta: int,
         *,
         idempotency_key: str,
+        change_from_quantity: Optional[int] = None,
         sku: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_inventory_item_id = normalize_gid("InventoryItem", inventory_item_id)
@@ -1548,6 +1546,7 @@ class ShopifyClient:
                             "inventoryItemId": normalized_inventory_item_id,
                             "locationId": normalized_location_id,
                             "delta": int(delta),
+                            "changeFromQuantity": change_from_quantity,
                         }
                     ],
                 },

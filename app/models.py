@@ -229,6 +229,34 @@ class ConnectionSettingsResponse(BaseModel):
     timestamp: str
 
 
+class ConnectorEnrollmentRequest(BaseModel):
+    enrollment_token: str = Field(min_length=40, max_length=160)
+    installation_id: str = Field(
+        min_length=32,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    device_secret: str = Field(min_length=40, max_length=160)
+    connector_version: str = Field(min_length=1, max_length=32)
+
+
+class ConnectorEnrollmentResponse(BaseModel):
+    status: str
+    shop: str
+    installation_id: str
+    api_key: str
+    connector_version: str
+    timestamp: str
+
+
+class ConnectorActivationResponse(BaseModel):
+    status: str
+    shop: str
+    installation_id: str
+    connector_version: str
+    timestamp: str
+
+
 class ShopifyConnectionResponse(BaseModel):
     status: str
     authenticated: bool

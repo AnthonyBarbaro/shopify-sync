@@ -1,12 +1,13 @@
 # Shopify Inventory Sync
 
-FastAPI backend for syncing products, pricing, images, and inventory from an external POS into Shopify.
+FastAPI backend for syncing products, pricing, images, and inventory from Cash Register Express into
+Shopify.
 
 ## What It Does
 
 - installs as a Shopify app
 - stores one Shopify connection per shop
-- generates POS credentials per shop
+- creates one-time, shop-bound Cash Register Express connector installers and per-device credentials
 - exposes Woo-style compatible product endpoints for POS integrations
 - creates new Shopify products as drafts
 - updates existing Shopify products by SKU
@@ -47,7 +48,7 @@ Copy `.env.example` to `.env` and set:
 SHOPIFY_CLIENT_ID=your_client_id
 SHOPIFY_CLIENT_SECRET=your_client_secret
 SHOPIFY_API_VERSION=2026-01
-# SHOPIFY_LOCATION_ID=123456789
+# SHOPIFY_LOCATION_ID=123456789  # legacy single-shop override; migrated onto that shop
 APP_BASE_URL=https://your-domain.example
 APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations,read_orders
 APP_SESSION_SECRET=replace_with_a_long_random_secret
@@ -67,7 +68,7 @@ setting is higher. Railway separately keeps only 50 small order summaries for th
 the Windows Shopify order DBF inbox defaults to 250 orders with a hard maximum of 500.
 
 Legacy POS ZIP uploads retain only the product/inventory DBFs and delete the ZIP after extraction.
-The unattended Windows connector does not upload DBF files at all.
+The unattended Inventory Sync POS Bridge does not upload DBF files at all.
 
 The unattended connector treats catalog data as a one-time import: zero-quantity products are
 archived, descriptions start empty, and the generated product name is added as a tag. After a base
@@ -91,9 +92,9 @@ the nightly scan. Incomplete matrix definitions are probed again after a 15-minu
 
 The first connector run after an inventory or catalog-structure reconciliation upgrade, and one run
 after local midnight each day, compares POS quantities with a lean Shopify inventory snapshot at one location.
-This repairs SKUs that predate a local baseline or whose webhook was missed during downtime. Set
-`SHOPIFY_LOCATION_ID` when the store has more than one inventory location; otherwise Shopify's
-primary location is pinned on the first verified snapshot. Duplicate Shopify SKUs and items that
+This repairs SKUs that predate a local baseline or whose webhook was missed during downtime. A legacy
+single-shop `SHOPIFY_LOCATION_ID` override is migrated onto that shop; additional shops use their
+own Shopify primary location. Duplicate Shopify SKUs and items that
 are unavailable at that location are blocked instead of being adjusted ambiguously.
 
 Products archived automatically because their imported quantity was zero carry the internal
@@ -135,6 +136,13 @@ Use these values in Shopify:
 App URL: https://your-domain.example/
 Allowed redirection URL: https://your-domain.example/auth/callback
 ```
+
+Distribution is separate from hosting and installation. This backend can isolate multiple shops, but
+Shopify custom distribution is limited to one merchant, and Shopify currently does not accept public
+App Store apps that require a desktop app or connect to a non-Shopify POS. Confirm an approved
+distribution path with Shopify Partner Support before onboarding unrelated merchants.
+The downloadable BAT installs only the local Cash Register Express connector after the Shopify app
+is authorized; it is not a Shopify app installation or distribution link.
 
 ## Railway Production Notes
 
@@ -202,10 +210,20 @@ list is truncated are never archived by reconciliation. Reconciliation only mana
 with the `pos.sku` metafield by a previous rich POS sync, so unrelated Shopify products remain intact.
 Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SKU `21741`.
 
-## Windows Connector
+## Inventory Sync POS Bridge
 
-The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
-It starts with Windows, uploads product details only during the initial catalog import, processes new
+The Cash Register Express connector is documented in [windows_connector/README.md](windows_connector/README.md).
+From the Inventory Sync app's Settings page inside Shopify, download the personalized BAT and open it
+on the store's Cash Register Express computer within 15 minutes. It verifies and installs the runtime,
+locates `ashpsdat`, pairs with a one-use token, registers the scheduled task, and starts it. Downloading
+another BAT immediately revokes every earlier unused pairing code, so use only the newest download.
+Long-lived device secrets are created on the Windows computer and only their password hashes are
+stored by Railway. A successful replacement revokes the prior device and any legacy shared POS
+credentials; local inventory state is bound to its shop and device.
+New connector installs start POS quantity write-back in dry-run mode. A verified replacement preserves
+the existing write-back mode.
+
+The connector starts with Windows, uploads product details only during the initial catalog import, processes new
 `invdtl.dbf` and `editvoid.dbf` events every three minutes, and runs one full quantity reconciliation
 after local midnight. The first upgraded run also forces this reconciliation immediately. Deploy the
 Railway/backend update before updating the Windows connector; the connector rejects an older snapshot
@@ -220,7 +238,7 @@ GET /api/feed.csv
 GET /api/request-logs.csv
 ```
 
-## POS Connector
+## Legacy POS Connector API
 
 Use the shareable connector guide here:
 
@@ -250,5 +268,8 @@ PUT /wp-json/wc/v3/products/{id}
 
 - new products should be sent with `status=draft` on first upload
 - images must be public `https://` URLs
-- POS credentials do not expire automatically
-- POS credentials only change if rotated manually or the database is reset
+- managed pairing codes expire after 15 minutes, and only the newest downloaded installer's code
+  remains valid
+- managed device credentials remain valid until the device is replaced or the Shopify app is uninstalled
+- legacy shared POS credentials do not expire automatically, but manual rotation, managed-device activation,
+  Shopify app uninstall, or a database reset revokes them

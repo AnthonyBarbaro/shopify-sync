@@ -1,6 +1,7 @@
 param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot "connector.env"),
     [string]$TaskName = "Shopify POS Inventory Connector",
+    [string]$PythonPath = "",
     [switch]$StartNow
 )
 
@@ -8,42 +9,59 @@ $ErrorActionPreference = "Stop"
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Run this installer from PowerShell as Administrator."
+    throw "Run this installer as Administrator."
 }
 
 $config = (Resolve-Path -LiteralPath $ConfigPath).Path
 $connector = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "connector.py")).Path
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $reader = Join-Path $projectRoot "jbarbaro_db\dbf_pos_sync.py"
-if (-not (Test-Path -LiteralPath $reader)) {
+if (-not (Test-Path -LiteralPath $reader -PathType Leaf)) {
     throw "Missing POS reader: $reader"
 }
 
-$launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-if ($launcher) {
-    & $launcher.Source -3 -m venv (Join-Path $PSScriptRoot ".venv")
+if ($PythonPath) {
+    $python = (Resolve-Path -LiteralPath $PythonPath).Path
 }
 else {
-    $python = Get-Command python.exe -ErrorAction Stop
-    & $python.Source -m venv (Join-Path $PSScriptRoot ".venv")
+    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $python = (& $launcher.Source -3 -c "import sys; print(sys.executable)" | Select-Object -Last 1).Trim()
+    }
+    else {
+        $pythonCommand = Get-Command python.exe -ErrorAction Stop
+        $python = $pythonCommand.Source
+    }
 }
 
-$venvPython = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot ".venv\Scripts\python.exe")).Path
-& $venvPython -m pip install --disable-pip-version-check "requests>=2.32,<3"
+$venvPath = Join-Path $PSScriptRoot ".venv"
+& $python -m venv $venvPath
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not install the connector dependency."
+    throw "Could not create the connector Python environment."
 }
-
-& $venvPython $connector --config $config --once --dry-run
+$venvPython = (Resolve-Path -LiteralPath (Join-Path $venvPath "Scripts\python.exe")).Path
+$requirements = Join-Path $PSScriptRoot "requirements.txt"
+if (Test-Path -LiteralPath $requirements -PathType Leaf) {
+    & $venvPython -m pip install --disable-pip-version-check --requirement $requirements
+}
+else {
+    & $venvPython -m pip install --disable-pip-version-check "requests>=2.32,<3"
+}
 if ($LASTEXITCODE -ne 0) {
-    throw "Connector validation failed. Review connector.env and the console output."
+    throw "Could not install the connector dependency. Check this computer's internet or proxy settings."
 }
 
+& $venvPython $connector --config $config --validate
+if ($LASTEXITCODE -ne 0) {
+    throw "Connector validation failed. Review the setup message and $config."
+}
+
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $arguments = '"{0}" --config "{1}"' -f $connector, $config
 $action = New-ScheduledTaskAction -Execute $venvPython -Argument $arguments -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $trigger.Delay = "PT1M"
-$settings = New-ScheduledTaskSettingsSet `
+$taskSettings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -56,18 +74,15 @@ Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
     -Trigger $trigger `
-    -Settings $settings `
+    -Settings $taskSettings `
     -Principal $taskPrincipal `
-    -Description "Processes POS sales/edit events every three minutes and runs a nightly full inventory reconciliation." `
+    -Description "Synchronizes the store POS, Shopify inventory, prices, and order inbox." `
     -Force | Out-Null
 
 if ($StartNow) {
     Start-ScheduledTask -TaskName $TaskName
 }
 
-Write-Host "Installed scheduled task: $TaskName"
+Write-Host "Prepared scheduled task: $TaskName"
 Write-Host "Config: $config"
-Write-Host "Log: C:\ProgramData\ShopifyPosConnector\connector.log (unless CONNECTOR_DATA_DIR was changed)"
-if (-not $StartNow) {
-    Write-Host "The connector will start one minute after the next boot. Use Start-ScheduledTask to start it now."
-}
+Write-Host "Log: C:\ProgramData\ShopifyPosConnector\connector.log"

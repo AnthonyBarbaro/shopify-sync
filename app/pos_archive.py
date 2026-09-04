@@ -121,9 +121,6 @@ def default_archive_root(storage_root: Path) -> Path:
     current_root = storage_root / "current"
     if current_root.exists():
         return current_root
-    local_root = Path("ashpsdat")
-    if local_root.exists():
-        return local_root
     return current_root
 
 
