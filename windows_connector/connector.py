@@ -315,6 +315,18 @@ class Connector:
             now=now,
             hour=self.nightly_full_sync_hour,
         )
+        status_reconcile_due = (
+            now.hour >= self.nightly_full_sync_hour
+            and (
+                state.get("last_product_status_reconcile_date") != now.date().isoformat()
+                or bool(state.get("pending_product_status_skus"))
+            )
+            and (
+                nightly_due
+                or bool(state.get("pending_product_status_reconcile_date"))
+                or bool(state.get("pending_product_status_skus"))
+            )
+        )
         inventory_reconcile_upgrade_due = (
             int(state.get("inventory_reconcile_schema_version") or 0)
             < INVENTORY_RECONCILE_SCHEMA_VERSION
@@ -332,6 +344,7 @@ class Connector:
             or matrix_option_repair_due
             or inventory_reconcile_upgrade_due
             or catalog_structure_upgrade_due
+            or status_reconcile_due
         )
         if full_reconcile:
             if catalog_incomplete:
@@ -821,6 +834,10 @@ class Connector:
             state["inventory_reconcile_schema_version"] = INVENTORY_RECONCILE_SCHEMA_VERSION
             if catalog_structure_scan_complete:
                 state["catalog_structure_schema_version"] = CATALOG_STRUCTURE_SCHEMA_VERSION
+            if status_reconcile_due:
+                # Save the unfinished pass before adjustments; failures must retry
+                # even though the quantity reconciliation is already dated today.
+                state["pending_product_status_reconcile_date"] = now.date().isoformat()
         save_state(self.state_path, state)
         blocked_pos_skus: set[str] = set()
         if planned_shop:
@@ -845,6 +862,14 @@ class Connector:
                     self.writeback_mode,
                     len(planned_pos),
                 )
+        if inventory_snapshot is not None and status_reconcile_due:
+            if self._reconcile_zero_stock_product_statuses(
+                state,
+                local_quantities,
+                observed_skus=local_quantities.keys() & remote_quantities.keys(),
+            ):
+                state["last_product_status_reconcile_date"] = now.date().isoformat()
+                state.pop("pending_product_status_reconcile_date", None)
         state["last_cycle_epoch"] = int(time.time())
         save_state(self.state_path, state)
         if inventory_changes and inventory_snapshot is None:
@@ -864,6 +889,113 @@ class Connector:
             len(planned_shop),
             len(planned_pos),
         )
+
+    def _reconcile_zero_stock_product_statuses(
+        self,
+        state: Dict[str, Any],
+        local_quantities: Dict[str, int],
+        *,
+        observed_skus: set[str],
+    ) -> bool:
+        if self.dry_run:
+            return False
+        known_products = set(state.get("catalog_products") or [])
+        sku_bases = state.get("sku_bases") or {}
+        entries = state.get("quantities") or {}
+        blocked_skus = set(state.get("blocked_inventory_skus") or [])
+        blocked_skus.update(pending_matrix_structure_skus(state))
+        blocked_bases = {
+            sku_bases.get(sku, base_sku(sku)) for sku in blocked_skus
+        }
+        pending_bases = {
+            sku_bases.get(sku, base_sku(sku))
+            for sku, entry in entries.items()
+            if entry.get("pending_shop") or entry.get("pending_pos")
+        }
+        product_skus: Dict[str, List[str]] = {}
+        for sku in local_quantities:
+            base = sku_bases.get(sku, base_sku(sku))
+            if base in known_products:
+                product_skus.setdefault(base, []).append(sku)
+
+        pending_status_skus = set(state.get("pending_product_status_skus") or [])
+        candidates: List[str] = []
+        for sku in sorted(pending_status_skus, key=str.casefold):
+            base = sku_bases.get(sku, base_sku(sku))
+            skus = product_skus.get(base) or []
+            if (
+                skus
+                and base not in blocked_bases
+                and base not in pending_bases
+                and sku in observed_skus
+                and all(child in observed_skus for child in skus)
+            ):
+                # A previous archive may need restock recovery even when this
+                # snapshot is positive. The backend freshly verifies its stock.
+                candidates.append(sku)
+        deferred = False
+        for base, skus in product_skus.items():
+            if base in blocked_bases or any(sku not in observed_skus for sku in skus):
+                continue
+            if any(
+                (entries.get(sku) or {}).get("canonical") is None
+                or int(entries[sku]["canonical"]) > 0
+                for sku in skus
+            ):
+                continue
+            if base in pending_bases:
+                deferred = True
+                continue
+            if any(
+                any(
+                    (entries.get(sku) or {}).get(field) is None
+                    or int(entries[sku][field]) > 0
+                    for field in ("pos_seen", "shop_seen")
+                )
+                for sku in skus
+            ):
+                continue
+            # Matrix base SKUs need not exist as Shopify variants. Send one
+            # observed child; the backend verifies every variant and location.
+            candidate = sorted(skus, key=str.casefold)[0]
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        succeeded = 0
+        batch_size = max(1, min(self.batch_size, 100)) if candidates else 1
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start : start + batch_size]
+            pending_status_skus.update(batch)
+            state["pending_product_status_skus"] = sorted(pending_status_skus, key=str.casefold)
+            # Persist before sending: a timeout may follow a completed archive.
+            save_state(self.state_path, state)
+            response = self.session.post(
+                f"{self.base_url}/sync/inventory/status/reconcile",
+                json={"skus": batch},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            results = response.json().get("results") or []
+            for sku in batch:
+                matches = [result for result in results if result.get("sku") == sku]
+                if len(matches) == 1 and matches[0].get("success") is True:
+                    succeeded += 1
+                    pending_status_skus.discard(sku)
+                else:
+                    self.logger.error("product_status_reconcile_failed sku=%s", sku)
+            if pending_status_skus:
+                state["pending_product_status_skus"] = sorted(pending_status_skus, key=str.casefold)
+            else:
+                state.pop("pending_product_status_skus", None)
+            save_state(self.state_path, state)
+        self.logger.info(
+            "product_status_reconcile candidates=%s succeeded=%s failed=%s pending_inventory=%s",
+            len(candidates),
+            succeeded,
+            len(candidates) - succeeded,
+            deferred,
+        )
+        return succeeded == len(candidates) and not deferred and not pending_status_skus
 
     def _reader_args(self, skus: Optional[Iterable[str]] = None) -> SimpleNamespace:
         return SimpleNamespace(

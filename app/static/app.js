@@ -134,7 +134,7 @@ function navigate(path) {
     })
   }
   render()
-  window.scrollTo({ top: 0, behavior: "smooth" })
+  window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" })
 }
 
 function render() {
@@ -170,17 +170,18 @@ function renderOverview() {
     <section class="page">
       <div class="welcome">
         <div>
-          <p class="kicker">${escapeHtml(storeName)}</p>
-          <h1>${bridgeActive ? "Your POS bridge is active" : "Waiting for your POS bridge"}</h1>
+          <p class="kicker">Store overview <span aria-hidden="true">/</span> ${escapeHtml(storeName)}</p>
+          <h1>${bridgeActive ? "Your store, connected." : "Let’s get you connected."}</h1>
           <p>${bridgeActive
-            ? "Inventory and Shopify orders are moving through the connector automatically."
+            ? "Your connector is checking in. Follow inventory and order activity below."
             : "The Windows connector has not checked in during the last 8 minutes."}</p>
         </div>
         <div class="welcome-actions">
           ${statusBadge(bridgeActive ? "Active" : "Offline", bridgeActive ? "success" : "danger", true)}
           <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>
-            ${state.refreshing ? "Checking…" : "Refresh"}
+            ${icon("refresh", state.refreshing ? "is-spinning" : "")} ${state.refreshing ? "Checking…" : "Refresh"}
           </button>
+          <small>${state.bridge?.timestamp ? `Updated ${escapeHtml(relativeTime(state.bridge.timestamp))}` : "Refreshes every 30 seconds"}</small>
         </div>
       </div>
 
@@ -189,7 +190,7 @@ function renderOverview() {
 
       <div class="status-grid">
         ${renderStatusCard({
-          icon: "I",
+          icon: "inventory",
           title: "Inventory bridge",
           active: inventory.active,
           activeText: "Inventory bridge is active",
@@ -200,7 +201,7 @@ function renderOverview() {
           lastSeen: connector.last_seen_at,
         })}
         ${renderStatusCard({
-          icon: "O",
+          icon: "orders",
           title: "Order sync",
           active: orders.active && orders.authorized,
           activeText: "Order sync is active",
@@ -210,13 +211,26 @@ function renderOverview() {
         })}
       </div>
 
+      <section class="panel" aria-labelledby="inventory-changes-heading">
+        <div class="panel-head">
+          <div>
+            <p class="kicker">Inventory tracking</p>
+            <h2 id="inventory-changes-heading">Recent quantity changes</h2>
+          </div>
+          <span class="panel-label">POS <span aria-hidden="true">→</span> Shopify</span>
+        </div>
+        ${renderInventoryChangeList(inventory.recent || [])}
+        <div class="panel-footer">Latest 10 successful quantity updates <span>Refreshes automatically</span></div>
+      </section>
+
+      <div class="activity-grid">
       <section class="panel">
         <div class="panel-head">
           <div>
-            <p class="kicker">Recent orders</p>
-            <h2>Shopify → POS</h2>
+            <p class="kicker">Shopify → POS</p>
+            <h2>Recent orders</h2>
           </div>
-          <a class="text-link" href="/app/orders" data-route>View all recent orders</a>
+          <a class="text-link" href="/app/orders" data-route>View orders ${icon("arrow")}</a>
         </div>
         ${renderOrderList((orders.recent || []).slice(0, 5), true)}
       </section>
@@ -225,12 +239,12 @@ function renderOverview() {
         <div class="panel-head">
           <div>
             <p class="kicker">Price tracking</p>
-            <h2>Recent POS price changes</h2>
+            <h2>Recent price changes</h2>
           </div>
-          <small>Only variant prices are updated</small>
         </div>
         ${renderPriceChangeList(prices.recent || [])}
       </section>
+      </div>
 
       <section class="flow-card">
         <div><span>1</span><strong>POS sales</strong><small>Inventory events are detected</small></div>
@@ -243,11 +257,11 @@ function renderOverview() {
   `
 }
 
-function renderStatusCard({ icon, title, active, activeText, inactiveText, detail, lastSeen }) {
+function renderStatusCard({ icon: iconName, title, active, activeText, inactiveText, detail, lastSeen }) {
   return `
     <article class="status-card ${active ? "is-active" : "is-offline"}">
       <div class="status-card-top">
-        <span class="feature-icon">${icon}</span>
+        <span class="feature-icon">${icon(iconName)}</span>
         ${statusBadge(active ? "Active" : "Needs attention", active ? "success" : "danger")}
       </div>
       <div>
@@ -255,7 +269,7 @@ function renderStatusCard({ icon, title, active, activeText, inactiveText, detai
         <h2>${escapeHtml(active ? activeText : inactiveText)}</h2>
         <p>${escapeHtml(detail)}</p>
       </div>
-      <small>${lastSeen ? `Last check-in ${escapeHtml(relativeTime(lastSeen))}` : "No check-in recorded yet"}</small>
+      <small class="status-last-seen">${icon("clock")} ${lastSeen ? `Last check-in ${escapeHtml(relativeTime(lastSeen))}` : "No check-in recorded yet"}</small>
     </article>
   `
 }
@@ -263,47 +277,56 @@ function renderStatusCard({ icon, title, active, activeText, inactiveText, detai
 function renderOrders() {
   const orders = state.bridge?.orders || {}
   const recent = orders.recent || []
+  const delivered = recent.filter((order) => order.delivery_status === "sent_to_pos").length
   return `
     <section class="page">
       <div class="page-head">
         <div>
-          <p class="kicker">Order sync</p>
+          <p class="kicker">Shopify <span aria-hidden="true">→</span> POS</p>
           <h1>Recent Shopify orders</h1>
-          <p>Only small order summaries are kept here. Full order details are delivered to <code>shopify-order-header.dbf</code> and <code>shopify-order-detail.dbf</code> on the POS computer.</p>
+          <p>Follow your online orders from checkout to your store’s POS.</p>
         </div>
-        <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>${state.refreshing ? "Checking…" : "Refresh"}</button>
+        <div class="page-actions">
+          <small>Refreshes every 30 seconds</small>
+          <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>${icon("refresh", state.refreshing ? "is-spinning" : "")} ${state.refreshing ? "Checking…" : "Refresh"}</button>
+        </div>
       </div>
+
+      ${state.error ? `<div class="notice danger">Orders could not be refreshed. ${escapeHtml(state.error.message)}</div>` : ""}
 
       <div class="mini-stats">
-        <div><strong>${recent.length}</strong><span>Recent orders shown</span></div>
-        <div><strong>${number(orders.queued_orders)}</strong><span>Waiting for POS</span></div>
-        <div><strong>${state.bridge?.storage?.recent_order_limit || 50}</strong><span>Maximum summaries saved</span></div>
+        <div><span class="stat-label">Recent orders ${icon("orders")}</span><strong>${recent.length}</strong><small>In your recent history</small></div>
+        <div><span class="stat-label">Waiting for POS ${icon("clock")}</span><strong>${number(orders.queued_orders)}</strong><small>Queued for delivery</small></div>
+        <div><span class="stat-label">Sent to POS ${icon("check")}</span><strong>${delivered}</strong><small>Of the orders shown</small></div>
       </div>
 
-      <section class="panel">
+      <section class="panel orders-panel" aria-labelledby="order-history-heading">
+        <div class="panel-head">
+          <div><p class="kicker">Order activity</p><h2 id="order-history-heading">Delivery history</h2></div>
+          <span class="panel-label">${recent.length} recent order${recent.length === 1 ? "" : "s"}</span>
+        </div>
+        ${recent.length ? `<div class="list-heading" aria-hidden="true"><span>Order / placed</span><span>Amount / payment</span><span>Delivery status</span></div>` : ""}
         ${renderOrderList(recent, false)}
+        <div class="panel-footer">${icon("check")} Order details are delivered automatically to your POS.</div>
       </section>
 
-      <div class="notice neutral">
-        Railway keeps at most ${state.bridge?.storage?.recent_order_limit || 50} lightweight summaries and removes acknowledged full order payloads from its queue. The Windows database also has a configurable recent-order limit.
-      </div>
     </section>
   `
 }
 
 function renderOrderList(items, compact) {
   if (!items.length) {
-    return `<div class="empty"><span>✓</span><strong>No recent orders yet</strong><p>A new Shopify order will appear here as soon as its webhook reaches the app.</p></div>`
+    return `<div class="empty"><span>${icon("orders")}</span><strong>No recent orders yet</strong><p>Your next Shopify order will appear here when it reaches the bridge.</p></div>`
   }
 
   return `
-    <div class="order-list ${compact ? "compact" : ""}">
+    <div class="order-list order-history ${compact ? "compact" : ""}">
       ${items.map((order) => {
         const sent = order.delivery_status === "sent_to_pos"
         return `
           <article class="order-row">
             <div class="order-main">
-              <span class="order-icon">${sent ? "✓" : "↓"}</span>
+              <span class="order-icon ${sent ? "" : "is-pending"}" aria-hidden="true">${icon(sent ? "orders" : "clock")}</span>
               <div>
                 <strong>${escapeHtml(order.order_name || `Order ${order.shopify_order_id}`)}</strong>
                 <small>${escapeHtml(formatDate(order.order_created_at || order.received_at))}</small>
@@ -321,9 +344,9 @@ function renderOrderList(items, compact) {
   `
 }
 
-function renderPriceChangeList(items) {
+function renderInventoryChangeList(items) {
   if (!items.length) {
-    return `<div class="empty"><span>$</span><strong>No price changes detected yet</strong><p>The connector checks <code>pricechg.dbf</code> every three minutes.</p></div>`
+    return `<div class="empty"><span>${icon("inventory")}</span><strong>No quantity changes recorded yet</strong><p>Successful POS → Shopify quantity updates will appear here. Earlier changes are not included.</p></div>`
   }
 
   return `
@@ -331,7 +354,34 @@ function renderPriceChangeList(items) {
       ${items.map((change) => `
         <article class="order-row">
           <div class="order-main">
-            <span class="order-icon">$</span>
+            <span class="order-icon" aria-hidden="true">${change.delta > 0 ? "+" : "−"}</span>
+            <div>
+              <strong>SKU ${escapeHtml(change.sku)}</strong>
+              <small>${escapeHtml(formatDate(change.changed_at))}</small>
+            </div>
+          </div>
+          <div class="price-change ${change.delta > 0 ? "quantity-increase" : "quantity-decrease"}">
+            <small>${change.quantity_after_change == null ? "Resulting quantity unavailable" : `Resulting quantity: ${escapeHtml(change.quantity_after_change)}`}</small>
+            <strong>${change.delta > 0 ? "+" : ""}${escapeHtml(change.delta)} ${Math.abs(change.delta) === 1 ? "unit" : "units"}</strong>
+          </div>
+          ${statusBadge("Updated", "success")}
+        </article>
+      `).join("")}
+    </div>
+  `
+}
+
+function renderPriceChangeList(items) {
+  if (!items.length) {
+    return `<div class="empty"><span>${icon("price")}</span><strong>No price changes detected yet</strong><p>Price updates will appear here after the connector’s next check.</p></div>`
+  }
+
+  return `
+    <div class="order-list compact">
+      ${items.map((change) => `
+        <article class="order-row">
+          <div class="order-main">
+            <span class="order-icon" aria-hidden="true">${icon("price")}</span>
             <div>
               <strong>SKU ${escapeHtml(change.source_sku)}</strong>
               <small>${escapeHtml(formatDate(change.changed_at))}${number(change.target_count) > 1 ? ` · ${number(change.target_count)} matrix variants` : ""}</small>
@@ -355,17 +405,17 @@ function renderSettings() {
       <div class="page-head">
         <div>
           <p class="kicker">Settings</p>
-          <h1>Windows connector</h1>
-          <p>These values connect the computer at the store to this Shopify app.</p>
+          <h1>Connection settings</h1>
+          <p>Keep your store’s POS and Shopify working together.</p>
         </div>
-        <button class="button secondary" type="button" data-test-shopify ${state.testing ? "disabled" : ""}>${state.testing ? "Testing…" : "Test Shopify"}</button>
+        <button class="button secondary" type="button" data-test-shopify ${state.testing ? "disabled" : ""}>${icon("link")} ${state.testing ? "Testing…" : "Test Shopify"}</button>
       </div>
 
       <section class="panel">
         <div class="panel-head">
           <div>
-            <p class="kicker">Connection details</p>
-            <h2>POS Bridge credentials</h2>
+            <p class="kicker">Windows connector</p>
+            <h2>Connection details</h2>
           </div>
         </div>
         ${connection ? `
@@ -417,8 +467,25 @@ function normalizeRoute(path) {
 
 function updateTabs(route) {
   document.querySelectorAll(".tabs a").forEach((link) => {
-    link.classList.toggle("active", link.getAttribute("href") === route)
+    const active = link.getAttribute("href") === route
+    link.classList.toggle("active", active)
+    if (active) link.setAttribute("aria-current", "page")
+    else link.removeAttribute("aria-current")
   })
+}
+
+function icon(name, className = "") {
+  const paths = {
+    refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-2l2 2M4 17l2 2a7 7 0 0 0 12-2"/>',
+    inventory: '<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9M7 5.8l9 5"/>',
+    orders: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3ZM9 8h6M9 12h6"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    check: '<path d="m6 12 4 4 8-8"/>',
+    arrow: '<path d="M4 12h16m-5-5 5 5-5 5"/>',
+    price: '<path d="M3 3h8l10 10-8 8L3 11V3Z"/><circle cx="7.5" cy="7.5" r="1"/>',
+    link: '<path d="m10 13 4-4M8 15l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 9l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(0 -1)"/>',
+  }
+  return `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[name] || paths.inventory}</svg>`
 }
 
 async function fetchJson(url, options = {}) {

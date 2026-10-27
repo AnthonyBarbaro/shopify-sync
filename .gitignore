@@ -37,6 +37,9 @@ dist/
 .codex/
 .agents/
 
+# Local scratch files and review exports
+/tmp/
+
 # POS databases, archives, generated reports, and connector state
 jbarbaro_db/*
 !jbarbaro_db/dbf_pos_sync.py

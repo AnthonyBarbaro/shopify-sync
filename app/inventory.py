@@ -1831,6 +1831,168 @@ class InventorySyncService:
 
         return list(metafields.values())
 
+    def archive_zero_stock_product_by_sku(
+        self,
+        *,
+        shop: ShopRecord,
+        sku: str,
+    ) -> Dict[str, Any]:
+        """Archive a managed product after the connector's nightly quantity pass."""
+        normalized_sku = sku.strip()
+        if not normalized_sku:
+            raise SyncProcessingError("Status reconciliation requires a SKU.", code="missing_status_sku")
+        mapping = self.shopify_client.get_variant_by_sku(
+            shop.shop_domain,
+            shop.access_token,
+            normalized_sku,
+            force_refresh=True,
+        )
+        result: Dict[str, Any] = {
+            "sku": normalized_sku,
+            "product_id": mapping.product_id,
+            "success": True,
+            "product_status_updated": False,
+        }
+        if (
+            (mapping.product_status or "").upper() == "ARCHIVED"
+            and not mapping.auto_archived_zero_stock
+        ):
+            return {**result, "reason": "already_archived_or_unknown_status"}
+        product = self.shopify_client.get_product_stock_for_archiving(
+            shop.shop_domain,
+            shop.access_token,
+            mapping.product_id,
+        )
+        if not product or product.get("id") != mapping.product_id:
+            raise SyncProcessingError(
+                "Shopify did not return the product for status reconciliation.",
+                {"sku": normalized_sku},
+                code="status_product_not_found",
+            )
+        current_status = str(product.get("status") or "").upper()
+        auto_archived = (
+            current_status == "ARCHIVED"
+            and str((product.get("autoArchivedZeroStock") or {}).get("value") or "").lower()
+            == "true"
+        )
+        if current_status not in {"ACTIVE", "DRAFT"} and not auto_archived:
+            return {
+                **result,
+                "success": not mapping.auto_archived_zero_stock or current_status == "ARCHIVED",
+                "reason": "already_archived_or_unknown_status",
+            }
+
+        stock_reason, positive_quantity = self._status_reconciliation_stock_state(product, normalized_sku)
+        if stock_reason:
+            return {**result, "success": not auto_archived, "reason": stock_reason}
+
+        if positive_quantity > 0:
+            if auto_archived:
+                refreshed_mapping = mapping.model_copy(update={
+                    "product_status": current_status,
+                    "auto_archived_zero_stock": True,
+                })
+                self._restore_auto_archived_product(
+                    shop=shop,
+                    mapping=refreshed_mapping,
+                    resulting_quantity=positive_quantity,
+                )
+                return {**result, "product_status_updated": True, "reason": "restocked_auto_archived"}
+            return {**result, "reason": "in_stock"}
+        if auto_archived:
+            return {**result, "reason": "already_archived_or_unknown_status"}
+
+        self.shopify_client.update_product(
+            shop.shop_domain,
+            shop.access_token,
+            product={
+                "id": mapping.product_id,
+                "status": "ARCHIVED",
+                "metafields": [_auto_archive_metafield_input(value=True)],
+            },
+        )
+        # A restock webhook can finish between our stock read and the archive mutation.
+        refreshed_product = self.shopify_client.get_product_stock_for_archiving(
+            shop.shop_domain,
+            shop.access_token,
+            mapping.product_id,
+        )
+        if (
+            not refreshed_product
+            or refreshed_product.get("id") != mapping.product_id
+            or str(refreshed_product.get("status") or "").upper() not in {"ACTIVE", "DRAFT", "ARCHIVED"}
+        ):
+            return {
+                **result, "success": False, "product_status_updated": True,
+                "reason": "status_verification_incomplete",
+            }
+        stock_reason, positive_quantity = self._status_reconciliation_stock_state(
+            refreshed_product, normalized_sku,
+        )
+        if stock_reason:
+            return {
+                **result, "success": False, "product_status_updated": True,
+                "reason": stock_reason,
+            }
+        if positive_quantity > 0:
+            refreshed_mapping = mapping.model_copy(update={
+                "product_status": refreshed_product.get("status"),
+                "auto_archived_zero_stock": str(
+                    (refreshed_product.get("autoArchivedZeroStock") or {}).get("value") or ""
+                ).lower() == "true",
+            })
+            self._restore_auto_archived_product(
+                shop=shop,
+                mapping=refreshed_mapping,
+                resulting_quantity=positive_quantity,
+            )
+            return {**result, "product_status_updated": True, "reason": "restocked_during_archive"}
+        return {**result, "product_status_updated": True, "reason": "zero_stock"}
+
+    @staticmethod
+    def _status_reconciliation_stock_state(
+        product: Dict[str, Any],
+        sku: str,
+    ) -> tuple[Optional[str], int]:
+        variants_connection = product.get("variants") or {}
+        variants = variants_connection.get("nodes") or []
+        if (
+            (variants_connection.get("pageInfo") or {}).get("hasNextPage") is not False
+            or not variants
+        ):
+            return "incomplete_variants", 0
+        managed_sku = str((product.get("managedSku") or {}).get("value") or "").strip()
+        if (
+            not managed_sku
+            or managed_sku.casefold() != (_matrix_base_sku(sku) or sku).casefold()
+            or sku not in {variant.get("sku") for variant in variants}
+        ):
+            return "unmanaged_product", 0
+
+        positive_quantity = 0
+        for variant in variants:
+            inventory_item = variant.get("inventoryItem") or {}
+            if inventory_item.get("tracked") is not True:
+                return "untracked_inventory", 0
+            levels_connection = inventory_item.get("inventoryLevels") or {}
+            levels = levels_connection.get("nodes") or []
+            if (
+                (levels_connection.get("pageInfo") or {}).get("hasNextPage") is not False
+                or not levels
+            ):
+                return "incomplete_inventory", 0
+            for level in levels:
+                available = [
+                    quantity.get("quantity")
+                    for quantity in level.get("quantities") or []
+                    if quantity.get("name") == "available"
+                ]
+                if len(available) != 1 or type(available[0]) is not int:
+                    return "unknown_quantity", 0
+                # Negative stock in one size or location must not cancel positive stock elsewhere.
+                positive_quantity = max(positive_quantity, available[0])
+        return None, positive_quantity
+
     def _restore_auto_archived_product(
         self,
         *,

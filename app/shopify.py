@@ -909,6 +909,64 @@ class ShopifyClient:
         node = payload["data"]["node"]
         return node if node else None
 
+    def get_product_stock_for_archiving(
+        self,
+        shop_domain: str,
+        access_token: str,
+        product_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Read up to 50 variants and 5 locations each; callers must reject truncation."""
+        query = """
+        query ProductStockForArchiving($id: ID!) {
+          product(id: $id) {
+            id
+            status
+            managedSku: metafield(namespace: "pos", key: "sku") {
+              value
+            }
+            autoArchivedZeroStock: metafield(
+              namespace: "pos",
+              key: "auto_archived_zero_stock"
+            ) {
+              value
+            }
+            variants(first: 50) {
+              pageInfo {
+                hasNextPage
+              }
+              nodes {
+                id
+                sku
+                inventoryItem {
+                  id
+                  tracked
+                  inventoryLevels(first: 5) {
+                    pageInfo {
+                      hasNextPage
+                    }
+                    nodes {
+                      quantities(names: ["available"]) {
+                        name
+                        quantity
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"id": normalize_gid("Product", product_id)},
+            operation_name="ProductStockForArchiving",
+        )
+        product = payload["data"].get("product")
+        return product if product else None
+
     def rename_product_option(
         self,
         shop_domain: str,

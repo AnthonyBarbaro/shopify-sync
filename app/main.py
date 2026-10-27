@@ -1631,6 +1631,10 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         shop_domain=shop.shop_domain,
         limit=10,
     )
+    recent_inventory = db.list_recent_inventory_changes(
+        shop_domain=shop.shop_domain,
+        limit=10,
+    )
     return JSONResponse(
         {
             "shop": shop.shop_domain,
@@ -1643,6 +1647,15 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
                 "last_poll_at": heartbeat["last_inventory_poll_at"],
                 "last_catalog_sync_at": heartbeat["last_catalog_sync_at"],
                 "queued_changes": db.inventory_change_count(shop_domain=shop.shop_domain),
+                "recent": [
+                    {
+                        "sku": row.sku,
+                        "delta": row.delta,
+                        "quantity_after_change": row.quantity_after_change,
+                        "changed_at": row.changed_at,
+                    }
+                    for row in recent_inventory
+                ],
             },
             "orders": {
                 "active": is_active(heartbeat["last_order_poll_at"]),
@@ -1681,6 +1694,7 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
             "storage": {
                 "recent_order_limit": settings.recent_order_retention_rows,
                 "recent_price_limit": 50,
+                "recent_inventory_limit": 50,
                 "stores_order_details": False,
             },
             "timestamp": utc_now_iso(),
@@ -2983,6 +2997,55 @@ async def connector_inventory_snapshot(
     )
 
 
+@app.post("/sync/inventory/status/reconcile", response_model=None)
+async def connector_inventory_status_reconcile(
+    request: Request,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    raw_payload = await parse_external_request_payload(request)
+    raw_skus = raw_payload.get("skus") if isinstance(raw_payload, dict) else None
+    if (
+        not isinstance(raw_skus, list)
+        or not raw_skus
+        or any(not isinstance(sku, str) or not sku.strip() for sku in raw_skus)
+    ):
+        raise SyncProcessingError(
+            "Status reconciliation requires a non-empty array of SKU strings.",
+            code="invalid_status_skus",
+        )
+    if len(raw_skus) > 100:
+        raise SyncProcessingError(
+            "Status reconciliation is limited to 100 SKUs per request.",
+            code="too_many_status_skus",
+        )
+
+    results: list[dict[str, Any]] = []
+    for sku in dict.fromkeys(value.strip() for value in raw_skus):
+        try:
+            result = await asyncio.to_thread(
+                run_with_shop_retry,
+                shop,
+                lambda active_shop, sku=sku: inventory_service.archive_zero_stock_product_by_sku(
+                    shop=active_shop,
+                    sku=sku,
+                ),
+            )
+        except Exception as exc:
+            result = {"sku": sku, "success": False, "message": str(exc)}
+        results.append(result)
+
+    succeeded = sum(1 for result in results if result.get("success"))
+    return JSONResponse(
+        {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "results": results,
+            "timestamp": utc_now_iso(),
+        }
+    )
+
+
 @app.post("/sync/prices", response_model=None)
 @app.post("/wc-api/v3/prices", response_model=None, include_in_schema=False)
 async def connector_price_changes(
@@ -3227,6 +3290,13 @@ async def connector_inventory_adjustments(
                     shop_domain=shop.shop_domain,
                     inventory_item_id=normalize_gid("InventoryItem", result["inventory_item_id"]),
                     sku=result["sku"],
+                )
+                db.record_recent_inventory_change(
+                    shop_domain=shop.shop_domain,
+                    idempotency_key=idempotency_key,
+                    sku=result["sku"],
+                    delta=delta,
+                    quantity_after_change=result.get("quantity_after_change"),
                 )
             results.append(result)
         except Exception as exc:

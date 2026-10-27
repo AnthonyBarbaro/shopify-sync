@@ -11,6 +11,7 @@
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
+    <a class="skip-link" href="#app">Skip to content</a>
     <s-app-nav>
       <s-link href="/app" rel="home">Overview</s-link>
       <s-link href="/app/orders">Orders</s-link>
@@ -20,20 +21,20 @@
     <div class="shell">
       <header class="topbar">
         <a class="brand" href="/app" data-route aria-label="POS Bridge overview">
-          <span class="brand-mark">PB</span>
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h14l-4-4M19 16H5l4 4M19 8v4M5 16v-4"/></svg></span>
           <span>
             <strong>POS Bridge</strong>
-            <small>Inventory + orders</small>
+            <small>Your store, connected</small>
           </span>
         </a>
         <nav class="tabs" aria-label="Main navigation">
-          <a href="/app" data-route>Overview</a>
-          <a href="/app/orders" data-route>Orders</a>
-          <a href="/app/settings" data-route>Settings</a>
+          <a href="/app" data-route><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>Overview</a>
+          <a href="/app/orders" data-route><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6"/></svg>Orders</a>
+          <a href="/app/settings" data-route><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="white"/><circle cx="15" cy="17" r="3" fill="white"/></svg>Settings</a>
         </nav>
       </header>
 
-      <main id="app" class="workspace" aria-live="polite">
+      <main id="app" class="workspace" aria-live="polite" tabindex="-1">
         <section class="loading-card">
           <span class="spinner" aria-hidden="true"></span>
           <p>Checking your bridge…</p>

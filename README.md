@@ -62,6 +62,13 @@ RECENT_ORDER_RETENTION_ROWS=50
 Feed and request history is automatically pruned to these limits so recurring connector traffic
 cannot grow the Railway SQLite volume without bound.
 
+The Overview shows the latest 10 successful POS-to-Shopify quantity adjustments, including
+SKU, signed change, resulting quantity when Shopify returns it, and the time recorded.
+It refreshes every 30 seconds or with Refresh. At most 50 entries are retained per shop;
+retries with the same idempotency key are not added twice while the entry is retained.
+History starts after this update and does not include Shopify-originated changes or initial
+catalog quantities. Failed and zero-delta adjustments are excluded.
+
 Full order payloads are a temporary delivery queue capped at 500 rows even if an older environment
 setting is higher. Railway separately keeps only 50 small order summaries for the dashboard, and
 the Windows Shopify order DBF inbox defaults to 250 orders with a hard maximum of 500.
@@ -96,7 +103,19 @@ This repairs SKUs that predate a local baseline or whose webhook was missed duri
 primary location is pinned on the first verified snapshot. Duplicate Shopify SKUs and items that
 are unavailable at that location are blocked instead of being adjusted ambiguously.
 
-Products archived automatically because their imported quantity was zero carry the internal
+After the nightly quantity reconciliation, the connector also checks known products with no
+remaining stock and archives them. This status pass runs once per local day at the configured
+nightly hour, after pending inventory adjustments have succeeded. The backend verifies that the
+product is POS-managed and every tracked variant has nonpositive available stock at every Shopify
+location. Positive stock, missing inventory data, and truncated variant or location lists prevent
+archiving. These checks currently read up to 50 variants and five locations per variant. Products
+already at zero are included; recurring three-minute inventory updates do not newly archive products.
+Each status request saves its pending SKUs before sending. Failed or unconfirmed requests remain
+pending across connector restarts and are checked again after inventory adjustments succeed, even
+if a later snapshot shows positive stock. This lets the backend restore its own archived product
+to Draft when a restock raced the archive and its follow-up stock verification failed.
+
+Products archived automatically because their imported or nightly quantity was zero carry the internal
 `pos.auto_archived_zero_stock` marker. A later positive stock update returns only those products to
 Draft and clears the marker; an unmarked manual archive remains archived. Products archived before
 this marker was introduced require a one-time manual change to Draft after their quantity is
@@ -189,6 +208,7 @@ GET/POST /sync/product
 GET/POST /sync/bulk
 GET /sync/inventory
 POST /sync/inventory/adjustments
+POST /sync/inventory/status/reconcile
 GET /sync/inventory/changes
 POST /sync/inventory/changes/ack
 POST /sync/catalog/reconcile

@@ -49,9 +49,22 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
    POS write is deferred and recalculated on the next cycle. POS writes use compare-before-update
    checks so a sale at the register cannot be silently overwritten.
 
-The catalog import archives zero-quantity products and marks that transition as connector-owned. A
-later positive stock observation restores only a marked product to Draft and clears the marker;
-manual, unmarked archives are preserved. Recurring inventory cycles do not newly archive products.
+The catalog import archives zero-quantity products and marks that transition as connector-owned.
+After the nightly quantity reconciliation, a separate daily status pass also archives known
+products whose variants all have nonpositive stock. It includes products already at zero. Pending
+or blocked inventory changes prevent archiving the affected product, and the backend freshly checks
+all variants and Shopify locations before changing status. Products with positive stock, untracked
+inventory, missing data, or more than the checked 50 variants or five locations per variant are
+skipped. A failed status pass retries on a later cycle; a completed pass does not run again that day.
+The connector saves pending status SKUs before sending each request and removes them only after an
+explicit successful result. Failed, missing, or timed-out results survive a restart and are checked
+again after inventory adjustments complete, including when a later snapshot is positive. The
+backend can then restore a connector-owned archive to Draft if the restock webhook was missed or
+finished before archiving. Incomplete stock verification for that recovery remains retryable.
+The normal three-minute inventory cycles do not newly archive products.
+
+A later positive stock observation restores only a marked product to Draft and clears the marker;
+manual, unmarked archives are preserved.
 An automatically archived product created before this marker existed needs a one-time manual change
 to Draft after the upgraded reconciliation repairs its quantity.
 

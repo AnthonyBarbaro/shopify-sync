@@ -131,6 +131,14 @@ class RecentPriceChangeRow:
     changed_at: str
 
 
+@dataclass(frozen=True)
+class RecentInventoryChangeRow:
+    sku: str
+    delta: int
+    quantity_after_change: Optional[int]
+    changed_at: str
+
+
 class DatabaseStore:
     def __init__(
         self,
@@ -325,6 +333,25 @@ class DatabaseStore:
                     FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
                 )
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recent_inventory_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    sku TEXT NOT NULL,
+                    delta INTEGER NOT NULL,
+                    quantity_after_change INTEGER,
+                    changed_at TEXT NOT NULL,
+                    UNIQUE(shop_domain, idempotency_key),
+                    FOREIGN KEY(shop_domain) REFERENCES shops(shop_domain)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recent_inventory_shop_id "
+                "ON recent_inventory_changes(shop_domain, id DESC)"
             )
             self._ensure_column(connection, "pos_credentials", "secret_ciphertext", "TEXT")
             self._ensure_column(connection, "inventory_changes", "version", "INTEGER NOT NULL DEFAULT 1")
@@ -825,6 +852,7 @@ class DatabaseStore:
             "order_changes": "id",
             "recent_order_summaries": "received_at",
             "recent_price_changes": "changed_at",
+            "recent_inventory_changes": "id",
         }
         if table_name not in allowed or order_column != allowed[table_name]:
             raise ValueError(f"Unsupported retention table: {table_name}")
@@ -1382,6 +1410,60 @@ class DatabaseStore:
             for row in rows
         ]
 
+    def record_recent_inventory_change(
+        self,
+        *,
+        shop_domain: str,
+        idempotency_key: str,
+        sku: str,
+        delta: int,
+        quantity_after_change: Optional[int],
+    ) -> None:
+        if not delta:
+            return
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO recent_inventory_changes (
+                        shop_domain, idempotency_key, sku, delta,
+                        quantity_after_change, changed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (shop_domain, idempotency_key, sku, int(delta),
+                     quantity_after_change, utc_now_iso()),
+                )
+                self._trim_shop_rows(
+                    connection,
+                    table_name="recent_inventory_changes",
+                    shop_domain=shop_domain,
+                    limit=50,
+                )
+                connection.commit()
+        except sqlite3.Error:
+            # Optional history must not make an applied adjustment fail and retry.
+            self.logger.exception("recent_inventory_change_log_failed sku=%s", sku)
+
+    def list_recent_inventory_changes(
+        self,
+        *,
+        shop_domain: str,
+        limit: int = 10,
+    ) -> list[RecentInventoryChangeRow]:
+        safe_limit = max(1, min(int(limit), 50))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sku, delta, quantity_after_change, changed_at
+                FROM recent_inventory_changes
+                WHERE shop_domain = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (shop_domain, safe_limit),
+            ).fetchall()
+        return [RecentInventoryChangeRow(**dict(row)) for row in rows]
+
     def record_recent_price_change(
         self,
         *,
@@ -1495,6 +1577,10 @@ class DatabaseStore:
             )
             connection.execute(
                 "DELETE FROM inventory_changes WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM recent_inventory_changes WHERE shop_domain = ?",
                 (shop_domain,),
             )
             connection.execute(
