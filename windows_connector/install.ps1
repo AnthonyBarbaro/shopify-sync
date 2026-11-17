@@ -1,7 +1,7 @@
 param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot "connector.env"),
     [string]$TaskName = "Shopify POS Inventory Connector",
-    [switch]$StartNow
+    [switch]$StartNow = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,11 +43,14 @@ $arguments = '"{0}" --config "{1}"' -f $connector, $config
 $action = New-ScheduledTaskAction -Execute $venvPython -Argument $arguments -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $trigger.Delay = "PT1M"
+$recoveryTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -55,10 +58,10 @@ $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceA
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger @($trigger, $recoveryTrigger) `
     -Settings $settings `
     -Principal $taskPrincipal `
-    -Description "Processes POS sales/edit events every three minutes and runs a nightly full inventory reconciliation." `
+    -Description "Continuously checks POS inventory, syncs customers, and runs a nightly full inventory reconciliation." `
     -Force | Out-Null
 
 if ($StartNow) {
@@ -69,5 +72,5 @@ Write-Host "Installed scheduled task: $TaskName"
 Write-Host "Config: $config"
 Write-Host "Log: C:\ProgramData\ShopifyPosConnector\connector.log (unless CONNECTOR_DATA_DIR was changed)"
 if (-not $StartNow) {
-    Write-Host "The connector will start one minute after the next boot. Use Start-ScheduledTask to start it now."
+    Write-Host "The recovery trigger will start the connector within one minute."
 }

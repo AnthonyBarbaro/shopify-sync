@@ -38,3 +38,56 @@ test('overview renders recent inventory from the bridge response', () => {
   assert.match(html, /SKU matrix-123/)
   assert.match(html, /Resulting quantity: 5/)
 })
+
+test('overview separates connector heartbeat from inventory and shows actual intervals', () => {
+  vm.runInContext(`state.bridge = {
+    connector: { active: true, sync_interval_seconds: 90, last_seen_at: '2026-11-17T12:00:00Z' },
+    inventory: { active: false, last_poll_at: '2026-11-16T12:00:00Z' },
+    customers: { enabled: true, authorized: true, active: true, interval_seconds: 60 }
+  }`, context)
+  const html = context.renderOverview()
+  assert.match(html, /Connected/)
+  assert.match(html, /inventory polling is delayed/)
+  assert.match(html, /POS checks every 90 seconds/)
+  assert.match(html, /Customer connector is checking in/)
+  assert.match(html, /Checks every 1 minute/)
+  assert.match(html, /adds missing POS customers/)
+  assert.match(html, /Existing Shopify customers stay unchanged/)
+  assert.doesNotMatch(html, /Inventory bridge is active/)
+})
+
+test('overview reports missing customer authorization and missing connector check-ins', () => {
+  vm.runInContext(`state.bridge = {
+    connector: { active: false }, customers: { enabled: true, authorized: false }
+  }`, context)
+  const html = context.renderOverview()
+  assert.match(html, /No check-in/)
+  assert.match(html, /Customer access needs approval/)
+  assert.match(html, /read_customers and write_customers/)
+  assert.doesNotMatch(html, />Offline</)
+})
+
+test('inventory history shows product names, variants and SKU with escaped merchant text', () => {
+  const html = context.renderInventoryChangeList([
+    { sku: '123. 1 1', product_title: '<b>Linen shirt</b>', variant_title: 'Blue / Medium', delta: -1, quantity_after_change: 2 },
+    { sku: 'simple', product_title: 'Belt', variant_title: 'Default Title', delta: 1, quantity_after_change: 0 },
+  ])
+  assert.match(html, /&lt;b&gt;Linen shirt&lt;\/b&gt;/)
+  assert.match(html, /SKU 123. 1 1 · Blue \/ Medium/)
+  assert.doesNotMatch(html, /<b>Linen shirt/)
+  assert.doesNotMatch(html, /Default Title/)
+})
+
+test('force sync shows queued work honestly when the connector is unavailable', () => {
+  vm.runInContext(`state.bridge = {
+    connector: { active: false }, force_sync: { request_id: 'request1', completed_at: null }
+  }`, context)
+  const html = context.renderOverview()
+  assert.match(html, /data-force-sync disabled/)
+  assert.match(html, /Sync queued/)
+  assert.match(html, /Queued until the Windows connector reconnects/)
+  vm.runInContext(`state.bridge.force_sync.completed_at = '2026-11-17T12:00:00Z'`, context)
+  assert.match(context.renderOverview(), /Last forced inventory scan finished/)
+  assert.match(context.renderOverview(), /Force sync\s*<\/button>/)
+  assert.match(context.renderOverview(), /data-force-sync\s*>/)
+})

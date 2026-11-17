@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -48,7 +49,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.1"
+CONNECTOR_VERSION = "1.2"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -156,7 +157,15 @@ class Connector:
         self.base_url = self._required("SHOPIFY_SYNC_BASE_URL").rstrip("/")
         self.api_key = self._required("SHOPIFY_SYNC_API_KEY")
         self.api_secret = self._required("SHOPIFY_SYNC_API_SECRET")
-        self.interval_seconds = env_int("SYNC_INTERVAL_SECONDS", 180, minimum=30, maximum=86400)
+        self.interval_seconds = env_int("SYNC_INTERVAL_SECONDS", 30, minimum=30, maximum=86400)
+        self.customer_sync_enabled = env_bool("CUSTOMER_SYNC_ENABLED", True)
+        self.customer_sync_interval_seconds = env_int(
+            "CUSTOMER_SYNC_INTERVAL_SECONDS", 60, minimum=30, maximum=86400,
+        )
+        self._sync_request_lock = Lock()
+        self._sync_request_id: Optional[str] = None
+        self._sync_wakeup = Event()
+        self._customer_wakeup = Event()
         self.nightly_full_sync_hour = env_int("NIGHTLY_FULL_SYNC_HOUR", 0, minimum=0, maximum=23)
         self.batch_size = env_int("CONNECTOR_BATCH_SIZE", 25, minimum=1, maximum=100)
         self.workers = env_int("CONNECTOR_WORKERS", 2, minimum=1, maximum=4)
@@ -208,6 +217,7 @@ class Connector:
         data_dir = Path(os.getenv("CONNECTOR_DATA_DIR") or (CONNECTOR_DIR / "data")).expanduser().resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = data_dir / "state.json"
+        self.customer_state_path = data_dir / "customers.json"
         self.log_path = data_dir / "connector.log"
         self.writer_script = Path(
             os.getenv("POS_WRITEBACK_SCRIPT") or (CONNECTOR_DIR / "write_pos_quantity.ps1")
@@ -245,20 +255,178 @@ class Connector:
             self.price_sync_enabled,
             self.dry_run,
         )
-        while True:
-            started = time.monotonic()
-            try:
-                self.run_cycle()
-            except Exception:
-                self.logger.exception("connector_cycle_failed")
+        stop = Event()
+        workers: List[Thread] = []
+        if not once:
+            workers.append(Thread(target=self._heartbeat_loop, args=(stop,), daemon=True))
+            if self.customer_sync_enabled:
+                workers.append(Thread(target=self._customer_loop, args=(stop,), daemon=True))
+            for worker in workers:
+                worker.start()
+        try:
+            while True:
+                self._sync_wakeup.clear()
+                started = time.monotonic()
                 if once:
-                    return 1
-            if once:
-                return 0
-            elapsed = time.monotonic() - started
-            time.sleep(max(1.0, self.interval_seconds - elapsed))
+                    try:
+                        self._send_heartbeat(self.session)
+                    except requests.RequestException:
+                        self.logger.warning("connector_heartbeat_failed")
+                failed = False
+                with self._sync_request_lock:
+                    request_id = self._sync_request_id
+                try:
+                    if request_id:
+                        self.run_cycle(force_full=True)
+                        self._complete_sync_request(request_id)
+                    else:
+                        self.run_cycle()
+                except Exception:
+                    self.logger.exception("connector_cycle_failed")
+                    failed = True
+                if once:
+                    if self.customer_sync_enabled:
+                        try:
+                            self._sync_customers(self.session)
+                        except Exception:
+                            self.logger.warning("customer_sync_failed; check customer access and POS files")
+                            failed = True
+                    return 1 if failed else 0
+                elapsed = time.monotonic() - started
+                self._sync_wakeup.wait(max(1.0, self.interval_seconds - elapsed))
+        finally:
+            stop.set()
+            self._customer_wakeup.set()
+            for worker in workers:
+                worker.join(timeout=1)
 
-    def run_cycle(self) -> None:
+    def _send_heartbeat(self, session: requests.Session) -> None:
+        response = session.post(
+            f"{self.base_url}/sync/heartbeat",
+            json={
+                "version": CONNECTOR_VERSION,
+                "sync_interval_seconds": self.interval_seconds,
+                "customer_sync_enabled": self.customer_sync_enabled and not self.dry_run,
+                "customer_sync_interval_seconds": self.customer_sync_interval_seconds,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        request_id = response.json().get("sync_request_id")
+        if isinstance(request_id, str) and request_id:
+            with self._sync_request_lock:
+                if request_id != self._sync_request_id:
+                    self._sync_request_id = request_id
+                    self._sync_wakeup.set()
+                    self._customer_wakeup.set()
+
+    def _complete_sync_request(self, request_id: str) -> None:
+        response = self.session.post(
+            f"{self.base_url}/sync/requests/{request_id}/ack", timeout=30,
+        )
+        response.raise_for_status()
+        if response.json().get("completed") is True:
+            with self._sync_request_lock:
+                if self._sync_request_id == request_id:
+                    self._sync_request_id = None
+            self.logger.info("forced_inventory_scan_completed")
+
+    def _heartbeat_loop(self, stop: Event) -> None:
+        # Requests sessions are owned by one thread; long imports cannot delay check-ins.
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            while not stop.is_set():
+                try:
+                    self._send_heartbeat(session)
+                except requests.RequestException:
+                    self.logger.warning("connector_heartbeat_failed")
+                stop.wait(30)
+
+    def _customer_loop(self, stop: Event) -> None:
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            while not stop.is_set():
+                self._customer_wakeup.clear()
+                try:
+                    self._sync_customers(session)
+                except Exception:
+                    # Responses can contain customer contact data; do not log them.
+                    self.logger.warning("customer_sync_failed; check customer access and POS files")
+                self._customer_wakeup.wait(self.customer_sync_interval_seconds)
+
+    def _sync_customers(self, session: requests.Session) -> None:
+        if not self.customer_sync_enabled:
+            return
+        if not self.dry_run:
+            response = session.get(f"{self.base_url}/sync/customers/status", timeout=30)
+            response.raise_for_status()
+            if response.json().get("authorized") is not True:
+                self.logger.warning("customer_sync_needs_read_customers_and_write_customers; reauthorize Shopify app")
+                return
+
+        payloads, _audits, _stats = dbf_pos_sync.load_customers(SimpleNamespace(
+            dbf_dir=str(self.dbf_dir), customer_scope="primary",
+            customer_tag=None, customer_limit=None,
+        ))
+        state = load_state(self.customer_state_path)
+        fingerprints = state.setdefault("customer_hashes", {})
+        observed: set[str] = set()
+        changed: List[Dict[str, Any]] = []
+        offset = int(state.get("next_offset") or 0) % max(1, len(payloads))
+        ordered = payloads[offset:] + payloads[:offset]
+        scanned = 0
+        for payload in ordered:
+            scanned += 1
+            number = str(payload.get("pos_customer_number") or "").strip()
+            if not number:
+                continue
+            identity = hashlib.sha256(
+                f"{payload.get('source') or 'Customer.dbf'}:{number}".encode("utf-8")
+            ).hexdigest()
+            observed.add(identity)
+            fingerprint = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if fingerprints.get(identity) != fingerprint:
+                changed.append({"identity": identity, "fingerprint": fingerprint, "payload": payload})
+            # Bound each pass while rotating past failed records to avoid starvation.
+            if len(changed) == 50:
+                break
+        if self.dry_run:
+            self.logger.info("customer_sync_dry_run pending_in_batch=%s", len(changed))
+            return
+
+        state["next_offset"] = (offset + scanned) % max(1, len(payloads))
+        if scanned == len(payloads):
+            # A complete scan can discard hashes for removed POS records without deleting Shopify customers.
+            state["customer_hashes"] = fingerprints = {
+                key: value for key, value in fingerprints.items() if key in observed
+            }
+        save_state(self.customer_state_path, state)
+        succeeded = 0
+        for batch in chunks(changed, min(10, self.batch_size)):
+            response = session.post(
+                f"{self.base_url}/sync/customers",
+                json={"customers": [entry["payload"] for entry in batch]},
+                timeout=min(self.timeout, 120),
+            )
+            response.raise_for_status()
+            results = response.json().get("results") or []
+            for entry in batch:
+                payload = entry["payload"]
+                confirmed = any(
+                    row.get("success") is True and row.get("customer_id")
+                    and row.get("pos_customer_number") == payload["pos_customer_number"]
+                    and (row.get("source") or "Customer.dbf") == (payload.get("source") or "Customer.dbf")
+                    for row in results if isinstance(row, dict)
+                )
+                if confirmed:
+                    fingerprints[entry["identity"]] = entry["fingerprint"]
+                    succeeded += 1
+            save_state(self.customer_state_path, state)
+        self.logger.info("customer_sync_checked pending_in_batch=%s succeeded=%s", len(changed), succeeded)
+
+    def run_cycle(self, *, force_full: bool = False) -> None:
         state = load_state(self.state_path)
         now = datetime.now()
         if not self.dry_run:
@@ -338,7 +506,8 @@ class Connector:
             or bool(structure_probe_skus)
         )
         full_reconcile = (
-            catalog_incomplete
+            force_full
+            or catalog_incomplete
             or nightly_due
             or event_file_reset
             or matrix_option_repair_due
@@ -347,7 +516,9 @@ class Connector:
             or status_reconcile_due
         )
         if full_reconcile:
-            if catalog_incomplete:
+            if force_full:
+                read_mode = "manual"
+            elif catalog_incomplete:
                 read_mode = "initial"
             elif catalog_structure_upgrade_due:
                 read_mode = "matrix-structure-repair"

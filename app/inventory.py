@@ -177,12 +177,10 @@ class InventorySyncService:
             details = exc.details if isinstance(exc, AppError) else {"reason": str(exc)}
             log_sync_event(
                 self.logger,
-                sku=normalized.pos_customer_number or normalized.email or normalized.phone or "unknown-customer",
+                sku=normalized.pos_customer_number or "unknown-customer",
                 success=False,
                 message="customer_sync_failed",
                 shop=shop.shop_domain,
-                error=str(exc),
-                title=display_name,
             )
             return CustomerSyncResult(
                 shop_domain=shop.shop_domain,
@@ -199,11 +197,10 @@ class InventorySyncService:
 
         log_sync_event(
             self.logger,
-            sku=result.pos_customer_number or result.email or result.phone or "unknown-customer",
+            sku=result.pos_customer_number or "unknown-customer",
             success=True,
             message="customer_sync_completed",
             shop=shop.shop_domain,
-            title=result.name,
             customer_id=result.customer_id,
         )
         return result
@@ -356,6 +353,8 @@ class InventorySyncService:
             "quantity_after_change": quantity_after_change,
             "inventory_updated_at": inventory_updated_at,
             "product_status_updated": status_updated,
+            "product_title": mapping.product_title,
+            "variant_title": mapping.variant_title,
         }
 
     def update_price_by_sku(
@@ -547,60 +546,61 @@ class InventorySyncService:
 
     def _sync_customer_record(self, payload: CustomerSyncRequest, shop: ShopRecord) -> CustomerSyncResult:
         custom_id = _customer_custom_id_value(payload)
+        identifiers = _customer_identifiers(payload, custom_id=custom_id)
         if custom_id:
             self._ensure_customer_custom_id_definition(shop)
 
-        customer_input = self._build_customer_set_input(payload)
-        identifier = _customer_identifier(payload, custom_id=custom_id)
-        fallback_used = False
-
-        try:
-            customer = self.shopify_client.customer_set(
-                shop.shop_domain,
-                shop.access_token,
-                identifier=identifier,
-                input_data=customer_input,
-            )
-        except ShopifyAPIError as exc:
-            fallback_identifier = _customer_contact_identifier(payload)
-            if not custom_id or fallback_identifier is None or not _is_customer_identity_conflict(exc.details):
-                raise
-            customer = self.shopify_client.customer_set(
-                shop.shop_domain,
-                shop.access_token,
-                identifier=fallback_identifier,
-                input_data=customer_input,
-            )
-            fallback_used = True
-
-        customer_id = customer["id"]
-        metafields = self._build_customer_metafields(payload, customer_id, custom_id=custom_id)
-        if metafields:
-            self.shopify_client.set_customer_metafields(
-                shop.shop_domain,
-                shop.access_token,
-                metafields,
-            )
+        customer = self._find_existing_customer(shop, identifiers)
+        created = False
+        customer_input: Dict[str, Any] = {}
+        metafields: List[Dict[str, Any]] = []
+        if customer is None:
+            customer_input = self._build_customer_create_input(payload)
+            metafields = self._build_customer_metafields(payload, custom_id=custom_id)
+            if metafields:
+                customer_input["metafields"] = metafields
+            try:
+                # Create-only also protects a customer created between the lookup and this request.
+                customer = self.shopify_client.customer_create(
+                    shop.shop_domain, shop.access_token, input_data=customer_input,
+                )
+                created = True
+            except ShopifyAPIError:
+                customer = self._find_existing_customer(shop, identifiers)
+                if customer is None:
+                    raise
 
         return CustomerSyncResult(
             shop_domain=shop.shop_domain,
             pos_customer_number=payload.pos_customer_number,
             source=payload.source,
             success=True,
-            message="Customer synced successfully.",
+            message="Customer added successfully." if created else "Existing Shopify customer preserved; no changes made.",
             timestamp=utc_now_iso(),
-            customer_id=customer_id,
+            customer_id=customer["id"],
             email=customer.get("email") or payload.email,
             phone=customer.get("phone") or payload.phone,
             name=customer.get("displayName") or _customer_display_name(payload),
             details={
-                "identifier": identifier,
-                "fallback_used": fallback_used,
-                "metafield_count": len(metafields),
-                "address_count": len(customer_input.get("addresses") or []),
-                "tag_count": len(customer_input.get("tags") or []),
+                "append_only": True,
+                "created": created,
+                "skipped_existing": not created,
+                "metafield_count": len(metafields) if created else 0,
+                "address_count": len(customer_input.get("addresses") or []) if created else 0,
+                "tag_count": len(customer_input.get("tags") or []) if created else 0,
             },
         )
+
+    def _find_existing_customer(
+        self, shop: ShopRecord, identifiers: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        for identifier in identifiers:
+            customer = self.shopify_client.get_customer_by_identifier(
+                shop.shop_domain, shop.access_token, identifier=identifier,
+            )
+            if customer is not None:
+                return customer
+        return None
 
     def _ensure_customer_custom_id_definition(self, shop: ShopRecord) -> None:
         cache_key = shop.shop_domain
@@ -614,7 +614,7 @@ class InventorySyncService:
         )
         self._customer_custom_id_ready.add(cache_key)
 
-    def _build_customer_set_input(self, payload: CustomerSyncRequest) -> Dict[str, Any]:
+    def _build_customer_create_input(self, payload: CustomerSyncRequest) -> Dict[str, Any]:
         first_name = payload.firstName
         last_name = payload.lastName
         if not first_name and not last_name and payload.company:
@@ -652,16 +652,13 @@ class InventorySyncService:
     def _build_customer_metafields(
         self,
         payload: CustomerSyncRequest,
-        customer_id: str,
         *,
         custom_id: Optional[str],
     ) -> List[Dict[str, Any]]:
-        owner_id = normalize_gid("Customer", customer_id)
         metafields: Dict[tuple[str, str], Dict[str, Any]] = {}
 
         if custom_id:
             metafields[(CUSTOMER_CUSTOM_ID_NAMESPACE, CUSTOMER_CUSTOM_ID_KEY)] = {
-                "ownerId": owner_id,
                 "namespace": CUSTOMER_CUSTOM_ID_NAMESPACE,
                 "key": CUSTOMER_CUSTOM_ID_KEY,
                 "type": "id",
@@ -670,7 +667,6 @@ class InventorySyncService:
 
         if payload.company:
             metafields[("pos", "company")] = {
-                "ownerId": owner_id,
                 "namespace": "pos",
                 "key": "company",
                 "type": "single_line_text_field",
@@ -678,8 +674,12 @@ class InventorySyncService:
             }
 
         for metafield in payload.metafields:
-            prepared = _prepare_customer_metafield(metafield, owner_id=owner_id)
+            prepared = _prepare_customer_metafield(metafield)
             if prepared is None:
+                continue
+            if custom_id and (prepared["namespace"], prepared["key"]) == (
+                CUSTOMER_CUSTOM_ID_NAMESPACE, CUSTOMER_CUSTOM_ID_KEY,
+            ):
                 continue
             metafields[(prepared["namespace"], prepared["key"])] = prepared
 
@@ -2159,6 +2159,8 @@ class InventorySyncService:
             variant_id=target_variant["id"],
             product_id=product["id"],
             inventory_item_id=inventory_item["id"],
+            product_title=product.get("title"),
+            variant_title=target_variant.get("title"),
             product_status=product.get("status"),
             auto_archived_zero_stock=(
                 str(auto_archived_marker.get("value") or "").strip().lower() == "true"
@@ -2418,31 +2420,27 @@ def _customer_custom_id_value(payload: CustomerSyncRequest) -> Optional[str]:
     return f"{source}:{customer_number}"
 
 
-def _customer_identifier(payload: CustomerSyncRequest, *, custom_id: Optional[str]) -> Dict[str, Any]:
+def _customer_identifiers(payload: CustomerSyncRequest, *, custom_id: Optional[str]) -> List[Dict[str, Any]]:
+    identifiers: List[Dict[str, Any]] = []
     if custom_id:
-        return {
+        identifiers.append({
             "customId": {
                 "namespace": CUSTOMER_CUSTOM_ID_NAMESPACE,
                 "key": CUSTOMER_CUSTOM_ID_KEY,
                 "value": custom_id,
             }
-        }
-    contact_identifier = _customer_contact_identifier(payload)
-    if contact_identifier is not None:
-        return contact_identifier
+        })
+    if payload.email:
+        identifiers.append({"emailAddress": payload.email})
+    if payload.phone:
+        identifiers.append({"phoneNumber": payload.phone})
+    if identifiers:
+        return identifiers
     raise SyncProcessingError(
         "Customer needs a POS customer number, email, or phone to sync safely.",
         {"source": payload.source},
         code="missing_customer_identifier",
     )
-
-
-def _customer_contact_identifier(payload: CustomerSyncRequest) -> Optional[Dict[str, Any]]:
-    if payload.email:
-        return {"email": payload.email}
-    if payload.phone:
-        return {"phone": payload.phone}
-    return None
 
 
 def _customer_display_name(payload: CustomerSyncRequest) -> str:
@@ -2470,8 +2468,6 @@ def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[st
 
 def _prepare_customer_metafield(
     metafield: CustomerMetafieldInput,
-    *,
-    owner_id: str,
 ) -> Optional[Dict[str, Any]]:
     namespace = (metafield.namespace or "pos").strip()
     key = (metafield.key or "").strip()
@@ -2482,7 +2478,6 @@ def _prepare_customer_metafield(
         return None
 
     return {
-        "ownerId": owner_id,
         "namespace": namespace,
         "key": key,
         "type": metafield_type,

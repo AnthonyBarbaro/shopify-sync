@@ -17,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasicCredentials
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import (
     AppSessionManager,
@@ -40,6 +41,7 @@ from app.models import (
     BulkSyncResponse,
     CatalogResponse,
     ConnectionSettingsResponse,
+    ConnectorHeartbeatRequest,
     CustomerBulkSyncResponse,
     CustomerSyncRequest,
     CustomerSyncResult,
@@ -209,7 +211,9 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
 
     content_type = (request.headers.get("content-type") or "").lower()
     body_preview: str | None = None
-    if request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
+    if "customer" in effective_path.lower() and request_body:
+        body_preview = "[customer payload omitted]"
+    elif request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
         if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
             body_preview = _truncate_text(request_body.decode("utf-8", errors="replace"))
         else:
@@ -1623,6 +1627,7 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
             return False
 
     scopes = get_granted_access_scopes(shop)
+    connector_settings = json.loads(heartbeat.get("connector_settings") or "{}")
     recent_orders = db.list_recent_order_summaries(
         shop_domain=shop.shop_domain,
         limit=max(1, min(order_limit, 25)),
@@ -1635,15 +1640,41 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         shop_domain=shop.shop_domain,
         limit=10,
     )
+    inventory_details: dict[str, dict[str, str | None]] = {}
+    details_due = [
+        row.sku for row in recent_inventory
+        if not row.product_title and (
+            not row.details_checked_at
+            or parse_iso_datetime(row.details_checked_at) < utc_now() - timedelta(minutes=15)
+        )
+    ]
+    if details_due and "read_products" in scopes:
+        try:
+            inventory_details = await run_in_threadpool(
+                run_with_shop_retry, shop,
+                lambda active_shop: shopify_client.get_inventory_history_details(
+                    active_shop.shop_domain, active_shop.access_token, details_due,
+                ),
+            )
+            for sku in details_due:
+                details = inventory_details.get(sku) or {}
+                db.update_inventory_history_details(
+                    shop_domain=shop.shop_domain, sku=sku,
+                    product_title=details.get("product_title"), variant_title=details.get("variant_title"),
+                )
+        except Exception:
+            logger.warning("inventory_history_details_unavailable shop=%s", shop.shop_domain)
     return JSONResponse(
         {
             "shop": shop.shop_domain,
+            "force_sync": db.get_connector_sync_request(shop_domain=shop.shop_domain),
             "connector": {
                 "active": is_active(heartbeat["last_seen_at"]),
                 "last_seen_at": heartbeat["last_seen_at"],
+                **connector_settings,
             },
             "inventory": {
-                "active": is_active(heartbeat["last_seen_at"]),
+                "active": is_active(heartbeat["last_inventory_poll_at"]),
                 "last_poll_at": heartbeat["last_inventory_poll_at"],
                 "last_catalog_sync_at": heartbeat["last_catalog_sync_at"],
                 "queued_changes": db.inventory_change_count(shop_domain=shop.shop_domain),
@@ -1653,9 +1684,18 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
                         "delta": row.delta,
                         "quantity_after_change": row.quantity_after_change,
                         "changed_at": row.changed_at,
+                        "product_title": row.product_title or (inventory_details.get(row.sku) or {}).get("product_title"),
+                        "variant_title": row.variant_title or (inventory_details.get(row.sku) or {}).get("variant_title"),
                     }
                     for row in recent_inventory
                 ],
+            },
+            "customers": {
+                "enabled": connector_settings.get("customer_sync_enabled", False),
+                "authorized": {"read_customers", "write_customers"}.issubset(scopes),
+                "active": is_active(heartbeat.get("last_customer_poll_at")),
+                "last_poll_at": heartbeat.get("last_customer_poll_at"),
+                "interval_seconds": connector_settings.get("customer_sync_interval_seconds", 60),
             },
             "orders": {
                 "active": is_active(heartbeat["last_order_poll_at"]),
@@ -2438,11 +2478,11 @@ async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord
         )
 
     normalized_items = normalize_external_customer_bulk_payload(raw_payload)
-    result = run_with_shop_retry(
-        shop,
+    result = await run_in_threadpool(
+        run_with_shop_retry, shop,
         lambda active_shop: inventory_service.sync_customers_bulk(normalized_items, active_shop),
     )
-    normalized_json = _serialize_payload([item.model_dump(mode="json") for item in normalized_items])
+    db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="customers")
     for row in result.results:
         db.record_feed_event(
             shop_domain=shop.shop_domain,
@@ -2450,13 +2490,13 @@ async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord
             endpoint=request.url.path,
             method=request.method,
             sku=row.pos_customer_number,
-            title=row.name,
+            title=None,
             success=row.success,
-            message=row.message,
+            message="Customer synced successfully." if row.success else "Customer sync failed.",
             product_id=row.customer_id,
             variant_id=None,
-            request_payload=_serialize_payload(raw_payload),
-            normalized_payload=normalized_json,
+            request_payload=None,
+            normalized_payload=None,
         )
     return result
 
@@ -2644,6 +2684,45 @@ async def sync_bulk(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> BulkSyncResponse | JSONResponse:
     return await _handle_external_bulk_sync(request, shop)
+
+
+@app.post("/sync/heartbeat", response_model=None)
+def connector_heartbeat(
+    payload: ConnectorHeartbeatRequest,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    db.record_connector_heartbeat(
+        shop_domain=shop.shop_domain, channel="connector", metadata=payload.model_dump(),
+    )
+    sync_request = db.get_connector_sync_request(shop_domain=shop.shop_domain)
+    return JSONResponse({
+        "timestamp": utc_now_iso(),
+        "sync_request_id": sync_request["request_id"] if not sync_request["completed_at"] else None,
+    })
+
+
+@app.post("/api/connector/force-sync", response_model=None)
+def request_connector_force_sync(request: Request) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    if request.headers.get("x-requested-with") != "pos-bridge":
+        raise AuthorizationError("Request a sync from the POS Bridge dashboard.")
+    return JSONResponse(db.request_connector_sync(shop_domain=shop.shop_domain))
+
+
+@app.post("/sync/requests/{request_id}/ack", response_model=None)
+def acknowledge_connector_sync(
+    request_id: str, shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    return JSONResponse({"completed": db.complete_connector_sync(
+        shop_domain=shop.shop_domain, request_id=request_id,
+    )})
+
+
+@app.get("/sync/customers/status", response_model=None)
+def connector_customer_status(shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
+    scopes = get_granted_access_scopes(shop)
+    db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="customers")
+    return JSONResponse({"authorized": {"read_customers", "write_customers"}.issubset(scopes)})
 
 
 @app.api_route(
@@ -3297,6 +3376,8 @@ async def connector_inventory_adjustments(
                     sku=result["sku"],
                     delta=delta,
                     quantity_after_change=result.get("quantity_after_change"),
+                    product_title=result.get("product_title"),
+                    variant_title=result.get("variant_title"),
                 )
             results.append(result)
         except Exception as exc:

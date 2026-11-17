@@ -46,6 +46,9 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.main.db.reset_mock(return_value=True, side_effect=True)
         self.main.db.verify_pos_credentials.return_value = self.shop
         self.main.db.get_pos_auth_record.return_value = None
+        self.main.db.get_connector_sync_request.return_value = {
+            "request_id": None, "requested_at": None, "completed_at": None,
+        }
         self.main.app.dependency_overrides.clear()
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -59,19 +62,24 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         payload: object,
         *,
         authenticated: bool = True,
+        path: str = "/sync/inventory/status/reconcile",
+        method: str = "POST",
+        dashboard_header: bool = True,
     ) -> tuple[int, dict[str, object]]:
         body = json.dumps(payload).encode("utf-8")
         headers = [(b"content-type", b"application/json")]
+        if dashboard_header and path == "/api/connector/force-sync":
+            headers.append((b"x-requested-with", b"pos-bridge"))
         if authenticated:
             headers.extend([(b"x-api-key", b"test-key"), (b"x-api-secret", b"test-secret")])
         scope: Scope = {
             "type": "http",
             "asgi": {"version": "3.0", "spec_version": "2.4"},
             "http_version": "1.1",
-            "method": "POST",
+            "method": method,
             "scheme": "http",
-            "path": "/sync/inventory/status/reconcile",
-            "raw_path": b"/sync/inventory/status/reconcile",
+            "path": path,
+            "raw_path": path.encode("utf-8"),
             "query_string": b"",
             "root_path": "",
             "headers": headers,
@@ -109,6 +117,73 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["error"]["code"], "authorization_error")
         self.main.db.verify_pos_credentials.assert_not_called()
         self.archive.assert_not_called()
+
+    async def test_heartbeat_requires_credentials_and_validates_intervals(self) -> None:
+        payload = {"version": "1.2", "sync_interval_seconds": 30, "customer_sync_enabled": True}
+        status, _body = await self.post(payload, path="/sync/heartbeat", authenticated=False)
+        self.assertEqual(status, 401)
+        self.main.db.record_connector_heartbeat.assert_not_called()
+        status, _body = await self.post({**payload, "sync_interval_seconds": 0}, path="/sync/heartbeat")
+        self.assertEqual(status, 422)
+        self.main.db.record_connector_heartbeat.assert_not_called()
+        status, _body = await self.post(payload, path="/sync/heartbeat")
+        self.assertEqual(status, 200)
+        self.main.db.record_connector_heartbeat.assert_called_once_with(
+            shop_domain=self.shop.shop_domain, channel="connector",
+            metadata={**payload, "customer_sync_interval_seconds": 60},
+        )
+
+    async def test_customer_status_requires_credentials(self) -> None:
+        status, _body = await self.post(None, path="/sync/customers/status", method="GET", authenticated=False)
+        self.assertEqual(status, 401)
+        self.main.db.record_connector_heartbeat.assert_not_called()
+
+    async def test_force_sync_requires_dashboard_session_and_uses_its_shop(self) -> None:
+        status, _body = await self.post({}, path="/api/connector/force-sync")
+        self.assertEqual(status, 401)
+        self.main.db.request_connector_sync.assert_not_called()
+        queued = {"request_id": "request1", "requested_at": "2026-11-17T12:00:00Z", "completed_at": None}
+        self.main.db.request_connector_sync.return_value = queued
+        with mock.patch.object(self.main, '_get_session_context', return_value=(self.shop, {})):
+            status, _body = await self.post({}, path="/api/connector/force-sync", dashboard_header=False)
+            self.assertEqual(status, 401)
+            self.main.db.request_connector_sync.assert_not_called()
+            status, body = await self.post({"shop": "other.myshopify.com"}, path="/api/connector/force-sync")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, queued)
+        self.main.db.request_connector_sync.assert_called_once_with(shop_domain=self.shop.shop_domain)
+
+    async def test_force_sync_acknowledgment_requires_pos_authentication(self) -> None:
+        status, _body = await self.post({}, path="/sync/requests/request1/ack", authenticated=False)
+        self.assertEqual(status, 401)
+        self.main.db.complete_connector_sync.assert_not_called()
+        self.main.db.complete_connector_sync.return_value = True
+        status, body = await self.post({}, path="/sync/requests/request1/ack")
+        self.assertEqual(status, 200)
+        self.assertTrue(body['completed'])
+        self.main.db.complete_connector_sync.assert_called_once_with(
+            shop_domain=self.shop.shop_domain, request_id="request1",
+        )
+
+    async def test_customer_batch_omits_contact_data_from_request_and_feed_logs(self) -> None:
+        with (
+            mock.patch.object(self.main.shopify_client, "ensure_customer_custom_id_definition"),
+            mock.patch.object(self.main.shopify_client, "get_customer_by_identifier", return_value=None),
+            mock.patch.object(self.main.shopify_client, "customer_create", return_value={
+                "id": "gid://shopify/Customer/1", "email": "sample@example.test",
+            }),
+        ):
+            status, body = await self.post({"customers": [{
+                "source": "Customer.dbf", "pos_customer_number": "1",
+                "firstName": "Sample", "email": "sample@example.test",
+            }]}, path="/sync/customers")
+        self.assertEqual(status, 200)
+        self.assertEqual(body['succeeded'], 1)
+        self.assertEqual(self.main.db.record_request_log.call_args.kwargs['request_body'], '[customer payload omitted]')
+        feed = self.main.db.record_feed_event.call_args.kwargs
+        self.assertIsNone(feed['title'])
+        self.assertIsNone(feed['request_payload'])
+        self.assertIsNone(feed['normalized_payload'])
 
     async def test_invalid_credentials_are_rejected_before_archiving(self) -> None:
         self.main.db.verify_pos_credentials.side_effect = AuthorizationError("Invalid POS credentials.")

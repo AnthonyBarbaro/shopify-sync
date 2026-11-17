@@ -528,6 +528,68 @@ class ShopifyClient:
                 {"user_errors": user_errors, "shop": shop_domain},
             )
 
+    def get_customer_by_identifier(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        identifier: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        query = """
+        query CustomerByIdentifier($identifier: CustomerIdentifierInput!) {
+          customerByIdentifier(identifier: $identifier) {
+            id
+            displayName
+            email
+            phone
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain, access_token, query, {"identifier": identifier},
+            operation_name="CustomerByIdentifier",
+        )
+        customer = payload["data"]["customerByIdentifier"]
+        if customer is not None and not customer.get("id"):
+            raise ShopifyAPIError("Shopify could not verify this customer's identity.")
+        return customer
+
+    def customer_create(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        mutation = """
+        mutation CustomerCreate($input: CustomerInput!) {
+          customerCreate(input: $input) {
+            customer {
+              id
+              displayName
+              email
+              phone
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain, access_token, mutation, {"input": input_data},
+            operation_name="CustomerCreate",
+        )
+        result = payload["data"]["customerCreate"]
+        user_errors = result.get("userErrors") or []
+        if user_errors or not (result.get("customer") or {}).get("id"):
+            raise ShopifyAPIError(
+                "Shopify could not create this customer.",
+                {"user_errors": user_errors, "shop": shop_domain},
+            )
+        return result["customer"]
+
     def customer_set(
         self,
         shop_domain: str,
@@ -637,6 +699,7 @@ class ShopifyClient:
             nodes {
               id
               sku
+              title
               price
               product {
                 id
@@ -741,6 +804,37 @@ class ShopifyClient:
         )
         nodes = payload["data"]["productVariants"]["nodes"]
         return (nodes[0] or {}).get("product") if nodes else None
+
+    def get_inventory_history_details(
+        self, shop_domain: str, access_token: str, skus: List[str],
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        skus = list(dict.fromkeys(skus))[:10]
+        if not skus:
+            return {}
+        variables = {f"query{index}": _build_sku_search_query(sku) for index, sku in enumerate(skus)}
+        arguments = ", ".join(f"${key}: String!" for key in variables)
+        fields = " ".join(
+            f"item{index}: productVariants(first: 10, query: $query{index}) "
+            "{ pageInfo { hasNextPage } nodes { sku title product { title } } }"
+            for index in range(len(skus))
+        )
+        payload = self.graphql(
+            shop_domain, access_token, f"query InventoryHistoryDetails({arguments}) {{ {fields} }}",
+            variables, operation_name="InventoryHistoryDetails",
+        )
+        result: Dict[str, Dict[str, Optional[str]]] = {}
+        for index, sku in enumerate(skus):
+            connection = payload.get("data", {}).get(f"item{index}") or {}
+            if (connection.get("pageInfo") or {}).get("hasNextPage"):
+                continue
+            nodes = connection.get("nodes") or []
+            matches = [node for node in nodes if str(node.get("sku") or "").strip() == sku]
+            if len(matches) == 1:
+                result[sku] = {
+                    "product_title": (matches[0].get("product") or {}).get("title"),
+                    "variant_title": matches[0].get("title"),
+                }
+        return result
 
     def get_product_by_handle(
         self,
@@ -2068,6 +2162,8 @@ def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
         variant_id=node["id"],
         product_id=product["id"],
         inventory_item_id=inventory_item["id"],
+        product_title=product.get("title"),
+        variant_title=node.get("title"),
         product_status=product.get("status"),
         auto_archived_zero_stock=(
             str(auto_archived_marker.get("value") or "").strip().lower() == "true"

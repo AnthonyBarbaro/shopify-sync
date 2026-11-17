@@ -80,6 +80,13 @@ class CustomerSyncRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ConnectorHeartbeatRequest(BaseModel):
+    version: str = Field(min_length=1, max_length=40)
+    sync_interval_seconds: int = Field(ge=30, le=86400)
+    customer_sync_enabled: bool = False
+    customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
+
+
 class ProductSyncRequest(BaseModel):
     sku: Optional[str] = Field(default=None, min_length=1)
     title: Optional[str] = None
@@ -122,6 +129,8 @@ class VariantMapping(BaseModel):
     variant_id: str
     product_id: str
     inventory_item_id: str
+    product_title: Optional[str] = None
+    variant_title: Optional[str] = None
     product_status: Optional[str] = None
     auto_archived_zero_stock: bool = False
     current_price: Optional[float] = None

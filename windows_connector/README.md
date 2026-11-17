@@ -1,7 +1,10 @@
 # Windows POS Inventory Connector
 
 This connector runs continuously on the Windows POS computer. It checks the live POS event tables
-every three minutes but sends no DBF files or ZIP archives to Railway.
+every 30 seconds by default but sends no DBF files or ZIP archives to Railway. A separate heartbeat
+also runs every 30 seconds, including during long inventory jobs. The dashboard refreshes every
+30 seconds and shows inventory, order, and customer check-ins independently. A missing check-in
+reports connector communication, not the computer's internet connection.
 
 ## Sync behavior
 
@@ -12,7 +15,7 @@ every three minutes but sends no DBF files or ZIP archives to Railway.
 3. Initial descriptions are empty and the generated product name is included as a tag. Later runs
    send inventory deltas and explicit price changes only, so product titles, tags, descriptions,
    images, and other merchandising edits are not repeatedly overwritten.
-4. Every three minutes it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
+4. Every 30 seconds by default it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
    Those rows identify affected base SKUs; the connector then rereads their authoritative current
    quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
    It also checks the current numeric SKU sequence in `Item.dbf`. A SKU above the saved five-digit
@@ -61,7 +64,7 @@ explicit successful result. Failed, missing, or timed-out results survive a rest
 again after inventory adjustments complete, including when a later snapshot is positive. The
 backend can then restore a connector-owned archive to Draft if the restock webhook was missed or
 finished before archiving. Incomplete stock verification for that recovery remains retryable.
-The normal three-minute inventory cycles do not newly archive products.
+The normal inventory cycles do not newly archive products.
 
 A later positive stock observation restores only a marked product to Draft and clears the marker;
 manual, unmarked archives are preserved.
@@ -79,6 +82,7 @@ blocked from unattended writes.
 The connector's recurring Windows storage is limited to:
 
 - `state.json` and one backup;
+- `customers.json` and one backup containing only customer identity/payload hashes and a scan cursor;
 - `shopify-order-header.dbf` and `shopify-order-detail.dbf` when order sync is enabled;
 - `shopify-order-header.lock`, used to coordinate DBF reads and status writes;
 - a 5 MB rotating log with three backups by default;
@@ -88,11 +92,44 @@ After an upgrade, a legacy `shopify-order.db` or `shopify-orders.db` may also re
 after its rows are migrated into the DBFs. Later Shopify deletion and customer-redaction events are
 also removed from that copy before acknowledgement.
 
-Railway receives only small JSON inventory or price adjustments, never sales/edit history or DBF archives.
+Railway receives JSON inventory/price adjustments and enabled customer uploads, never sales/edit history or DBF archives.
 Its inventory-change queue keeps only the latest unprocessed value and deletes it after the Windows
 connector acknowledges it. The dashboard keeps only the 50 most recent lightweight price-change
 results. The server separately caps its feed and request history using
 `FEED_EVENT_RETENTION_ROWS` and `REQUEST_LOG_RETENTION_ROWS`.
+
+## Customer sync
+
+Customer sync is append-only from the POS to Shopify. The connector reads the primary `Customer.dbf`
+and its associated shipping addresses every 60 seconds in a separate worker. The first import
+processes up to 50 customers per pass, in requests of at most ten. It then submits only records
+whose POS payload has changed. The backend checks POS ID, email, and phone before creating a missing
+customer. A matched Shopify customer stays unchanged, including names, contacts, addresses, notes,
+tags, consent, and metafields. Creation uses `customerCreate` with the stable POS identity in the
+same request; retries and creation conflicts recheck for an existing customer and never switch to
+an update. Both new customers and preserved existing matches count as successfully processed.
+Each confirmed success saves an identity/payload hash; failures,
+missing results, and timeouts are retried using the same stable POS ID. Customers without a POS
+customer number are skipped. Removing a POS customer does not delete their Shopify record.
+
+Enable the customer permissions on Railway and in Shopify before upgrading Windows:
+
+1. Add `read_customers,write_customers` to the existing Railway `APP_SCOPES` list.
+2. Repeat the Shopify install flow to grant those scopes. The app also needs the appropriate
+   [protected customer data access](https://shopify.dev/docs/api/admin-graphql/2026-01/mutations/customerCreate).
+3. Keep these Windows `connector.env` settings (also the defaults when absent):
+
+   ```env
+   CUSTOMER_SYNC_ENABLED=true
+   CUSTOMER_SYNC_INTERVAL_SECONDS=60
+   ```
+
+`--dry-run` reads customers without sending them or advancing their hashes. Inventory jobs and
+customer uploads use separate sessions and state files. Customer upload failures do not stop
+inventory. The Overview shows customer authorization and check-ins; aggregate upload results are
+in the Windows log. A check-in confirms communication, so check the log for failed import counts.
+Recurring uploads omit contact payloads from request/feed logs. Contact details are not stored in
+`customers.json`.
 
 ## Shopify order inbox
 
@@ -153,9 +190,12 @@ The POS developer handoff, field list, and import queries are in
    powershell -ExecutionPolicy Bypass -File windows_connector\install.ps1
    ```
 
-The task runs as Windows `SYSTEM`, starts one minute after boot, restarts after failures, and prevents
+The installer starts the task immediately by default. The task runs as Windows `SYSTEM`, starts one
+minute after later boots, restarts after failures, and prevents
 overlapping instances. Use a local drive or UNC path for `POS_DBF_DIR`; mapped drive letters are not
 normally available to `SYSTEM`.
+A recurring recovery trigger also starts a stopped connector within one minute while Windows is
+awake. It ignores the trigger when the connector is already running, so only one instance runs.
 
 ## POS quantity write-back
 
@@ -195,10 +235,29 @@ updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_syn
 supporting runtime files. It preserves `connector.env`, connector state, logs, Shopify order DBFs,
 native POS DBFs, and any legacy Shopify order SQLite database.
 
-Start or stop the task:
+The updater preserves existing configuration. Set `SYNC_INTERVAL_SECONDS=30` in `connector.env`
+to replace the old 180-second interval, and restart the task after editing. The dashboard reports
+the configured interval after the upgraded connector's first heartbeat. Faster polling does not
+guarantee an update within 30 seconds: full reconciliations, POS file locks, API retries, and
+connectivity can add delay. Recent quantity history appears after successful POS-to-Shopify
+adjustments; it does not list idle checks or Shopify-originated stock changes.
+Use the updated installer or updater to register the recovery trigger on an existing computer.
+The updater temporarily disables the task while replacing files and preserves an explicitly
+disabled task's state after updating.
+
+The Overview's **Force sync** button saves a request on Railway. The next heartbeat wakes the
+connector for a full inventory comparison and a customer scan, without clearing quantity baselines
+or resending unchanged customers. A running inventory cycle finishes first. Offline requests remain
+queued until the connector reconnects; the dashboard reports completion of the inventory scan only
+after acknowledgment. Individual failed adjustments continue through the existing retry mechanism.
+This requires the updated backend and Windows connector.
+
+Start or pause the task (disable recovery before stopping for maintenance):
 
 ```powershell
+Enable-ScheduledTask -TaskName "Shopify POS Inventory Connector"
 Start-ScheduledTask -TaskName "Shopify POS Inventory Connector"
+Disable-ScheduledTask -TaskName "Shopify POS Inventory Connector"
 Stop-ScheduledTask -TaskName "Shopify POS Inventory Connector"
 ```
 

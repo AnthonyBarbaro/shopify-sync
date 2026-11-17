@@ -26,6 +26,7 @@ $files = @(
 $downloads = @()
 $installed = @()
 $taskStopped = $false
+$taskWasEnabled = $false
 
 try {
     Write-Host "Downloading Windows connector runtime files..."
@@ -66,8 +67,11 @@ try {
     }
 
     Write-Host "Stopping Shopify connector..."
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $taskWasEnabled = $existingTask.Settings.Enabled
+    Disable-ScheduledTask -TaskName $TaskName | Out-Null
     $taskStopped = $true
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
     Write-Host "Backing up and installing updates..."
     foreach ($item in $downloads) {
@@ -83,6 +87,23 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "The updated connector failed its import validation."
     }
+
+    $startupTrigger = New-ScheduledTaskTrigger -AtStartup
+    $startupTrigger.Delay = "PT1M"
+    $recoveryTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $taskSettings = New-ScheduledTaskSettingsSet `
+        -MultipleInstances IgnoreNew `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries
+    # Keep the task disabled until every runtime file has been installed and validated.
+    $taskSettings.Enabled = $false
+    Set-ScheduledTask -TaskName $TaskName -Trigger @($startupTrigger, $recoveryTrigger) `
+        -Settings $taskSettings | Out-Null
 }
 catch {
     Write-Warning "Update failed: $($_.Exception.Message)"
@@ -97,8 +118,9 @@ finally {
     foreach ($item in $downloads) {
         Remove-Item -LiteralPath $item.Download -Force -ErrorAction SilentlyContinue
     }
-    if ($taskStopped) {
+    if ($taskStopped -and $taskWasEnabled) {
         Write-Host "Starting Shopify connector..."
+        Enable-ScheduledTask -TaskName $TaskName | Out-Null
         Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     }
 }

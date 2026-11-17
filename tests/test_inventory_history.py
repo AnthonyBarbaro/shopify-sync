@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import timedelta
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -12,6 +13,9 @@ from starlette.requests import Request
 
 from app.config import Settings
 from app.db import DatabaseStore, ShopRecord
+from app.models import ConnectorHeartbeatRequest
+from app.shopify import ShopifyClient
+from app.utils import utc_now
 
 
 class InventoryHistoryTests(unittest.TestCase):
@@ -78,6 +82,32 @@ class InventoryHistoryTests(unittest.TestCase):
             with self.assertLogs(self.store.logger, level='ERROR'):
                 self.record()
 
+    def test_force_requests_coalesce_are_shop_isolated_and_acknowledgments_are_versioned(self) -> None:
+        first = self.store.request_connector_sync(shop_domain='one.myshopify.com')
+        self.assertEqual(self.store.request_connector_sync(shop_domain='one.myshopify.com'), first)
+        self.assertFalse(self.store.complete_connector_sync(shop_domain='two.myshopify.com', request_id=first['request_id']))
+        self.assertTrue(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
+        self.assertTrue(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
+        newer = self.store.request_connector_sync(shop_domain='one.myshopify.com')
+        self.assertNotEqual(newer['request_id'], first['request_id'])
+        self.assertFalse(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
+        self.assertIsNone(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['completed_at'])
+        self.store.mark_shop_uninstalled('one.myshopify.com')
+        self.assertIsNone(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['request_id'])
+
+    def test_product_details_are_persisted_without_replacing_recorded_quantities(self) -> None:
+        self.record()
+        self.store.update_inventory_history_details(
+            shop_domain='two.myshopify.com', sku='123. 1 1', product_title='Wrong shop', variant_title='Wrong',
+        )
+        self.assertIsNone(self.store.list_recent_inventory_changes(shop_domain='one.myshopify.com')[0].product_title)
+        self.store.update_inventory_history_details(
+            shop_domain='one.myshopify.com', sku='123. 1 1', product_title='Linen shirt', variant_title='Blue / M',
+        )
+        row = self.store.list_recent_inventory_changes(shop_domain='one.myshopify.com')[0]
+        self.assertEqual((row.product_title, row.variant_title), ('Linen shirt', 'Blue / M'))
+        self.assertEqual((row.delta, row.quantity_after_change), (-1, 0))
+
 
 class InventoryHistoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
     main: ModuleType
@@ -118,7 +148,8 @@ class InventoryHistoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {'sku': '123', 'delta': 0, 'idempotency_key': 'zero'},
             {'sku': '123', 'delta': 2, 'idempotency_key': 'failure'},
         ]
-        success = {'sku': '123', 'success': True, 'inventory_item_id': '1', 'quantity_after_change': 0}
+        success = {'sku': '123', 'success': True, 'inventory_item_id': '1', 'quantity_after_change': 0,
+                   'product_title': 'Linen shirt', 'variant_title': 'Blue / M'}
         with (
             mock.patch.object(self.main, 'parse_external_request_payload',
                               new=mock.AsyncMock(return_value={'adjustments': adjustments})),
@@ -132,6 +163,7 @@ class InventoryHistoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         rows = self.store.list_recent_inventory_changes(shop_domain=self.shop.shop_domain)
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0].sku, rows[0].delta, rows[0].quantity_after_change), ('123', -1, 0))
+        self.assertEqual((rows[0].product_title, rows[0].variant_title), ('Linen shirt', 'Blue / M'))
 
     async def test_dashboard_history_uses_authenticated_shop_and_latest_ten(self) -> None:
         for index in range(12):
@@ -151,6 +183,86 @@ class InventoryHistoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             session.return_value = (replace(self.shop, shop_domain='other.myshopify.com'), {})
             other = json.loads((await self.main.bridge_status(request)).body)
             self.assertEqual(other['inventory']['recent'], [])
+
+    async def test_heartbeat_does_not_make_stale_inventory_or_orders_active(self) -> None:
+        self.store.record_connector_heartbeat(shop_domain=self.shop.shop_domain, channel='inventory')
+        stale = (utc_now() - timedelta(minutes=40)).isoformat()
+        with self.store._connect() as connection:
+            connection.execute('UPDATE connector_heartbeats SET last_inventory_poll_at = ?', (stale,))
+            connection.commit()
+        self.main.connector_heartbeat(ConnectorHeartbeatRequest(
+            version='1.2', sync_interval_seconds=30, customer_sync_enabled=True,
+        ), self.shop)
+        with (
+            mock.patch.object(self.main, '_get_session_context', return_value=(self.shop, {})),
+            mock.patch.object(self.main, 'get_granted_access_scopes', return_value={'read_customers', 'write_customers'}),
+        ):
+            payload = json.loads((await self.main.bridge_status(Request({'type': 'http', 'headers': []}))).body)
+        self.assertTrue(payload['connector']['active'])
+        self.assertEqual(payload['connector']['sync_interval_seconds'], 30)
+        self.assertFalse(payload['inventory']['active'])
+        self.assertFalse(payload['orders']['active'])
+        self.assertTrue(payload['customers']['enabled'])
+        self.assertTrue(payload['customers']['authorized'])
+        self.assertFalse(payload['customers']['active'])
+
+    async def test_customer_status_checks_scopes_and_keeps_channels_separate(self) -> None:
+        for scopes, expected in [([], False), (['read_customers'], False),
+                                 (['read_customers', 'write_customers'], True)]:
+            with mock.patch.object(self.main, 'get_granted_access_scopes', return_value=scopes):
+                result = json.loads(self.main.connector_customer_status(self.shop).body)
+                self.assertEqual(result['authorized'], expected)
+        heartbeat = self.store.get_connector_heartbeat(shop_domain=self.shop.shop_domain)
+        self.assertIsNotNone(heartbeat['last_customer_poll_at'])
+        self.assertIsNone(heartbeat['last_inventory_poll_at'])
+        self.assertIsNone(heartbeat['last_order_poll_at'])
+        self.assertIsNone(self.store.get_connector_heartbeat(shop_domain='other.myshopify.com')['last_seen_at'])
+
+    async def test_legacy_history_names_are_loaded_once_and_unknown_skus_are_throttled(self) -> None:
+        for sku in ['123', 'missing']:
+            self.store.record_recent_inventory_change(
+                shop_domain=self.shop.shop_domain, idempotency_key=sku, sku=sku,
+                delta=1, quantity_after_change=2,
+            )
+        with (
+            mock.patch.object(self.main, '_get_session_context', return_value=(self.shop, {})),
+            mock.patch.object(self.main, 'get_granted_access_scopes', return_value=['read_products']),
+            mock.patch.object(self.main.shopify_client, 'get_inventory_history_details', return_value={
+                '123': {'product_title': 'Linen shirt', 'variant_title': 'Blue / M'},
+            }) as details,
+        ):
+            request = Request({'type': 'http', 'headers': []})
+            payload = json.loads((await self.main.bridge_status(request)).body)
+            self.assertEqual(payload['inventory']['recent'][1]['product_title'], 'Linen shirt')
+            await self.main.bridge_status(request)
+        details.assert_called_once()
+
+    async def test_legacy_heartbeat_database_is_upgraded_without_losing_checkins(self) -> None:
+        path = self.store.database_path.parent / 'legacy.sqlite3'
+        with sqlite3.connect(path) as connection:
+            connection.execute('CREATE TABLE connector_heartbeats (shop_domain TEXT PRIMARY KEY, '
+                               'last_seen_at TEXT NOT NULL, last_inventory_poll_at TEXT, '
+                               'last_order_poll_at TEXT, last_catalog_sync_at TEXT)')
+            connection.execute('INSERT INTO connector_heartbeats VALUES (?, ?, ?, NULL, NULL)',
+                               (self.shop.shop_domain, '2026-01-01', '2026-01-01'))
+        store = DatabaseStore(str(path), 'test-secret')
+        heartbeat = store.get_connector_heartbeat(shop_domain=self.shop.shop_domain)
+        self.assertEqual(heartbeat['last_inventory_poll_at'], '2026-01-01')
+        self.assertIsNone(heartbeat['last_customer_poll_at'])
+
+
+class InventoryHistoryLookupTests(unittest.TestCase):
+    def test_names_require_one_exact_sku_match_and_complete_results(self) -> None:
+        client = ShopifyClient(mock.Mock())
+        node = {'sku': 'exact', 'title': 'Blue / M', 'product': {'title': 'Linen shirt'}}
+        with mock.patch.object(client, 'graphql', return_value={'data': {
+            'item0': {'nodes': [dict(node, sku='exact-other'), node]},
+            'item1': {'nodes': [dict(node, sku='duplicate'), dict(node, sku='duplicate')]},
+            'item2': {'nodes': [dict(node, sku='truncated')], 'pageInfo': {'hasNextPage': True}},
+        }}) as graphql:
+            result = client.get_inventory_history_details('one.myshopify.com', 'test-token', ['exact', 'duplicate', 'truncated'])
+        self.assertEqual(result, {'exact': {'product_title': 'Linen shirt', 'variant_title': 'Blue / M'}})
+        self.assertEqual(graphql.call_args.kwargs['operation_name'], 'InventoryHistoryDetails')
 
 
 if __name__ == '__main__':

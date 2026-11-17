@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -137,6 +137,9 @@ class RecentInventoryChangeRow:
     delta: int
     quantity_after_change: Optional[int]
     changed_at: str
+    product_title: Optional[str] = None
+    variant_title: Optional[str] = None
+    details_checked_at: Optional[str] = None
 
 
 class DatabaseStore:
@@ -263,6 +266,16 @@ class DatabaseStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS connector_sync_requests (
+                    shop_domain TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS recent_price_changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shop_domain TEXT NOT NULL,
@@ -357,6 +370,11 @@ class DatabaseStore:
             self._ensure_column(connection, "inventory_changes", "version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "inventory_changes", "source_updated_at", "TEXT")
             self._ensure_column(connection, "inventory_item_skus", "last_quantity", "INTEGER")
+            self._ensure_column(connection, "connector_heartbeats", "last_customer_poll_at", "TEXT")
+            self._ensure_column(connection, "connector_heartbeats", "connector_settings", "TEXT")
+            self._ensure_column(connection, "recent_inventory_changes", "product_title", "TEXT")
+            self._ensure_column(connection, "recent_inventory_changes", "variant_title", "TEXT")
+            self._ensure_column(connection, "recent_inventory_changes", "details_checked_at", "TEXT")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_credentials_api_key ON pos_credentials(api_key)"
             )
@@ -1272,15 +1290,20 @@ class DatabaseStore:
             ).fetchone()
         return int(row["count"]) if row else 0
 
-    def record_connector_heartbeat(self, *, shop_domain: str, channel: str) -> None:
+    def record_connector_heartbeat(
+        self, *, shop_domain: str, channel: str, metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         now = utc_now_iso()
         column = {
             "inventory": "last_inventory_poll_at",
             "orders": "last_order_poll_at",
             "catalog": "last_catalog_sync_at",
+            "customers": "last_customer_poll_at",
         }.get(channel)
-        if column is None:
+        if column is None and channel != "connector":
             raise ValueError(f"Unsupported heartbeat channel: {channel}")
+        column = column or "connector_settings"
+        value = json.dumps(metadata or {}) if channel == "connector" else now
         with self._connect() as connection:
             connection.execute(
                 f"""
@@ -1290,7 +1313,7 @@ class DatabaseStore:
                     last_seen_at=excluded.last_seen_at,
                     {column}=excluded.{column}
                 """,
-                (shop_domain, now, now),
+                (shop_domain, now, value),
             )
             connection.commit()
 
@@ -1306,13 +1329,50 @@ class DatabaseStore:
                 "last_inventory_poll_at": None,
                 "last_order_poll_at": None,
                 "last_catalog_sync_at": None,
+                "last_customer_poll_at": None,
+                "connector_settings": None,
             }
         return {
             "last_seen_at": row["last_seen_at"],
             "last_inventory_poll_at": row["last_inventory_poll_at"],
             "last_order_poll_at": row["last_order_poll_at"],
             "last_catalog_sync_at": row["last_catalog_sync_at"],
+            "last_customer_poll_at": row["last_customer_poll_at"],
+            "connector_settings": row["connector_settings"],
         }
+
+    def request_connector_sync(self, *, shop_domain: str) -> dict[str, Optional[str]]:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO connector_sync_requests (shop_domain, request_id, requested_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(shop_domain) DO UPDATE SET
+                    request_id=excluded.request_id, requested_at=excluded.requested_at, completed_at=NULL
+                WHERE connector_sync_requests.completed_at IS NOT NULL
+                """,
+                (shop_domain, secrets.token_hex(16), utc_now_iso()),
+            )
+            connection.commit()
+        return self.get_connector_sync_request(shop_domain=shop_domain)
+
+    def get_connector_sync_request(self, *, shop_domain: str) -> dict[str, Optional[str]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT request_id, requested_at, completed_at FROM connector_sync_requests WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        return dict(row) if row else {"request_id": None, "requested_at": None, "completed_at": None}
+
+    def complete_connector_sync(self, *, shop_domain: str, request_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE connector_sync_requests SET completed_at = COALESCE(completed_at, ?) "
+                "WHERE shop_domain = ? AND request_id = ?",
+                (utc_now_iso(), shop_domain, request_id),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
 
     def upsert_recent_order_summary(
         self,
@@ -1418,6 +1478,8 @@ class DatabaseStore:
         sku: str,
         delta: int,
         quantity_after_change: Optional[int],
+        product_title: Optional[str] = None,
+        variant_title: Optional[str] = None,
     ) -> None:
         if not delta:
             return
@@ -1427,11 +1489,12 @@ class DatabaseStore:
                     """
                     INSERT OR IGNORE INTO recent_inventory_changes (
                         shop_domain, idempotency_key, sku, delta,
-                        quantity_after_change, changed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        quantity_after_change, changed_at, product_title, variant_title, details_checked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (shop_domain, idempotency_key, sku, int(delta),
-                     quantity_after_change, utc_now_iso()),
+                     quantity_after_change, utc_now_iso(), product_title, variant_title,
+                     utc_now_iso() if product_title else None),
                 )
                 self._trim_shop_rows(
                     connection,
@@ -1454,7 +1517,8 @@ class DatabaseStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT sku, delta, quantity_after_change, changed_at
+                SELECT sku, delta, quantity_after_change, changed_at,
+                       product_title, variant_title, details_checked_at
                 FROM recent_inventory_changes
                 WHERE shop_domain = ?
                 ORDER BY id DESC
@@ -1463,6 +1527,18 @@ class DatabaseStore:
                 (shop_domain, safe_limit),
             ).fetchall()
         return [RecentInventoryChangeRow(**dict(row)) for row in rows]
+
+    def update_inventory_history_details(
+        self, *, shop_domain: str, sku: str, product_title: Optional[str], variant_title: Optional[str],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE recent_inventory_changes SET product_title = COALESCE(product_title, ?), "
+                "variant_title = COALESCE(variant_title, ?), details_checked_at = ? "
+                "WHERE shop_domain = ? AND sku = ?",
+                (product_title, variant_title, utc_now_iso(), shop_domain, sku),
+            )
+            connection.commit()
 
     def record_recent_price_change(
         self,
@@ -1593,6 +1669,10 @@ class DatabaseStore:
             )
             connection.execute(
                 "DELETE FROM connector_heartbeats WHERE shop_domain = ?",
+                (shop_domain,),
+            )
+            connection.execute(
+                "DELETE FROM connector_sync_requests WHERE shop_domain = ?",
                 (shop_domain,),
             )
             connection.execute(

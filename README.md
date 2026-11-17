@@ -49,7 +49,7 @@ SHOPIFY_CLIENT_SECRET=your_client_secret
 SHOPIFY_API_VERSION=2026-01
 # SHOPIFY_LOCATION_ID=123456789
 APP_BASE_URL=https://your-domain.example
-APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations,read_orders
+APP_SCOPES=read_products,write_products,read_inventory,write_inventory,read_locations,read_customers,write_customers,read_orders
 APP_SESSION_SECRET=replace_with_a_long_random_secret
 POS_SECRET_ENCRYPTION_SECRET=replace_with_a_second_long_random_secret
 DATABASE_PATH=inventory_sync.sqlite3
@@ -63,11 +63,23 @@ Feed and request history is automatically pruned to these limits so recurring co
 cannot grow the Railway SQLite volume without bound.
 
 The Overview shows the latest 10 successful POS-to-Shopify quantity adjustments, including
-SKU, signed change, resulting quantity when Shopify returns it, and the time recorded.
+product name, variant, SKU, signed change, resulting quantity when Shopify returns it, and time.
+New adjustments save the Shopify product/variant names. Older retained rows load missing names
+through one bounded Shopify query and cache the result locally; missing or ambiguous SKUs keep
+their SKU label. Unavailable names are retried after 15 minutes.
 It refreshes every 30 seconds or with Refresh. At most 50 entries are retained per shop;
 retries with the same idempotency key are not added twice while the entry is retained.
 History starts after this update and does not include Shopify-originated changes or initial
 catalog quantities. Failed and zero-delta adjustments are excluded.
+
+The connector defaults to inventory and POS price checks every 30 seconds. Actual updates can take
+longer during a full reconciliation, API retries, or downtime. A separate 30-second heartbeat reports
+connector connectivity during long jobs; inventory, order, and customer check-ins are shown separately.
+"No check-in" means Railway has not heard from the connector for eight minutes, even if the computer
+itself has internet access. The dashboard displays the interval reported by the updated connector.
+The **Force sync** button queues a full inventory comparison and customer scan for the connector's
+next heartbeat. Offline requests remain queued, and scan completion is reported after acknowledgment;
+failed quantity adjustments continue retrying. Existing quantity baselines are preserved.
 
 Full order payloads are a temporary delivery queue capped at 500 rows even if an older environment
 setting is higher. Railway separately keeps only 50 small order summaries for the dashboard, and
@@ -109,7 +121,7 @@ nightly hour, after pending inventory adjustments have succeeded. The backend ve
 product is POS-managed and every tracked variant has nonpositive available stock at every Shopify
 location. Positive stock, missing inventory data, and truncated variant or location lists prevent
 archiving. These checks currently read up to 50 variants and five locations per variant. Products
-already at zero are included; recurring three-minute inventory updates do not newly archive products.
+already at zero are included; recurring inventory updates do not newly archive products.
 Each status request saves its pending SKUs before sending. Failed or unconfirmed requests remain
 pending across connector restarts and are checked again after inventory adjustments succeed, even
 if a later snapshot shows positive stock. This lets the backend restore its own archived product
@@ -131,6 +143,26 @@ After adding `read_orders` to an existing Railway `APP_SCOPES` value, run the Sh
 again so the store grants the new scope. Depending on the app's Shopify distribution and protected
 customer data approval, customer contact and shipping fields can be redacted while order and SKU
 fields still sync.
+
+With `CUSTOMER_SYNC_ENABLED=true` (the new connector default), a separate Windows worker checks
+`Customer.dbf` and associated shipping addresses every 60 seconds and submits new or changed POS
+records for append-only import. Shopify customers matched by POS ID, email, or phone are preserved
+without updates to their fields, tags, notes, addresses, consent, or metafields. Only missing
+customers are created, with their POS identity saved in the same creation request. Create conflicts
+and retries recheck for an existing customer without falling back to an update. The initial import
+progresses in batches of at most 50 customers per pass. Successful
+payload hashes are saved in `customers.json`; unchanged records are not resent and failed or
+unconfirmed records are retried. This is one-way POS-to-Shopify sync using stable POS customer IDs;
+records without a POS customer number are skipped, and removed POS records do not delete Shopify
+customers. Matching existing customers counts as successfully processed and prevents unchanged
+records from being resent. Local state contains hashes rather than names or contact details.
+Customer uploads use separate sessions and state so they do not hold up inventory cycles.
+
+Existing installations must add `read_customers,write_customers` to Railway `APP_SCOPES` and repeat
+the Shopify install flow to grant those scopes. Shopify also requires the appropriate
+[protected customer data access](https://shopify.dev/docs/api/admin-graphql/2026-01/mutations/customerCreate).
+The Overview shows missing authorization; connector logs record aggregate upload results without
+customer contact details. Recurring customer uploads omit contact payloads from request/feed logs.
 
 ## Local Run
 
@@ -213,6 +245,11 @@ GET /sync/inventory/changes
 POST /sync/inventory/changes/ack
 POST /sync/catalog/reconcile
 POST /sync/catalog/matrix-structure/repair
+POST /sync/heartbeat
+GET /sync/customers/status
+POST /sync/customers
+POST /api/connector/force-sync
+POST /sync/requests/{request_id}/ack
 ```
 
 Catalog reconciliation accepts the complete source SKU list and previews Shopify products whose
@@ -226,11 +263,15 @@ Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SK
 
 The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
 It starts with Windows, uploads product details only during the initial catalog import, processes new
-`invdtl.dbf` and `editvoid.dbf` events every three minutes, and runs one full quantity reconciliation
+`invdtl.dbf` and `editvoid.dbf` events every 30 seconds by default, and runs one full quantity reconciliation
 after local midnight. The first upgraded run also forces this reconciliation immediately. Deploy the
 Railway/backend update before updating the Windows connector; the connector rejects an older snapshot
 schema without acknowledging queued changes. It sends JSON changes rather than DBF ZIP archives and
 keeps only bounded state and rotating logs on the host computer.
+The installer starts the scheduled task immediately and registers startup after reboot, plus a
+one-minute recovery trigger that restarts a stopped connector without creating duplicate instances. Existing
+`connector.env` files are preserved by the updater: change `SYNC_INTERVAL_SECONDS=180` to `30` and
+restart the task to adopt the faster interval. See the connector README for customer setup.
 
 Exports:
 

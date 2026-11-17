@@ -265,6 +265,17 @@ class NightlyProductStatusTests(unittest.TestCase):
         self.connector._fetch_inventory_snapshot.assert_not_called()
         self.assertEqual(self._persisted()["pending_product_status_reconcile_date"], "2026-09-13")
 
+    def test_manual_scan_reads_full_inventory_even_when_daily_scan_is_complete(self) -> None:
+        self.state['last_full_reconcile_date'] = '2026-09-14'
+        self.state['last_product_status_reconcile_date'] = '2026-09-14'
+        self.state['quantities']['ABC'] = {'canonical': 0, 'pos_seen': 0, 'shop_seen': 0}
+        self.snapshot['items'][0]['quantity'] = 0
+        save_state(self.connector.state_path, self.state)
+        self.connector.run_cycle(force_full=True)
+        self.load_products.assert_called_once()
+        self.connector._fetch_inventory_snapshot.assert_called_once()
+        self.connector.session.post.assert_not_called()
+
     def test_dry_run_does_not_send_or_record_status_pass(self) -> None:
         before = self.connector.state_path.read_text(encoding="utf-8")
         self.connector.dry_run = True

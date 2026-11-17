@@ -14,6 +14,7 @@ const state = {
   refreshing: false,
   rotating: false,
   testing: false,
+  forcing: false,
 }
 
 document.addEventListener("DOMContentLoaded", () => boot())
@@ -30,6 +31,11 @@ document.addEventListener("click", async (event) => {
   const copyButton = event.target.closest("[data-copy]")
   if (copyButton) {
     await copyValue(copyButton.dataset.copy || "")
+    return
+  }
+
+  if (event.target.closest("[data-force-sync]")) {
+    await forceSync()
     return
   }
 
@@ -82,6 +88,23 @@ async function refreshBridge(showMessage) {
     if (showMessage) showToast(error.message, "error")
   } finally {
     state.refreshing = false
+    render()
+  }
+}
+
+async function forceSync() {
+  state.forcing = true
+  render()
+  try {
+    const request = await fetchJson("/api/connector/force-sync", {
+      method: "POST", headers: { "X-Requested-With": "pos-bridge" },
+    })
+    state.bridge = { ...state.bridge, force_sync: request }
+    showToast("Full inventory check queued. The connector will also check customers.", "success")
+  } catch (error) {
+    showToast(error.message, "error")
+  } finally {
+    state.forcing = false
     render()
   }
 }
@@ -161,8 +184,11 @@ function renderOverview() {
   const connector = state.bridge?.connector || {}
   const inventory = state.bridge?.inventory || {}
   const orders = state.bridge?.orders || {}
+  const customers = state.bridge?.customers || {}
   const prices = state.bridge?.prices || {}
   const bridgeActive = connector.active === true
+  const forceRequest = state.bridge?.force_sync || {}
+  const forcePending = Boolean(forceRequest.request_id && !forceRequest.completed_at)
   const setupNeeded = orders.authorized === false
   const storeName = state.config?.shop_name || state.config?.shop || "Your store"
 
@@ -173,11 +199,14 @@ function renderOverview() {
           <p class="kicker">Store overview <span aria-hidden="true">/</span> ${escapeHtml(storeName)}</p>
           <h1>${bridgeActive ? "Your store, connected." : "Let’s get you connected."}</h1>
           <p>${bridgeActive
-            ? "Your connector is checking in. Follow inventory and order activity below."
-            : "The Windows connector has not checked in during the last 8 minutes."}</p>
+            ? "Your connector is checking in. Follow inventory, order, and customer activity below."
+            : "No connector check-in received in the last 8 minutes. Check the Windows scheduled task and connector log."}</p>
         </div>
         <div class="welcome-actions">
-          ${statusBadge(bridgeActive ? "Active" : "Offline", bridgeActive ? "success" : "danger", true)}
+          ${statusBadge(bridgeActive ? "Connected" : "No check-in", bridgeActive ? "success" : "danger", true)}
+          <button class="button" type="button" data-force-sync ${state.forcing || forcePending ? "disabled" : ""}>
+            ${icon("refresh", state.forcing ? "is-spinning" : "")} ${state.forcing ? "Requesting…" : forcePending ? "Sync queued" : "Force sync"}
+          </button>
           <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>
             ${icon("refresh", state.refreshing ? "is-spinning" : "")} ${state.refreshing ? "Checking…" : "Refresh"}
           </button>
@@ -186,7 +215,9 @@ function renderOverview() {
       </div>
 
       ${state.error ? `<div class="notice danger">Status could not be loaded. ${escapeHtml(state.error.message)}</div>` : ""}
+      ${forcePending ? `<div class="notice neutral">Full inventory check and customer scan requested. ${bridgeActive ? "Waiting for the connector’s next check-in; long-running jobs finish first." : "Queued until the Windows connector reconnects."}</div>` : forceRequest.completed_at ? `<div class="notice neutral">Last forced inventory scan finished ${escapeHtml(relativeTime(forceRequest.completed_at))}. Failed adjustments continue to retry.</div>` : ""}
       ${setupNeeded ? `<div class="notice warning"><strong>Order access needs approval.</strong> Reopen or reinstall the Shopify app once so Shopify can approve the read_orders permission.</div>` : ""}
+      ${customers.enabled && customers.authorized === false ? `<div class="notice warning"><strong>Customer access needs approval.</strong> Add read_customers and write_customers to APP_SCOPES and reopen the Shopify install flow to grant access.</div>` : ""}
 
       <div class="status-grid">
         ${renderStatusCard({
@@ -196,9 +227,9 @@ function renderOverview() {
           activeText: "Inventory bridge is active",
           inactiveText: "No recent inventory check-in",
           detail: inventory.active
-            ? `${number(inventory.queued_changes)} Shopify change${number(inventory.queued_changes) === 1 ? "" : "s"} waiting for the POS`
-            : "Start the Windows scheduled task to reconnect.",
-          lastSeen: connector.last_seen_at,
+            ? `Checks every ${syncIntervalLabel(connector.sync_interval_seconds)}. ${number(inventory.queued_changes)} Shopify change${number(inventory.queued_changes) === 1 ? "" : "s"} waiting for the POS`
+            : bridgeActive ? "Connector is connected, but inventory polling is delayed. Check its log for a long-running job or errors." : "Start the Windows scheduled task to reconnect.",
+          lastSeen: inventory.last_poll_at,
         })}
         ${renderStatusCard({
           icon: "orders",
@@ -208,6 +239,17 @@ function renderOverview() {
           inactiveText: orders.authorized === false ? "Order access needs approval" : "No recent order check-in",
           detail: `${number(orders.queued_orders)} order${number(orders.queued_orders) === 1 ? "" : "s"} waiting to be written to the POS computer`,
           lastSeen: orders.last_poll_at,
+        })}
+        ${renderStatusCard({
+          icon: "customers",
+          title: "Customer sync · POS → Shopify",
+          active: customers.enabled && customers.authorized && customers.active,
+          activeText: "Customer connector is checking in",
+          inactiveText: !customers.enabled ? "Customer sync is off" : customers.authorized === false ? "Customer access needs approval" : "No recent customer check-in",
+          detail: customers.enabled
+            ? `Checks every ${syncIntervalLabel(customers.interval_seconds || 60)} and adds missing POS customers. Existing Shopify customers stay unchanged. Failed imports are retried; check the connector log for results.`
+            : "Update the Windows connector and enable CUSTOMER_SYNC_ENABLED to send POS customers to Shopify.",
+          lastSeen: customers.last_poll_at,
         })}
       </div>
 
@@ -220,7 +262,7 @@ function renderOverview() {
           <span class="panel-label">POS <span aria-hidden="true">→</span> Shopify</span>
         </div>
         ${renderInventoryChangeList(inventory.recent || [])}
-        <div class="panel-footer">Latest 10 successful quantity updates <span>Refreshes automatically</span></div>
+        <div class="panel-footer">Latest 10 successful quantity updates <span>POS checks every ${syncIntervalLabel(connector.sync_interval_seconds)} · Display refreshes every 30 seconds</span></div>
       </section>
 
       <div class="activity-grid">
@@ -356,7 +398,8 @@ function renderInventoryChangeList(items) {
           <div class="order-main">
             <span class="order-icon" aria-hidden="true">${change.delta > 0 ? "+" : "−"}</span>
             <div>
-              <strong>SKU ${escapeHtml(change.sku)}</strong>
+              <strong>${escapeHtml(change.product_title || `SKU ${change.sku}`)}</strong>
+              ${change.product_title ? `<small>SKU ${escapeHtml(change.sku)}${change.variant_title && change.variant_title !== "Default Title" ? ` · ${escapeHtml(change.variant_title)}` : ""}</small>` : ""}
               <small>${escapeHtml(formatDate(change.changed_at))}</small>
             </div>
           </div>
@@ -400,6 +443,7 @@ function renderPriceChangeList(items) {
 
 function renderSettings() {
   const connection = state.connection
+  const connector = state.bridge?.connector || {}
   return `
     <section class="page narrow">
       <div class="page-head">
@@ -433,7 +477,7 @@ function renderSettings() {
       </section>
 
       <div class="notice neutral">
-        Inventory and POS price changes are checked every 3 minutes. A full inventory reconciliation runs nightly. Order payloads are removed from Railway after the Windows connector confirms they were written.
+        Inventory and POS price changes are checked every ${syncIntervalLabel(connector.sync_interval_seconds)}. The updated connector sends a separate heartbeat every 30 seconds. Customer sync checks every ${syncIntervalLabel(connector.customer_sync_interval_seconds || 60)} when enabled and adds missing POS customers to Shopify. Existing Shopify customer details stay unchanged. A full inventory reconciliation runs nightly. Order payloads are removed from Railway after the Windows connector confirms they were written.
       </div>
     </section>
   `
@@ -446,6 +490,14 @@ function settingRow(label, value) {
       <button type="button" data-copy="${escapeAttribute(value || "")}" ${value ? "" : "disabled"}>Copy</button>
     </div>
   `
+}
+
+function syncIntervalLabel(value) {
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds) || seconds <= 0) return "configured interval"
+  return seconds % 60 === 0
+    ? `${seconds / 60} minute${seconds === 60 ? "" : "s"}`
+    : `${seconds} seconds`
 }
 
 function statusBadge(text, tone, large = false) {
@@ -479,6 +531,7 @@ function icon(name, className = "") {
     refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-2l2 2M4 17l2 2a7 7 0 0 0 12-2"/>',
     inventory: '<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9M7 5.8l9 5"/>',
     orders: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3ZM9 8h6M9 12h6"/>',
+    customers: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 15a5 5 0 0 1 3 4v2"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     check: '<path d="m6 12 4 4 8-8"/>',
     arrow: '<path d="M4 12h16m-5-5 5 5-5 5"/>',
