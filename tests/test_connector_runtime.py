@@ -23,6 +23,7 @@ class ConnectorRuntimeTests(unittest.TestCase):
             "SHOPIFY_SYNC_BASE_URL=https://sync.example",
             "SHOPIFY_SYNC_API_KEY=test-key",
             "SHOPIFY_SYNC_API_SECRET=test-secret",
+            "ORDER_SYNC_ENABLED=false",
             f"CONNECTOR_DATA_DIR={directory / 'state'}",
         ]), encoding="utf-8")
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -81,6 +82,40 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.assertNotIn("Updated", state_text)
         self.assertEqual(len(json.loads(state_text)["customer_hashes"]), 2)
         self.assertFalse(self.connector.state_path.exists())
+
+    def test_customer_reader_skips_unchanged_files_and_rescans_after_shipping_changes(self) -> None:
+        self.connector.dbf_dir.mkdir()
+        (self.connector.dbf_dir / 'Customer.dbf').write_bytes(b'customer')
+        self.connector._sync_customers(self.session)
+        self.connector._sync_customers(self.session)
+        self.loader.assert_called_once()
+        self.assertEqual(self.session.get.call_count, 2)
+
+        (self.connector.dbf_dir / 'CustShip.dbf').write_bytes(b'new address')
+        self.connector._sync_customers(self.session)
+        self.connector._sync_customers(self.session, force_scan=True)
+        self.assertEqual(self.loader.call_count, 3)
+        self.session.post.assert_called_once()
+
+    def test_price_reader_retries_an_unconfirmed_change_before_skipping_unchanged_file(self) -> None:
+        self.connector.dbf_dir.mkdir()
+        (self.connector.dbf_dir / 'pricechg.dbf').write_bytes(b'changed price')
+        state = {'price_snapshot': {'101': '10.00'}}
+        failure = mock.Mock(status_code=200)
+        failure.json.return_value = {'results': [{'source_sku': '101', 'success': False}]}
+        success = mock.Mock(status_code=200)
+        success.json.return_value = {'results': [{'source_sku': '101', 'success': True}]}
+        with (
+            mock.patch.object(connector_module, 'read_pos_price_snapshot', return_value={'101': '12.00'}) as read,
+            mock.patch.object(self.connector.session, 'post', side_effect=[failure, success]) as post,
+        ):
+            self.connector._sync_pos_price_changes(state)
+            self.assertEqual(state['price_snapshot'], {'101': '10.00'})
+            self.connector._sync_pos_price_changes(state)
+            self.connector._sync_pos_price_changes(state)
+        self.assertEqual(state['price_snapshot'], {'101': '12.00'})
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(post.call_count, 2)
 
     def test_reads_real_customer_dbf_and_sends_contact_payload(self) -> None:
         self.connector.dbf_dir.mkdir()
@@ -162,10 +197,12 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.assertEqual(self.session.post.call_count, 1)
         self.assertEqual(json.loads(self.connector.customer_state_path.read_text())["customer_hashes"], {})
 
-    def test_heartbeat_continues_while_inventory_cycle_is_blocked(self) -> None:
+    def test_heartbeat_and_orders_continue_while_inventory_cycle_is_blocked(self) -> None:
         self.connector.customer_sync_enabled = False
+        self.connector.order_sync_enabled = True
         cycle_started = Event()
         heartbeat_received = Event()
+        orders_polled = Event()
         threads = []
 
         def send_heartbeat(session: requests.Session) -> None:
@@ -173,13 +210,20 @@ class ConnectorRuntimeTests(unittest.TestCase):
             threads.append(current_thread())
             heartbeat_received.set()
 
+        def poll_orders(session: requests.Session) -> None:
+            self.assertTrue(cycle_started.wait(timeout=2))
+            self.assertIsNot(session, self.connector.session)
+            orders_polled.set()
+
         def blocked_cycle() -> None:
             cycle_started.set()
             self.assertTrue(heartbeat_received.wait(timeout=2))
+            self.assertTrue(orders_polled.wait(timeout=2))
             raise KeyboardInterrupt()
 
         with (
             mock.patch.object(self.connector, "_send_heartbeat", side_effect=send_heartbeat),
+            mock.patch.object(self.connector, "_sync_order_inbox", side_effect=poll_orders),
             mock.patch.object(self.connector, "run_cycle", side_effect=blocked_cycle),
         ):
             with self.assertRaises(KeyboardInterrupt):

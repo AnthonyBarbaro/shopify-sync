@@ -49,7 +49,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.2"
+CONNECTOR_VERSION = "1.3"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -166,6 +166,7 @@ class Connector:
         self._sync_request_id: Optional[str] = None
         self._sync_wakeup = Event()
         self._customer_wakeup = Event()
+        self._customer_source_stamp: tuple[str, str | None] | None = None
         self.nightly_full_sync_hour = env_int("NIGHTLY_FULL_SYNC_HOUR", 0, minimum=0, maximum=23)
         self.batch_size = env_int("CONNECTOR_BATCH_SIZE", 25, minimum=1, maximum=100)
         self.workers = env_int("CONNECTOR_WORKERS", 2, minimum=1, maximum=4)
@@ -208,7 +209,6 @@ class Connector:
         self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 250, minimum=100, maximum=500)
         self.order_dbfs_initialized = False
         self.order_bridge_status_checked = False
-        self.last_order_poll_monotonic = 0.0
         self.writeback_mode = (os.getenv("POS_WRITEBACK_MODE") or "disabled").strip().lower()
         if self.writeback_mode not in {"disabled", "dry-run", "vfp-oledb"}:
             raise ValueError("POS_WRITEBACK_MODE must be disabled, dry-run, or vfp-oledb")
@@ -259,6 +259,8 @@ class Connector:
         workers: List[Thread] = []
         if not once:
             workers.append(Thread(target=self._heartbeat_loop, args=(stop,), daemon=True))
+            if self.order_sync_enabled:
+                workers.append(Thread(target=self._order_loop, args=(stop,), daemon=True))
             if self.customer_sync_enabled:
                 workers.append(Thread(target=self._customer_loop, args=(stop,), daemon=True))
             for worker in workers:
@@ -272,6 +274,8 @@ class Connector:
                         self._send_heartbeat(self.session)
                     except requests.RequestException:
                         self.logger.warning("connector_heartbeat_failed")
+                    if self.order_sync_enabled:
+                        self._sync_order_inbox()
                 failed = False
                 with self._sync_request_lock:
                     request_id = self._sync_request_id
@@ -306,6 +310,7 @@ class Connector:
             json={
                 "version": CONNECTOR_VERSION,
                 "sync_interval_seconds": self.interval_seconds,
+                "order_sync_enabled": self.order_sync_enabled,
                 "customer_sync_enabled": self.customer_sync_enabled and not self.dry_run,
                 "customer_sync_interval_seconds": self.customer_sync_interval_seconds,
             },
@@ -346,15 +351,24 @@ class Connector:
         with requests.Session() as session:
             session.headers.update(self.session.headers)
             while not stop.is_set():
-                self._customer_wakeup.clear()
+                with self._sync_request_lock:
+                    force_scan = self._customer_wakeup.is_set()
+                    self._customer_wakeup.clear()
                 try:
-                    self._sync_customers(session)
+                    self._sync_customers(session, force_scan=force_scan)
                 except Exception:
                     # Responses can contain customer contact data; do not log them.
                     self.logger.warning("customer_sync_failed; check customer access and POS files")
                 self._customer_wakeup.wait(self.customer_sync_interval_seconds)
 
-    def _sync_customers(self, session: requests.Session) -> None:
+    def _order_loop(self, stop: Event) -> None:
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            while not stop.is_set():
+                self._sync_order_inbox(session)
+                stop.wait(self.interval_seconds)
+
+    def _sync_customers(self, session: requests.Session, *, force_scan: bool = False) -> None:
         if not self.customer_sync_enabled:
             return
         if not self.dry_run:
@@ -363,6 +377,13 @@ class Connector:
             if response.json().get("authorized") is not True:
                 self.logger.warning("customer_sync_needs_read_customers_and_write_customers; reauthorize Shopify app")
                 return
+
+        customer_stamp = dbf_file_stamp(dbf_pos_sync.find_dbf_file(self.dbf_dir, "Customer.dbf", recursive=True))
+        shipping_stamp = dbf_file_stamp(dbf_pos_sync.find_dbf_file(self.dbf_dir, "CustShip.dbf", recursive=True))
+        source_stamp = (customer_stamp, shipping_stamp) if customer_stamp else None
+        if not self.dry_run and not force_scan and source_stamp and source_stamp == self._customer_source_stamp:
+            return
+        self._customer_source_stamp = None
 
         payloads, _audits, _stats = dbf_pos_sync.load_customers(SimpleNamespace(
             dbf_dir=str(self.dbf_dir), customer_scope="primary",
@@ -424,6 +445,8 @@ class Connector:
                     fingerprints[entry["identity"]] = entry["fingerprint"]
                     succeeded += 1
             save_state(self.customer_state_path, state)
+        if scanned == len(payloads) and succeeded == len(changed):
+            self._customer_source_stamp = source_stamp
         self.logger.info("customer_sync_checked pending_in_batch=%s succeeded=%s", len(changed), succeeded)
 
     def run_cycle(self, *, force_full: bool = False) -> None:
@@ -445,9 +468,6 @@ class Connector:
                     state,
                     excluded_skus=protected_pending_skus,
                 )
-
-        if self.order_sync_enabled:
-            self._sync_order_inbox()
 
         inventory_changes = self._fetch_inventory_changes()
         event_skus, event_file_reset = self._collect_pos_event_skus(state)
@@ -699,7 +719,7 @@ class Connector:
                 )
 
         if self.price_sync_enabled:
-            self._sync_pos_price_changes(state)
+            self._sync_pos_price_changes(state, force_scan=full_reconcile)
 
         ready_structure_repairs: List[Dict[str, Any]] = []
         if (
@@ -1209,6 +1229,20 @@ class Connector:
             self.logger.warning("new_product_scan_missing file=Item.dbf")
             return set()
 
+        source_stamp = dbf_file_stamp(item_path)
+        now_epoch = int(time.time())
+        due_probe = any(
+            now_epoch >= int(value or 0)
+            for value in (state.get("matrix_structure_probe_not_before") or {}).values()
+        )
+        if (
+            source_stamp and source_stamp == state.get("catalog_source_stamp")
+            and not state.get("pending_catalog_products")
+            and not state.get("matrix_structure_probe_skus")
+            and not due_probe
+        ):
+            return set()
+
         item_rows = list(dbf_pos_sync.iter_dbf_rows(item_path))
         item_skus = [
             str(row.get("SKU") or "").strip()
@@ -1238,7 +1272,6 @@ class Connector:
         for sku in list(probe_not_before):
             if sku not in matrix_bases_without_children:
                 probe_not_before.pop(sku, None)
-        now_epoch = int(time.time())
         structure_probe_skus = {
             sku
             for sku in matrix_bases_without_children
@@ -1278,6 +1311,7 @@ class Connector:
                 high_water,
                 ",".join(sorted(detected_candidates, key=int)),
             )
+        state["catalog_source_stamp"] = source_stamp
         return candidates
 
     def _collect_pos_event_skus(self, state: Dict[str, Any]) -> tuple[set[str], bool]:
@@ -1368,11 +1402,6 @@ class Connector:
                 total_products,
                 len(succeeded),
             )
-            if (
-                self.order_sync_enabled
-                and time.monotonic() - self.last_order_poll_monotonic >= self.interval_seconds
-            ):
-                self._sync_order_inbox()
         return succeeded
 
     def _fetch_inventory_changes(self) -> List[Dict[str, Any]]:
@@ -1517,11 +1546,6 @@ class Connector:
                         result.get("status"),
                         result.get("message"),
                     )
-            if (
-                self.order_sync_enabled
-                and time.monotonic() - self.last_order_poll_monotonic >= self.interval_seconds
-            ):
-                self._sync_order_inbox()
         return summary
 
     def _ready_matrix_structure_repairs(
@@ -1948,11 +1972,17 @@ class Connector:
                 ",".join(sorted(cleared, key=str.casefold)),
             )
 
-    def _sync_pos_price_changes(self, state: Dict[str, Any]) -> None:
+    def _sync_pos_price_changes(self, state: Dict[str, Any], *, force_scan: bool = False) -> None:
+        price_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "pricechg.dbf", recursive=True)
+        source_stamp = dbf_file_stamp(price_path)
+        if not force_scan and source_stamp and source_stamp == state.get("price_source_stamp"):
+            return
+        state.pop("price_source_stamp", None)
         current_snapshot = read_pos_price_snapshot(self.dbf_dir)
         previous_snapshot = state.get("price_snapshot")
         if not isinstance(previous_snapshot, dict):
             state["price_snapshot"] = current_snapshot
+            state["price_source_stamp"] = source_stamp
             if not self.dry_run:
                 save_state(self.state_path, state)
             self.logger.info(
@@ -1969,6 +1999,7 @@ class Connector:
         if not changes:
             # Keep the snapshot aligned if the POS purges old price-change rows.
             state["price_snapshot"] = current_snapshot
+            state["price_source_stamp"] = source_stamp
             return
 
         self.logger.info(
@@ -2037,9 +2068,12 @@ class Connector:
                 result.get("message") or "No result returned.",
             )
         state["price_snapshot"] = retry_snapshot
+        if retry_snapshot == current_snapshot:
+            state["price_source_stamp"] = source_stamp
         save_state(self.state_path, state)
 
-    def _sync_order_inbox(self) -> None:
+    def _sync_order_inbox(self, session: requests.Session | None = None) -> None:
+        session = self.session if session is None else session
         try:
             if not self.dry_run and not self.order_dbfs_initialized:
                 migrated_from: Optional[Path] = None
@@ -2071,7 +2105,7 @@ class Connector:
                 )
             if not self.order_bridge_status_checked:
                 try:
-                    status_response = self.session.get(
+                    status_response = session.get(
                         f"{self.base_url}/sync/orders/status",
                         timeout=self.timeout,
                     )
@@ -2088,7 +2122,7 @@ class Connector:
                     self.logger.exception("order_bridge_status_failed")
                 finally:
                     self.order_bridge_status_checked = True
-            response = self.session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
+            response = session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
             response.raise_for_status()
             changes = list(response.json().get("items") or [])
             self.logger.info(
@@ -2139,7 +2173,7 @@ class Connector:
                     for change in delivered_changes
                 ]
             }
-            ack = self.session.post(
+            ack = session.post(
                 f"{self.base_url}/sync/orders/changes/ack",
                 json=payload,
                 timeout=self.timeout,
@@ -2153,11 +2187,8 @@ class Connector:
                 self.order_detail_path,
             )
         except Exception:
-            # Order intake must not prevent inventory reconciliation. Railway keeps
-            # unacknowledged changes for a later retry.
+            # Railway keeps unacknowledged changes for a later retry.
             self.logger.exception("order_inbox_sync_failed")
-        finally:
-            self.last_order_poll_monotonic = time.monotonic()
 
     def _acknowledge_inventory_changes(self, changes: List[Dict[str, Any]]) -> None:
         payload = {
@@ -2430,6 +2461,17 @@ def nightly_full_sync_due(last_date: Any, *, now: datetime, hour: int) -> bool:
     if now.hour < max(0, min(23, int(hour))):
         return False
     return str(last_date or "") != now.date().isoformat()
+
+
+def dbf_file_stamp(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        # Without reliable metadata, let the existing reader check the file.
+        return None
+    return f"{datetime.now().date()}:{path}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}"
 
 
 def dbf_record_count(path: Path) -> int:

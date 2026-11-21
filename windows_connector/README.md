@@ -3,8 +3,9 @@
 This connector runs continuously on the Windows POS computer. It checks the live POS event tables
 every 30 seconds by default but sends no DBF files or ZIP archives to Railway. A separate heartbeat
 also runs every 30 seconds, including during long inventory jobs. The dashboard refreshes every
-30 seconds and shows inventory, order, and customer check-ins independently. A missing check-in
-reports connector communication, not the computer's internet connection.
+30 seconds and shows inventory, order, and customer check-ins independently. Order delivery runs in
+its own worker, so it can keep polling during a long inventory job. Each check-in records a request
+reaching the server. The Customers tab shows recent import outcomes by POS customer number.
 
 ## Sync behavior
 
@@ -18,11 +19,13 @@ reports connector communication, not the computer's internet connection.
 4. Every 30 seconds by default it reads only records newly appended to `invdtl.dbf` and `editvoid.dbf`.
    Those rows identify affected base SKUs; the connector then rereads their authoritative current
    quantities from the product tables. It deliberately does not read `invdtl1.dbf` or `meditvd.dbf`.
-   It also checks the current numeric SKU sequence in `Item.dbf`. A SKU above the saved five-digit
+   It checks the numeric SKU sequence when `Item.dbf` changes or a product check is pending.
+   A SKU above the saved five-digit
    high-water mark is held until its entire catalog payload is identical on two consecutive scans,
    then uploaded once as a new product. If the clerk is still editing a copied product, any changed
    field resets that stability check.
-   It also compares the latest rows in `pricechg.dbf` with a small local snapshot. The first updated
+   It compares `pricechg.dbf` with a small local snapshot when the file changes or a price needs to
+   retry. The first updated
    run establishes a baseline without replaying historical price changes; later changes update only
    the exact Shopify variant price. A base matrix SKU updates all of its matrix variants.
 5. At the first cycle at or after local midnight, it performs one full POS quantity reconciliation
@@ -100,8 +103,9 @@ results. The server separately caps its feed and request history using
 
 ## Customer sync
 
-Customer sync is append-only from the POS to Shopify. The connector reads the primary `Customer.dbf`
-and its associated shipping addresses every 60 seconds in a separate worker. The first import
+Customer sync is append-only from the POS to Shopify. A separate worker checks the `Customer.dbf`
+and `CustShip.dbf` file metadata every 60 seconds. It reads the records after a file change, when
+work remains, at the first check of a new day, or when a scan is requested. The first import
 processes up to 50 customers per pass, in requests of at most ten. It then submits only records
 whose POS payload has changed. The backend checks POS ID, email, and phone before creating a missing
 customer. A matched Shopify customer stays unchanged, including names, contacts, addresses, notes,
@@ -126,8 +130,8 @@ Enable the customer permissions on Railway and in Shopify before upgrading Windo
 
 `--dry-run` reads customers without sending them or advancing their hashes. Inventory jobs and
 customer uploads use separate sessions and state files. Customer upload failures do not stop
-inventory. The Overview shows customer authorization and check-ins; aggregate upload results are
-in the Windows log. A check-in confirms communication, so check the log for failed import counts.
+inventory. The Customers tab shows check-ins and recent import results. The Windows log has
+aggregate results for each batch.
 Recurring uploads omit contact payloads from request/feed logs. Contact details are not stored in
 `customers.json`.
 

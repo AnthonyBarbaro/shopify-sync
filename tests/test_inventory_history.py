@@ -13,7 +13,7 @@ from starlette.requests import Request
 
 from app.config import Settings
 from app.db import DatabaseStore, ShopRecord
-from app.models import ConnectorHeartbeatRequest
+from app.models import ConnectorHeartbeatRequest, CustomerBulkSyncResponse, CustomerSyncResult
 from app.shopify import ShopifyClient
 from app.utils import utc_now
 
@@ -217,6 +217,43 @@ class InventoryHistoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(heartbeat['last_inventory_poll_at'])
         self.assertIsNone(heartbeat['last_order_poll_at'])
         self.assertIsNone(self.store.get_connector_heartbeat(shop_domain='other.myshopify.com')['last_seen_at'])
+
+    async def test_customer_history_reports_outcomes_without_exposing_contact_details(self) -> None:
+        now = utc_now().isoformat()
+        rows = [
+            CustomerSyncResult(pos_customer_number='101', success=True, message='Created',
+                               timestamp=now, details={'created': True}, email='private@example.test'),
+            CustomerSyncResult(pos_customer_number='102', success=True, message='Matched',
+                               timestamp=now, details={'skipped_existing': True}),
+            CustomerSyncResult(pos_customer_number='103', success=False, message='private@example.test',
+                               timestamp=now),
+        ]
+        result = CustomerBulkSyncResponse(total=3, succeeded=2, failed=1, timestamp=now, results=rows)
+        request = Request({'type': 'http', 'path': '/sync/customers', 'method': 'POST', 'headers': []})
+        self.store.record_feed_event(
+            shop_domain=self.shop.shop_domain, source='test', endpoint='/sync/customers', method='POST',
+            sku='100', title=None, success=True, message='Customer synced successfully.', product_id=None,
+            variant_id=None, request_payload='', normalized_payload=None,
+        )
+        with (
+            mock.patch.object(self.main, 'parse_external_request_payload', new=mock.AsyncMock(return_value=[
+                {'pos_customer_number': row.pos_customer_number} for row in rows
+            ])),
+            mock.patch.object(self.main, 'run_with_shop_retry', return_value=result),
+            mock.patch.object(self.main, 'run_in_threadpool', side_effect=lambda fn, *args: fn(*args)),
+            mock.patch.object(self.main, '_get_session_context', return_value=(self.shop, {})) as session,
+            mock.patch.object(self.main, 'get_granted_access_scopes', return_value=[]),
+        ):
+            await self.main.sync_customers(request, self.shop)
+            payload = json.loads((await self.main.bridge_status(request)).body)
+            recent = payload['customers']['recent']
+            self.assertEqual([(row['pos_customer_number'], row['outcome']) for row in recent], [
+                ('103', 'failed'), ('102', 'matched'), ('101', 'created'), ('100', 'processed'),
+            ])
+            self.assertTrue(all(set(row) == {'pos_customer_number', 'outcome', 'received_at'} for row in recent))
+            session.return_value = (replace(self.shop, shop_domain='other.myshopify.com'), {})
+            other = json.loads((await self.main.bridge_status(request)).body)
+            self.assertEqual(other['customers']['recent'], [])
 
     async def test_legacy_history_names_are_loaded_once_and_unknown_skus_are_throttled(self) -> None:
         for sku in ['123', 'missing']:

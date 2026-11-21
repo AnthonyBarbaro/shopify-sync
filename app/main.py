@@ -119,6 +119,12 @@ REQUEST_LOG_MASK_KEYS = {
     "oauth_signature",
     "x-api-secret",
 }
+CUSTOMER_CREATED_MESSAGE = "Customer added successfully."
+CUSTOMER_MATCHED_MESSAGE = "Existing Shopify customer matched."
+CUSTOMER_OUTCOME_BY_MESSAGE = {
+    CUSTOMER_CREATED_MESSAGE: "created",
+    CUSTOMER_MATCHED_MESSAGE: "matched",
+}
 
 
 def ensure_inventory_webhook(shop: ShopRecord) -> None:
@@ -1524,6 +1530,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 
 @app.get("/app", include_in_schema=False)
 @app.get("/app/orders", include_in_schema=False)
+@app.get("/app/customers", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
 @app.get("/app/pos-archive", include_in_schema=False)
@@ -1696,8 +1703,18 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
                 "active": is_active(heartbeat.get("last_customer_poll_at")),
                 "last_poll_at": heartbeat.get("last_customer_poll_at"),
                 "interval_seconds": connector_settings.get("customer_sync_interval_seconds", 60),
+                "recent": [
+                    {
+                        "pos_customer_number": row["pos_customer_number"],
+                        "outcome": CUSTOMER_OUTCOME_BY_MESSAGE.get(row["message"], "processed")
+                        if row["success"] else "failed",
+                        "received_at": row["received_at"],
+                    }
+                    for row in db.list_recent_customer_sync_events(shop.shop_domain)
+                ],
             },
             "orders": {
+                "enabled": connector_settings.get("order_sync_enabled"),
                 "active": is_active(heartbeat["last_order_poll_at"]),
                 "authorized": "read_orders" in scopes,
                 "last_poll_at": heartbeat["last_order_poll_at"],
@@ -2484,6 +2501,14 @@ async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord
     )
     db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="customers")
     for row in result.results:
+        if not row.success:
+            message = "Customer sync failed."
+        elif row.details.get("created") is True:
+            message = CUSTOMER_CREATED_MESSAGE
+        elif row.details.get("skipped_existing") is True:
+            message = CUSTOMER_MATCHED_MESSAGE
+        else:
+            message = "Customer synced successfully."
         db.record_feed_event(
             shop_domain=shop.shop_domain,
             source=source,
@@ -2492,7 +2517,7 @@ async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord
             sku=row.pos_customer_number,
             title=None,
             success=row.success,
-            message="Customer synced successfully." if row.success else "Customer sync failed.",
+            message=message,
             product_id=row.customer_id,
             variant_id=None,
             request_payload=None,
@@ -2692,7 +2717,7 @@ def connector_heartbeat(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
     db.record_connector_heartbeat(
-        shop_domain=shop.shop_domain, channel="connector", metadata=payload.model_dump(),
+        shop_domain=shop.shop_domain, channel="connector", metadata=payload.model_dump(exclude_none=True),
     )
     sync_request = db.get_connector_sync_request(shop_domain=shop.shop_domain)
     return JSONResponse({

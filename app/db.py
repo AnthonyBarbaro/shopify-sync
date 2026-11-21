@@ -986,6 +986,20 @@ class DatabaseStore:
             ).fetchall()
         return [self._row_to_feed_event(row) for row in rows]
 
+    def list_recent_customer_sync_events(self, shop_domain: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sku AS pos_customer_number, success, message, received_at
+                FROM feed_events
+                WHERE shop_domain = ? AND endpoint = '/sync/customers'
+                ORDER BY received_at DESC, id DESC
+                LIMIT 20
+                """,
+                (shop_domain,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def feed_event_count(self, shop_domain: str) -> int:
         with self._connect() as connection:
             row = connection.execute(

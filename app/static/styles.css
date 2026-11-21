@@ -114,6 +114,8 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .order-row { min-width: 0; padding: 17px 0; border-top: 1px solid #edf1ee; }
 .order-row:first-child { border-top: 0; }
 .order-row > .badge { justify-self: end; }
+.customer-history .order-row { grid-template-columns: minmax(0, 1fr) auto; }
+.customer-history .order-main, .customer-history .order-row > .badge { grid-row: auto; }
 .order-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .order-main > div { min-width: 0; }
 .order-main strong, .order-main small, .order-meta strong, .order-meta small, .price-change strong, .price-change small { display: block; }
@@ -233,7 +235,7 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 }
 @media (max-width: 360px) {
   .tabs a { gap: 5px; font-size: 11px; }
-  .tabs svg { width: 14px; height: 14px; }
+  .tabs svg { display: none; }
   .panel { padding: 16px; }
   .panel-footer { margin: 8px -16px -16px; padding: 12px 16px; }
   .panel-head { align-items: flex-start; flex-direction: column; }

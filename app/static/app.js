@@ -1,7 +1,8 @@
 const routes = {
-  "/app": "Overview",
-  "/app/orders": "Orders",
-  "/app/settings": "Settings",
+  "/app": { title: "Overview", render: renderOverview },
+  "/app/orders": { title: "Orders", render: renderOrders },
+  "/app/customers": { title: "Customers", render: renderCustomers },
+  "/app/settings": { title: "Settings", render: renderSettings },
 }
 
 const state = {
@@ -163,7 +164,7 @@ function navigate(path) {
 function render() {
   const app = document.getElementById("app")
   const route = normalizeRoute(window.location.pathname)
-  document.title = `${routes[route]} · POS Bridge`
+  document.title = `${routes[route].title} · POS Bridge`
   updateTabs(route)
 
   if (route === "/app/settings" && !state.connection && !state.connectionLoading && !state.error) {
@@ -173,11 +174,7 @@ function render() {
     })
   }
 
-  app.innerHTML = route === "/app/orders"
-    ? renderOrders()
-    : route === "/app/settings"
-      ? renderSettings()
-      : renderOverview()
+  app.innerHTML = routes[route].render()
 }
 
 function renderOverview() {
@@ -191,6 +188,7 @@ function renderOverview() {
   const forcePending = Boolean(forceRequest.request_id && !forceRequest.completed_at)
   const setupNeeded = orders.authorized === false
   const storeName = state.config?.shop_name || state.config?.shop || "Your store"
+  const orderQueue = `${number(orders.queued_orders)} order${number(orders.queued_orders) === 1 ? "" : "s"} waiting to be written to the POS computer.`
 
   return `
     <section class="page">
@@ -199,7 +197,7 @@ function renderOverview() {
           <p class="kicker">Store overview <span aria-hidden="true">/</span> ${escapeHtml(storeName)}</p>
           <h1>${bridgeActive ? "Your store, connected." : "Let’s get you connected."}</h1>
           <p>${bridgeActive
-            ? "Your connector is checking in. Follow inventory, order, and customer activity below."
+            ? "The Windows connector is checking in. Each sync channel reports its own activity below."
             : "No connector check-in received in the last 8 minutes. Check the Windows scheduled task and connector log."}</p>
         </div>
         <div class="welcome-actions">
@@ -234,10 +232,12 @@ function renderOverview() {
         ${renderStatusCard({
           icon: "orders",
           title: "Order sync",
-          active: orders.active && orders.authorized,
+          active: orders.enabled !== false && orders.active && orders.authorized,
           activeText: "Order sync is active",
-          inactiveText: orders.authorized === false ? "Order access needs approval" : "No recent order check-in",
-          detail: `${number(orders.queued_orders)} order${number(orders.queued_orders) === 1 ? "" : "s"} waiting to be written to the POS computer`,
+          inactiveText: orders.enabled === false ? "Order sync is off" : orders.authorized === false ? "Order access needs approval" : "No recent order check-in",
+          detail: !orders.active && orders.authorized && bridgeActive && orders.enabled !== false
+            ? `${orders.enabled === true ? "Check the Windows connector log for order inbox errors." : "Older connectors check orders in the inventory loop, so delays can affect both checks."} ${orderQueue}`
+            : orderQueue,
           lastSeen: orders.last_poll_at,
         })}
         ${renderStatusCard({
@@ -247,7 +247,7 @@ function renderOverview() {
           activeText: "Customer connector is checking in",
           inactiveText: !customers.enabled ? "Customer sync is off" : customers.authorized === false ? "Customer access needs approval" : "No recent customer check-in",
           detail: customers.enabled
-            ? `Checks every ${syncIntervalLabel(customers.interval_seconds || 60)} and adds missing POS customers. Existing Shopify customers stay unchanged. Failed imports are retried; check the connector log for results.`
+            ? `Checks every ${syncIntervalLabel(customers.interval_seconds || 60)} and adds missing POS customers. Existing Shopify customers stay unchanged. See the Customers tab for results.`
             : "Update the Windows connector and enable CUSTOMER_SYNC_ENABLED to send POS customers to Shopify.",
           lastSeen: customers.last_poll_at,
         })}
@@ -353,6 +353,76 @@ function renderOrders() {
       </section>
 
     </section>
+  `
+}
+
+function renderCustomers() {
+  const customers = state.bridge?.customers || {}
+  const recent = customers.recent || []
+  const checkIn = customers.last_poll_at
+    ? `Last check-in ${relativeTime(customers.last_poll_at)}`
+    : "No check-in recorded yet"
+  let status = `<div class="notice neutral">${escapeHtml(checkIn)} · Checks every ${syncIntervalLabel(customers.interval_seconds || 60)}</div>`
+  if (customers.enabled === false) {
+    status = `<div class="notice warning">Customer sync is off. Enable <code>CUSTOMER_SYNC_ENABLED</code> on the Windows connector.</div>`
+  } else if (customers.authorized === false) {
+    status = `<div class="notice warning">Customer access needs approval. Grant <code>read_customers</code> and <code>write_customers</code> through the Shopify install flow.</div>`
+  } else if (customers.active === false) {
+    status = `<div class="notice warning">${escapeHtml(checkIn)}. Check the Windows connector log for customer sync errors.</div>`
+  }
+
+  return `
+    <section class="page">
+      <div class="page-head">
+        <div>
+          <p class="kicker">POS <span aria-hidden="true">→</span> Shopify</p>
+          <h1>Customer sync</h1>
+          <p>See which POS customers were added to Shopify, matched to an existing customer, or failed to import.</p>
+        </div>
+        <div class="page-actions">
+          <small>Refreshes every 30 seconds</small>
+          <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>${icon("refresh", state.refreshing ? "is-spinning" : "")} ${state.refreshing ? "Checking…" : "Refresh"}</button>
+        </div>
+      </div>
+
+      ${state.error ? `<div class="notice danger">Customer activity could not be refreshed. ${escapeHtml(state.error.message)}</div>` : status}
+
+      <section class="panel" aria-labelledby="customer-history-heading">
+        <div class="panel-head">
+          <h2 id="customer-history-heading">Recent import results</h2>
+          <span class="panel-label">Latest ${recent.length} ${recent.length === 1 ? "result" : "results"}</span>
+        </div>
+        ${renderCustomerSyncHistory(recent)}
+      </section>
+    </section>
+  `
+}
+
+function renderCustomerSyncHistory(items) {
+  if (!items.length) {
+    return `<div class="empty"><span>${icon("customers")}</span><strong>No customer imports recorded yet</strong><p>Results appear here when the Windows connector submits customer records to Shopify.</p></div>`
+  }
+  const outcomes = {
+    created: ["Added to Shopify", "success"],
+    matched: ["Matched existing", "success"],
+    failed: ["Import failed", "danger"],
+    processed: ["Processed", "success"],
+  }
+  return `
+    <div class="order-list customer-history">
+      ${items.map((item) => `
+        <article class="order-row">
+          <div class="order-main">
+            <span class="order-icon" aria-hidden="true">${icon("customers")}</span>
+            <div>
+              <strong>${item.pos_customer_number ? `POS customer #${escapeHtml(item.pos_customer_number)}` : "POS customer"}</strong>
+              <small>${escapeHtml(formatDate(item.received_at))}</small>
+            </div>
+          </div>
+          ${statusBadge(...(outcomes[item.outcome] || outcomes.processed))}
+        </article>
+      `).join("")}
+    </div>
   `
 }
 
