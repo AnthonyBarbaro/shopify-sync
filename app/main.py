@@ -9,10 +9,10 @@ import zipfile
 from datetime import timedelta, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Any, Callable, List, Tuple, TypeVar
+from typing import Any, Callable, List, Literal, Tuple, TypeVar
 from urllib.parse import parse_qsl, urlencode
 
-from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,6 +54,8 @@ from app.models import (
     PosArchiveUploadResponse,
     ProductSyncRequest,
     RequestLogsResponse,
+    SalesBoardSnapshot,
+    SalesBoardSettings,
     ShopifyConnectionResponse,
     SyncActivityResponse,
     SyncResult,
@@ -217,7 +219,9 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
 
     content_type = (request.headers.get("content-type") or "").lower()
     body_preview: str | None = None
-    if "customer" in effective_path.lower() and request_body:
+    if effective_path.rstrip("/") == "/sync/sales-board" and request_body:
+        body_preview = "[sales board payload omitted]"
+    elif "customer" in effective_path.lower() and request_body:
         body_preview = "[customer payload omitted]"
     elif request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
         if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
@@ -1019,6 +1023,8 @@ def _looks_like_cre_inventory_payload(raw_payload: dict[str, Any], key_lookup: d
 
 
 def _should_log_incoming_request(path: str) -> bool:
+    if path.rstrip("/") == "/sync/sales-board/settings":
+        return False
     return path.startswith("/sync/") or path.startswith("/wc-api/") or path.startswith("/wp-json/wc/")
 
 
@@ -1531,6 +1537,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 @app.get("/app", include_in_schema=False)
 @app.get("/app/orders", include_in_schema=False)
 @app.get("/app/customers", include_in_schema=False)
+@app.get("/app/sales", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
 @app.get("/app/pos-archive", include_in_schema=False)
@@ -1617,6 +1624,58 @@ async def ui_config(request: Request) -> UiConfigResponse:
         location_override=settings.shopify_location_id,
         timestamp=utc_now_iso(),
     )
+
+
+@app.get("/api/sales-board", response_model=None)
+def sales_board(request: Request) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+    snapshot = db.get_sales_board(shop_domain=shop.shop_domain) if board.enabled else None
+    return JSONResponse({"snapshot": snapshot, "settings": board.model_dump()}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/customer-sync-history", response_model=None)
+def customer_sync_history(
+    request: Request, outcome: Literal["created", "matched", "failed"] | None = None,
+    before: int = Query(default=2**63 - 1, ge=1, le=2**63 - 1),
+) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    rows = db.list_customer_sync_history(shop.shop_domain, before=before, outcome=outcome)
+    return JSONResponse({"items": rows[:50], "next_before": rows[49]["id"] if len(rows) > 50 else None},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/sales-board/settings")
+def sales_board_settings(request: Request) -> SalesBoardSettings:
+    shop, _session = _get_session_context(request)
+    return SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+
+
+@app.put("/api/sales-board/settings")
+def update_sales_board_settings(request: Request, board: SalesBoardSettings) -> SalesBoardSettings:
+    shop, _session = _get_session_context(request)
+    if request.headers.get("x-requested-with") != "pos-bridge":
+        raise AuthorizationError("Change Sales Board settings from the POS Bridge dashboard.")
+    db.save_sales_board_settings(shop_domain=shop.shop_domain, **board.model_dump())
+    return board
+
+
+@app.get("/sync/sales-board/settings", response_model=None)
+def connector_sales_board_settings(shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
+    board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+    return JSONResponse({"enabled": board.enabled, "interval_seconds": board.interval_seconds}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/sync/sales-board", response_model=None)
+def publish_sales_board(payload: SalesBoardSnapshot, shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
+    if not SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain)).enabled:
+        return JSONResponse({"saved": False})
+    saved = db.save_sales_board(
+        shop_domain=shop.shop_domain,
+        observed_at=payload.observed_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        payload=payload.model_dump(mode="json"),
+    )
+    return JSONResponse({"saved": saved})
 
 
 @app.get("/api/bridge-status", response_model=None)
@@ -2461,21 +2520,29 @@ async def _handle_external_customer_sync(request: Request, shop: ShopRecord) -> 
 
     normalized = normalize_external_customer_payload(raw_payload)
     result = run_with_shop_retry(shop, lambda active_shop: inventory_service.sync_customer(normalized, active_shop))
+    db.record_customer_sync_history(shop.shop_domain, [_customer_history_event(result)])
     db.record_feed_event(
         shop_domain=shop.shop_domain,
         source=source,
         endpoint=request.url.path,
         method=request.method,
         sku=normalized.pos_customer_number,
-        title=result.name,
+        title=None,
         success=result.success,
-        message=result.message,
+        message=result.failure_reason or ("Customer synced successfully." if result.success else "Customer sync failed."),
         product_id=result.customer_id,
         variant_id=None,
-        request_payload=_serialize_payload(raw_payload),
-        normalized_payload=_serialize_payload(normalized.model_dump(mode="json")),
+        request_payload=None,
+        normalized_payload=None,
     )
     return result
+
+
+def _customer_history_event(row: CustomerSyncResult) -> tuple[str | None, str, str | None]:
+    if not row.success:
+        return row.pos_customer_number, "failed", row.failure_reason or "Customer sync failed."
+    outcome = "created" if row.details.get("created") is True else "matched" if row.details.get("skipped_existing") is True else "processed"
+    return row.pos_customer_number, outcome, None
 
 
 async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord) -> CustomerBulkSyncResponse | JSONResponse:
@@ -2500,6 +2567,7 @@ async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord
         lambda active_shop: inventory_service.sync_customers_bulk(normalized_items, active_shop),
     )
     db.record_connector_heartbeat(shop_domain=shop.shop_domain, channel="customers")
+    db.record_customer_sync_history(shop.shop_domain, [_customer_history_event(row) for row in result.results])
     for row in result.results:
         if not row.success:
             message = "Customer sync failed."

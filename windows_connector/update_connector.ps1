@@ -14,6 +14,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 $files = @(
     "windows_connector/connector.py",
     "windows_connector/order_dbf.py",
+    "windows_connector/sales_board.py",
     "jbarbaro_db/dbf_pos_sync.py",
     "windows_connector/write_pos_quantity.ps1",
     "windows_connector/install.ps1",

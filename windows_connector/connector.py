@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
@@ -31,6 +32,7 @@ sys.path.insert(0, str(POS_READER_DIR))
 import dbf_pos_sync  # noqa: E402
 
 if __package__:
+    from .sales_board import build_sales_board, sales_paths, sales_source_signature
     from .order_dbf import (
         migrate_legacy_sqlite_database,
         money_text,
@@ -39,6 +41,7 @@ if __package__:
         upsert_order_changes,
     )
 else:
+    from sales_board import build_sales_board, sales_paths, sales_source_signature
     from order_dbf import (
         migrate_legacy_sqlite_database,
         money_text,
@@ -49,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.3"
+CONNECTOR_VERSION = "1.4"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -263,6 +266,8 @@ class Connector:
                 workers.append(Thread(target=self._order_loop, args=(stop,), daemon=True))
             if self.customer_sync_enabled:
                 workers.append(Thread(target=self._customer_loop, args=(stop,), daemon=True))
+            if not self.dry_run:
+                workers.append(Thread(target=self._sales_board_loop, args=(stop,), daemon=True))
             for worker in workers:
                 worker.start()
         try:
@@ -368,6 +373,42 @@ class Connector:
                 self._sync_order_inbox(session)
                 stop.wait(self.interval_seconds)
 
+    def _sales_board_loop(self, stop: Event) -> None:
+        snapshot = None
+        signature = None
+        last_sent = None
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            while not stop.is_set():
+                interval = 60
+                try:
+                    config = session.get(f"{self.base_url}/sync/sales-board/settings", timeout=15)
+                    config.raise_for_status()
+                    remote = config.json()
+                    if not remote["enabled"]:
+                        last_sent = None
+                        stop.wait(interval)
+                        continue
+                    interval = min(900, max(30, int(remote["interval_seconds"])))
+                    today = datetime.now().date()
+                    paths = sales_paths(self.dbf_dir)
+                    current = (today, sales_source_signature(paths))
+                    if current != signature:
+                        report = build_sales_board(paths, today=today)
+                        if sales_source_signature(paths) != current[1]:
+                            raise OSError("Sales DBFs changed while reporting; retrying next check.")
+                        snapshot = report
+                        signature = current
+                        last_sent = None
+                    if last_sent is None or time.monotonic() - last_sent >= 300:
+                        snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
+                        response = session.post(f"{self.base_url}/sync/sales-board", json=snapshot, timeout=30)
+                        response.raise_for_status()
+                        last_sent = time.monotonic()
+                except Exception:
+                    self.logger.exception("sales_board_sync_failed")
+                stop.wait(interval)
+
     def _sync_customers(self, session: requests.Session, *, force_scan: bool = False) -> None:
         if not self.customer_sync_enabled:
             return
@@ -425,6 +466,7 @@ class Connector:
             }
         save_state(self.customer_state_path, state)
         succeeded = 0
+        failure_reasons: Counter[str] = Counter()
         for batch in chunks(changed, min(10, self.batch_size)):
             response = session.post(
                 f"{self.base_url}/sync/customers",
@@ -433,6 +475,10 @@ class Connector:
             )
             response.raise_for_status()
             results = response.json().get("results") or []
+            failure_reasons.update(
+                str(row.get("failure_reason") or "Customer import rejected")
+                for row in results if isinstance(row, dict) and row.get("success") is False
+            )
             for entry in batch:
                 payload = entry["payload"]
                 confirmed = any(
@@ -448,6 +494,8 @@ class Connector:
         if scanned == len(payloads) and succeeded == len(changed):
             self._customer_source_stamp = source_stamp
         self.logger.info("customer_sync_checked pending_in_batch=%s succeeded=%s", len(changed), succeeded)
+        if failure_reasons:
+            self.logger.warning("customer_sync_failures %s", dict(failure_reasons))
 
     def run_cycle(self, *, force_full: bool = False) -> None:
         state = load_state(self.state_path)

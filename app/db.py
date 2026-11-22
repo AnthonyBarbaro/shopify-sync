@@ -370,6 +370,39 @@ class DatabaseStore:
             self._ensure_column(connection, "inventory_changes", "version", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "inventory_changes", "source_updated_at", "TEXT")
             self._ensure_column(connection, "inventory_item_skus", "last_quantity", "INTEGER")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sales_board_snapshots (
+                    shop_domain TEXT PRIMARY KEY,
+                    observed_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sales_board_settings (
+                    shop_domain TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    monthly_goal_cents INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_sync_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_domain TEXT NOT NULL,
+                    pos_customer_number TEXT,
+                    outcome TEXT NOT NULL,
+                    reason TEXT,
+                    received_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_customer_history_shop ON customer_sync_history(shop_domain, id DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_customer_history_identity ON customer_sync_history(shop_domain, pos_customer_number, id DESC)")
             self._ensure_column(connection, "connector_heartbeats", "last_customer_poll_at", "TEXT")
             self._ensure_column(connection, "connector_heartbeats", "connector_settings", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "product_title", "TEXT")
@@ -1000,6 +1033,39 @@ class DatabaseStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_customer_sync_history(self, shop_domain: str, events: list[tuple[str | None, str, str | None]]) -> None:
+        try:
+            with self._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO customer_sync_history (shop_domain, pos_customer_number, outcome, reason, received_at)
+                    SELECT ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM (
+                            SELECT outcome, reason FROM customer_sync_history
+                            WHERE shop_domain = ? AND pos_customer_number IS ?
+                            ORDER BY id DESC LIMIT 1
+                        ) WHERE outcome = ? AND reason IS ? AND outcome = 'failed'
+                    )
+                    """,
+                    [(shop_domain, number, outcome, reason, utc_now_iso(), shop_domain, number, outcome, reason)
+                     for number, outcome, reason in events],
+                )
+        except sqlite3.Error:
+            self.logger.exception("customer_history_write_failed")
+
+    def list_customer_sync_history(self, shop_domain: str, *, before: int, outcome: str | None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, pos_customer_number, outcome, reason, received_at FROM customer_sync_history
+                WHERE shop_domain = ? AND id < ? AND (? IS NULL OR outcome = ?)
+                ORDER BY id DESC LIMIT 51
+                """,
+                (shop_domain, before, outcome, outcome),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def feed_event_count(self, shop_domain: str) -> int:
         with self._connect() as connection:
             row = connection.execute(
@@ -1303,6 +1369,46 @@ class DatabaseStore:
                 (shop_domain,),
             ).fetchone()
         return int(row["count"]) if row else 0
+
+    def save_sales_board(self, *, shop_domain: str, observed_at: str, payload: dict[str, Any]) -> bool:
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                INSERT INTO sales_board_snapshots (shop_domain, observed_at, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(shop_domain) DO UPDATE SET observed_at=excluded.observed_at, payload=excluded.payload
+                WHERE excluded.observed_at >= sales_board_snapshots.observed_at
+                """,
+                (shop_domain, observed_at, json.dumps(payload, separators=(",", ":"))),
+            )
+            return result.rowcount == 1
+
+    def get_sales_board(self, *, shop_domain: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row is not None else None
+
+    def get_sales_board_settings(self, *, shop_domain: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT enabled, interval_seconds, monthly_goal_cents FROM sales_board_settings WHERE shop_domain = ?",
+                (shop_domain,),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def save_sales_board_settings(self, *, shop_domain: str, enabled: bool, interval_seconds: int, monthly_goal_cents: int | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO sales_board_settings (shop_domain, enabled, interval_seconds, monthly_goal_cents)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(shop_domain) DO UPDATE SET enabled=excluded.enabled,
+                    interval_seconds=excluded.interval_seconds, monthly_goal_cents=excluded.monthly_goal_cents
+                """,
+                (shop_domain, enabled, interval_seconds, monthly_goal_cents),
+            )
 
     def record_connector_heartbeat(
         self, *, shop_domain: str, channel: str, metadata: Optional[dict[str, Any]] = None,
@@ -1689,6 +1795,9 @@ class DatabaseStore:
                 "DELETE FROM connector_sync_requests WHERE shop_domain = ?",
                 (shop_domain,),
             )
+            connection.execute("DELETE FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,))
+            connection.execute("DELETE FROM sales_board_settings WHERE shop_domain = ?", (shop_domain,))
+            connection.execute("DELETE FROM customer_sync_history WHERE shop_domain = ?", (shop_domain,))
             connection.execute(
                 "DELETE FROM inventory_item_skus WHERE shop_domain = ?",
                 (shop_domain,),

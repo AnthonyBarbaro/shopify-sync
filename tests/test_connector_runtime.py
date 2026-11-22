@@ -224,6 +224,7 @@ class ConnectorRuntimeTests(unittest.TestCase):
         with (
             mock.patch.object(self.connector, "_send_heartbeat", side_effect=send_heartbeat),
             mock.patch.object(self.connector, "_sync_order_inbox", side_effect=poll_orders),
+            mock.patch.object(self.connector, "_sales_board_loop"),
             mock.patch.object(self.connector, "run_cycle", side_effect=blocked_cycle),
         ):
             with self.assertRaises(KeyboardInterrupt):

@@ -68,7 +68,7 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
     ) -> tuple[int, dict[str, object]]:
         body = json.dumps(payload).encode("utf-8")
         headers = [(b"content-type", b"application/json")]
-        if dashboard_header and path == "/api/connector/force-sync":
+        if dashboard_header and path in {"/api/connector/force-sync", "/api/sales-board/settings"}:
             headers.append((b"x-requested-with", b"pos-bridge"))
         if authenticated:
             headers.extend([(b"x-api-key", b"test-key"), (b"x-api-secret", b"test-secret")])
@@ -137,6 +137,21 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         status, _body = await self.post(None, path="/sync/customers/status", method="GET", authenticated=False)
         self.assertEqual(status, 401)
         self.main.db.record_connector_heartbeat.assert_not_called()
+
+    async def test_board_settings_are_managed_in_dashboard_and_read_by_connector(self) -> None:
+        path = "/api/sales-board/settings"
+        options = {"enabled": False, "interval_seconds": 90, "monthly_goal_cents": 500000}
+        status, _ = await self.post(options, path=path, method="PUT")
+        self.assertEqual(status, 401)
+        with mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})):
+            status, _ = await self.post(options, path=path, method="PUT", dashboard_header=False)
+            self.assertEqual(status, 401)
+            status, result = await self.post(options, path=path, method="PUT")
+        self.assertEqual((status, result), (200, options))
+        self.main.db.save_sales_board_settings.assert_called_once_with(shop_domain=self.shop.shop_domain, **options)
+        self.main.db.get_sales_board_settings.return_value = options
+        status, result = await self.post(None, path="/sync/sales-board/settings", method="GET")
+        self.assertEqual((status, result), (200, {"enabled": False, "interval_seconds": 90}))
 
     async def test_force_sync_requires_dashboard_session_and_uses_its_shop(self) -> None:
         status, _body = await self.post({}, path="/api/connector/force-sync")

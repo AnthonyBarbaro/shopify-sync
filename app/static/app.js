@@ -2,6 +2,7 @@ const routes = {
   "/app": { title: "Overview", render: renderOverview },
   "/app/orders": { title: "Orders", render: renderOrders },
   "/app/customers": { title: "Customers", render: renderCustomers },
+  "/app/sales": { title: "Sales Board", render: renderSalesBoard },
   "/app/settings": { title: "Settings", render: renderSettings },
 }
 
@@ -16,16 +17,89 @@ const state = {
   rotating: false,
   testing: false,
   forcing: false,
+  sales: null,
+  salesLoading: false,
+  salesError: null,
+  salesPeriod: "month",
+  salesEmployee: null,
+  salesFocus: false,
+  salesSettings: null,
+  salesSettingsBusy: false,
+  salesSettingsError: null,
+  salesSettingsDirty: false,
+  customerLog: null,
+  customerLogError: null,
+  customerLogOutcome: "",
+  customerLogBefore: null,
+  customerLogRequest: 0,
 }
 
 document.addEventListener("DOMContentLoaded", () => boot())
-window.addEventListener("popstate", () => render())
+window.addEventListener("popstate", () => {
+  render()
+  if (window.location.pathname === "/app/sales") refreshSales()
+  if (window.location.pathname === "/app/customers") refreshCustomerLog()
+})
+
+document.addEventListener("input", (event) => {
+  if (event.target.closest("[data-sales-settings]")) state.salesSettingsDirty = true
+})
+
+document.addEventListener("submit", async (event) => {
+  if (!event.target.matches("[data-sales-settings]")) return
+  event.preventDefault()
+  await saveSalesSettings(event.target)
+})
 
 document.addEventListener("click", async (event) => {
   const routeLink = event.target.closest("[data-route]")
   if (routeLink) {
     event.preventDefault()
     navigate(routeLink.getAttribute("href"))
+    return
+  }
+
+  const period = event.target.closest("[data-sales-period]")
+  if (period) {
+    state.salesPeriod = period.dataset.salesPeriod
+    state.salesEmployee = null
+    render()
+    return
+  }
+
+  const employee = event.target.closest("[data-sales-employee]")
+  if (employee) {
+    state.salesEmployee = employee.dataset.salesEmployee
+    render()
+    document.getElementById("sales-employee-detail")?.focus()
+    return
+  }
+
+  if (event.target.closest("[data-sales-focus]")) {
+    state.salesFocus = !state.salesFocus
+    render()
+    return
+  }
+
+  if (event.target.closest("[data-sales-refresh]")) {
+    await refreshSales()
+    return
+  }
+
+  const historyFilter = event.target.closest("[data-customer-outcome]")
+  if (historyFilter) {
+    state.customerLogOutcome = historyFilter.dataset.customerOutcome
+    state.customerLogBefore = null
+    state.customerLog = null
+    await refreshCustomerLog()
+    return
+  }
+
+  const historyPage = event.target.closest("[data-customer-before]")
+  if (historyPage) {
+    state.customerLogBefore = historyPage.dataset.customerBefore || null
+    state.customerLog = null
+    await refreshCustomerLog()
     return
   }
 
@@ -41,7 +115,7 @@ document.addEventListener("click", async (event) => {
   }
 
   if (event.target.closest("[data-refresh]")) {
-    await refreshBridge(true)
+    await Promise.all([refreshBridge(true), window.location.pathname === "/app/customers" ? refreshCustomerLog() : null])
     return
   }
 
@@ -62,10 +136,81 @@ async function boot() {
     loadOptional("bridge", () => fetchJson("/api/bridge-status?order_limit=20").then((value) => { state.bridge = value })),
   ])
   render()
+  if (window.location.pathname === "/app/sales") refreshSales()
+  if (window.location.pathname === "/app/customers") refreshCustomerLog()
 
   window.setInterval(() => {
-    refreshBridge(false).catch((error) => console.error(error))
+    if (window.location.pathname === "/app/sales") refreshSales()
+    else {
+      refreshBridge(false).catch((error) => console.error(error))
+      if (window.location.pathname === "/app/customers" && !state.customerLogBefore) refreshCustomerLog()
+    }
   }, 30000)
+}
+
+async function refreshSales() {
+  if (state.salesLoading) return
+  state.salesLoading = true
+  try {
+    state.sales = await fetchJson("/api/sales-board")
+    state.salesError = null
+  } catch (error) {
+    state.salesError = error
+  } finally {
+    state.salesLoading = false
+    if (window.location.pathname === "/app/sales") render()
+  }
+}
+
+async function refreshCustomerLog() {
+  const request = ++state.customerLogRequest
+  const query = new URLSearchParams()
+  if (state.customerLogOutcome) query.set("outcome", state.customerLogOutcome)
+  if (state.customerLogBefore) query.set("before", state.customerLogBefore)
+  try {
+    const data = await fetchJson(`/api/customer-sync-history?${query}`)
+    if (request !== state.customerLogRequest) return
+    state.customerLog = data
+    state.customerLogError = null
+  } catch (error) {
+    if (request !== state.customerLogRequest) return
+    state.customerLogError = error
+  }
+  if (window.location.pathname === "/app/customers") render()
+}
+
+async function ensureSalesSettings() {
+  state.salesSettingsBusy = true
+  try {
+    state.salesSettings = await fetchJson("/api/sales-board/settings")
+  } catch (error) {
+    state.salesSettingsError = error
+  } finally {
+    state.salesSettingsBusy = false
+    if (window.location.pathname === "/app/settings") render()
+  }
+}
+
+async function saveSalesSettings(form) {
+  if (state.salesSettingsBusy) return
+  const values = new FormData(form)
+  const goal = values.get("monthly_goal")
+  state.salesSettingsBusy = true
+  try {
+    state.salesSettings = await fetchJson("/api/sales-board/settings", {
+      method: "PUT", headers: { "X-Requested-With": "pos-bridge", "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: values.has("enabled"), interval_seconds: Number(values.get("interval")),
+        monthly_goal_cents: goal ? Math.round(Number(goal) * 100) : null }),
+    })
+    state.salesSettingsDirty = false
+    state.salesSettingsError = null
+    showToast("Sales Board settings saved.", "success")
+    if (window.location.pathname === "/app/settings") render()
+  } catch (error) {
+    showToast(error.message, "error")
+  } finally {
+    state.salesSettingsBusy = false
+  }
 }
 
 async function loadOptional(name, loader) {
@@ -89,7 +234,7 @@ async function refreshBridge(showMessage) {
     if (showMessage) showToast(error.message, "error")
   } finally {
     state.refreshing = false
-    render()
+    if (window.location.pathname !== "/app/settings" || !state.salesSettingsDirty) render()
   }
 }
 
@@ -151,13 +296,17 @@ async function testShopify() {
 
 function navigate(path) {
   window.history.pushState({}, "", `${path}${window.location.search}`)
+  state.salesSettingsDirty = false
   if (path === "/app/settings") {
+    state.salesSettingsError = null
     ensureConnection().then(render).catch((error) => {
       state.error = error
       render()
     })
   }
   render()
+  if (path === "/app/sales") refreshSales()
+  if (path === "/app/customers") refreshCustomerLog()
   window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" })
 }
 
@@ -173,6 +322,7 @@ function render() {
       render()
     })
   }
+  if (route === "/app/settings" && !state.salesSettings && !state.salesSettingsBusy && !state.salesSettingsError) ensureSalesSettings()
 
   app.innerHTML = routes[route].render()
 }
@@ -356,9 +506,125 @@ function renderOrders() {
   `
 }
 
+function salesMoney(cents) {
+  return formatMoney(cents / 100, "USD")
+}
+
+function salesDate(value) {
+  return new Date(`${value}T12:00:00`).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })
+}
+
+function renderSalesBoard() {
+  const snapshot = state.sales?.snapshot
+  const focused = state.salesFocus ? "is-focused" : ""
+  const settings = { today: "Today", week: "This week", month: "This month", year: "This year" }
+  const actions = `<div class="sales-actions">
+    <button class="button secondary" type="button" data-sales-refresh>${icon("refresh")} Refresh</button>
+    <button class="button secondary" type="button" data-sales-focus aria-pressed="${state.salesFocus}">${state.salesFocus ? "Exit tablet view" : "Tablet view"}</button>
+  </div>`
+
+  if (!snapshot) {
+    return `<section class="page sales-board ${focused}">
+      <div class="page-head"><div><h1>Sales Board</h1><p>In-store sales · Alterations excluded</p></div>${actions}</div>
+      <section class="panel"><div class="empty"><strong>${state.salesError ? "Sales Board could not load" : state.sales?.settings?.enabled === false ? "Sales Board is paused" : state.sales ? "Waiting for POS sales data" : "Loading sales data…"}</strong>
+      <p>${state.salesError ? escapeHtml(state.salesError.message) : state.sales?.settings?.enabled === false ? `<a href="/app/settings" data-route>Open settings</a> to resume sales reporting.` : state.sales ? "Update the Windows connector and let it send its first sales summary." : ""}</p></div></section>
+    </section>`
+  }
+
+  const period = snapshot.periods[state.salesPeriod]
+  const totals = period.store
+  const ranked = period.employees.filter((person) => person.employee_id !== "unassigned")
+  const unassigned = period.employees.find((person) => person.employee_id === "unassigned")
+  const selected = period.employees.find((person) => person.employee_id === state.salesEmployee)
+  const stale = Date.now() - Date.parse(snapshot.observed_at) > 12 * 60 * 1000
+  const goal = state.sales.settings?.monthly_goal_cents
+  const monthlyNet = snapshot.periods.month.store.net_cents
+  const goalPercent = goal ? Math.round(monthlyNet / goal * 100) : 0
+  const status = state.salesError ? "Refresh failed · showing saved totals" : stale ? "POS update delayed" : "POS data current"
+  const dates = `${salesDate(period.start)}${period.start === snapshot.business_date ? "" : ` – ${salesDate(snapshot.business_date)}`}`
+  return `<section class="page sales-board ${focused}">
+    <div class="sales-header">
+      <div><h1>Sales Board</h1><p>In-store sales · Alterations excluded</p></div>
+      ${actions}
+    </div>
+    <div class="sales-toolbar">
+      <div class="sales-periods" role="group" aria-label="Reporting period">${Object.entries(settings).map(([key, label]) =>
+        `<button type="button" data-sales-period="${key}" aria-pressed="${key === state.salesPeriod}">${label}</button>`).join("")}</div>
+      <div class="sales-freshness">${statusBadge(status, stale || state.salesError ? "warning" : "success")} <span title="${escapeHtml(formatDate(snapshot.observed_at))}">Updated ${escapeHtml(relativeTime(snapshot.observed_at))}</span></div>
+    </div>
+    <div class="sales-scorecard">
+      <div class="sales-net"><span>Net sales</span><strong>${salesMoney(totals.net_cents)}</strong><small>${escapeHtml(dates)}</small></div>
+      <div><span>Sales tickets</span><strong>${formatSalesCount(totals.tickets)}</strong></div>
+      <div><span>Net units</span><strong>${formatSalesCount(totals.units)}</strong></div>
+      <div><span>Average ticket</span><strong>${totals.tickets ? salesMoney(totals.net_cents / totals.tickets) : "—"}</strong></div>
+      <div><span>Returns &amp; credits</span><strong>${salesMoney(totals.credits_cents)}</strong></div>
+    </div>
+    <div class="sales-layout">
+      <section class="panel sales-leaderboard" aria-labelledby="sales-leaderboard-heading">
+        <div class="panel-head"><h2 id="sales-leaderboard-heading">Employee leaderboard</h2><span class="panel-label">${settings[state.salesPeriod]}</span></div>
+        ${ranked.length || unassigned ? `<div class="sales-leader-labels" aria-hidden="true"><span>Employee</span><span>Tickets</span><span>Net sales</span></div>
+          ${ranked.map((person, index) => renderSalesEmployee(person, index + 1)).join("")}
+          ${unassigned ? renderSalesEmployee(unassigned, null) : ""}` : `<div class="empty"><strong>No merchandise sales in this period</strong></div>`}
+      </section>
+      <div class="sales-side">
+        <section class="panel">
+          <div class="panel-head"><h2>Monthly goal</h2></div>
+          ${goal ? `<div class="sales-goal"><strong>${Math.max(0, goalPercent)}%</strong><span>${salesMoney(monthlyNet)} of ${salesMoney(goal)}</span></div>
+            <progress aria-label="Monthly sales goal" max="${goal}" value="${Math.max(0, Math.min(monthlyNet, goal))}"></progress>
+            <p class="sales-muted">${monthlyNet >= goal ? "Goal reached" : `${salesMoney(goal - monthlyNet)} to goal`}</p>`
+          : `<p class="sales-muted">No monthly goal configured.</p>`}
+        </section>
+        <section class="panel sales-categories"><div class="panel-head"><h2>Category mix</h2></div>${renderSalesCategories(period.categories)}</section>
+      </div>
+    </div>
+    ${selected ? `<section class="panel sales-employee-detail" id="sales-employee-detail" tabindex="-1" aria-labelledby="sales-employee-heading">
+      <div class="panel-head"><h2 id="sales-employee-heading">${escapeHtml(selected.name)}</h2><span class="panel-label">${settings[state.salesPeriod]}</span></div>
+      <div class="sales-employee-stats"><span><strong>${salesMoney(selected.net_cents)}</strong> Net sales</span><span><strong>${formatSalesCount(selected.tickets)}</strong> Tickets</span><span><strong>${formatSalesCount(selected.units)}</strong> Net units</span><span><strong>${selected.tickets ? salesMoney(selected.net_cents / selected.tickets) : "—"}</strong> Average ticket</span></div>
+      ${renderSalesCategories(selected.categories)}
+    </section>` : ""}
+    <section class="panel"><div class="panel-head"><h2>${state.salesPeriod === "today" ? "Sales by hour" : state.salesPeriod === "year" ? "Sales by month" : "Sales by day"}</h2><span class="panel-label">Net sales</span></div>${renderSalesTrend(period.trend)}</section>
+    <p class="sales-muted">${snapshot.last_invoice_date ? `Latest completed POS invoice: ${escapeHtml(salesDate(snapshot.last_invoice_date))}. ` : ""}Sales credit follows the clerk on each line. A shared ticket can count for more than one employee.</p>
+  </section>`
+}
+
+function formatSalesCount(value) {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)
+}
+
+function renderSalesEmployee(person, rank) {
+  const id = escapeHtml(person.employee_id)
+  return `<button type="button" class="sales-leader-row" data-sales-employee="${id}" aria-pressed="${person.employee_id === state.salesEmployee}">
+    <span class="sales-person"><span class="sales-rank ${rank && rank <= 3 ? "is-top" : ""}">${rank ?? "—"}</span><strong>${escapeHtml(person.name)}</strong></span>
+    <span>${formatSalesCount(person.tickets)}</span><strong>${salesMoney(person.net_cents)}</strong>
+  </button>`
+}
+
+function renderSalesCategories(categories) {
+  if (!categories.length) return `<p class="sales-muted">No categories in this period.</p>`
+  const scale = Math.max(1, ...categories.map(({ net_cents }) => Math.abs(net_cents)))
+  return `<ul class="sales-category-list">${categories.map(({ name, net_cents }) => `<li>
+    <div><span>${escapeHtml(name)}</span><strong>${salesMoney(net_cents)}</strong></div>
+    <div class="sales-category-bar" aria-hidden="true"><i class="${net_cents < 0 ? "is-negative" : ""}" style="width:${Math.abs(net_cents) / scale * 100}%"></i></div>
+  </li>`).join("")}</ul>`
+}
+
+function renderSalesTrend(trend) {
+  if (!trend.some(({ net_cents }) => net_cents)) return `<p class="sales-muted">No sales activity to chart in this period.</p>`
+  const scale = Math.max(1, ...trend.map(({ net_cents }) => Math.abs(net_cents)))
+  return `<ul class="sales-trend">${trend.map(({ label, net_cents }, index) => {
+    const text = /^\d{4}-\d{2}-\d{2}$/.test(label) ? label.slice(-2) : /^\d{4}-\d{2}$/.test(label)
+      ? new Date(`${label}-01T12:00:00`).toLocaleDateString([], { month: "short" }) : label
+    return `<li><span class="sales-trend-bar"><i class="${net_cents < 0 ? "is-negative" : ""}" style="--bar:${Math.abs(net_cents) / scale * 100}%"></i></span>
+      <span aria-hidden="true">${index % Math.ceil(trend.length / 12) === 0 ? escapeHtml(text) : ""}</span>
+      <span class="sales-chart-value">${escapeHtml(label)} · ${salesMoney(net_cents)}</span></li>`
+  }).join("")}</ul>`
+}
+
 function renderCustomers() {
   const customers = state.bridge?.customers || {}
-  const recent = customers.recent || []
+  const recent = state.customerLog?.items || []
+  const showingLegacy = !recent.length && !state.customerLogOutcome && !state.customerLogBefore && (customers.recent || []).length
+  const filters = [["", "All activity"], ["created", "Added"], ["matched", "Matched"], ["failed", "Failed"]]
   const checkIn = customers.last_poll_at
     ? `Last check-in ${relativeTime(customers.last_poll_at)}`
     : "No check-in recorded yet"
@@ -389,10 +655,16 @@ function renderCustomers() {
 
       <section class="panel" aria-labelledby="customer-history-heading">
         <div class="panel-head">
-          <h2 id="customer-history-heading">Recent import results</h2>
-          <span class="panel-label">Latest ${recent.length} ${recent.length === 1 ? "result" : "results"}</span>
+          <h2 id="customer-history-heading">Customer activity log</h2>
         </div>
-        ${renderCustomerSyncHistory(recent)}
+        <div class="sales-periods" role="group" aria-label="Filter customer activity">${filters.map(([key, label]) =>
+          `<button type="button" data-customer-outcome="${key}" aria-pressed="${key === state.customerLogOutcome}">${label}</button>`).join("")}</div>
+        ${state.customerLogError ? `<p class="sales-muted">${escapeHtml(state.customerLogError.message)}</p>` : ""}
+        ${renderCustomerSyncHistory(showingLegacy ? customers.recent : recent)}
+        <div class="customer-log-pages">
+          ${state.customerLogBefore ? `<button class="button secondary" type="button" data-customer-before="">Newest</button>` : ""}
+          ${state.customerLog?.next_before ? `<button class="button secondary" type="button" data-customer-before="${state.customerLog.next_before}">Older results</button>` : ""}
+        </div>
       </section>
     </section>
   `
@@ -417,6 +689,7 @@ function renderCustomerSyncHistory(items) {
             <div>
               <strong>${item.pos_customer_number ? `POS customer #${escapeHtml(item.pos_customer_number)}` : "POS customer"}</strong>
               <small>${escapeHtml(formatDate(item.received_at))}</small>
+              ${item.reason ? `<small>${escapeHtml(item.reason)}</small>` : ""}
             </div>
           </div>
           ${statusBadge(...(outcomes[item.outcome] || outcomes.processed))}
@@ -514,6 +787,7 @@ function renderPriceChangeList(items) {
 function renderSettings() {
   const connection = state.connection
   const connector = state.bridge?.connector || {}
+  const board = state.salesSettings
   return `
     <section class="page narrow">
       <div class="page-head">
@@ -544,6 +818,16 @@ function renderSettings() {
             <button class="button danger" type="button" data-rotate ${state.rotating ? "disabled" : ""}>${state.rotating ? "Creating…" : "Create new key"}</button>
           </div>
         ` : `<div class="empty"><span class="spinner"></span><strong>Loading connector settings…</strong></div>`}
+      </section>
+
+      <section class="panel" aria-labelledby="sales-settings-heading">
+        <div class="panel-head"><h2 id="sales-settings-heading">Sales Board</h2></div>
+        ${board ? `<form class="sales-settings-form" data-sales-settings>
+          <label class="sales-settings-toggle"><input type="checkbox" name="enabled" ${board.enabled ? "checked" : ""}> Enable Sales Board</label>
+          <label>POS check interval (seconds)<input type="number" name="interval" min="30" max="900" step="1" value="${board.interval_seconds}" required></label>
+          <label>Monthly sales goal (USD)<input type="number" name="monthly_goal" min="0.01" max="1000000000" step="0.01" value="${board.monthly_goal_cents == null ? "" : (board.monthly_goal_cents / 100).toFixed(2)}" placeholder="Optional"></label>
+          <button class="button" type="submit">Save Sales Board settings</button>
+        </form>` : `<p class="sales-muted">${state.salesSettingsError ? escapeHtml(state.salesSettingsError.message) : "Loading Sales Board settings…"}</p>`}
       </section>
 
       <div class="notice neutral">

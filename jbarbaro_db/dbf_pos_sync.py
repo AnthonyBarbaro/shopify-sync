@@ -692,7 +692,9 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def iter_dbf_rows(path: Path, *, encoding: str = "latin1") -> Iterator[Dict[str, Any]]:
+def iter_dbf_rows(
+    path: Path, *, encoding: str = "latin1", required_fields: Optional[set[str]] = None,
+) -> Iterator[Dict[str, Any]]:
     with path.open("rb") as handle:
         header = handle.read(32)
         if len(header) != 32:
@@ -720,19 +722,30 @@ def iter_dbf_rows(path: Path, *, encoding: str = "latin1") -> Iterator[Dict[str,
                 )
             )
 
+        projection = []
+        offset = 1
+        for field in fields:
+            if required_fields is None or field.name in required_fields:
+                projection.append((field, offset))
+            offset += field.length
+        if required_fields is not None:
+            missing = required_fields - {field.name for field, _ in projection}
+            if missing or offset > record_length:
+                raise ValueError(f"Invalid {path.name} schema for sales reporting; missing fields: {sorted(missing)}")
+
         handle.seek(header_length)
         for _ in range(number_of_records):
             record = handle.read(record_length)
+            if required_fields is not None and len(record) != record_length:
+                raise ValueError(f"{path.name} changed while it was being read.")
             if not record:
                 break
             if record[0] == 0x2A:
                 continue
 
             row: Dict[str, Any] = {}
-            offset = 1
-            for field in fields:
+            for field, offset in projection:
                 raw_value = record[offset : offset + field.length]
-                offset += field.length
                 row[field.name] = _parse_dbf_value(raw_value, field, encoding=encoding)
             yield row
 

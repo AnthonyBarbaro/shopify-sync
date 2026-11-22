@@ -99,6 +99,16 @@ class AppendOnlyCustomerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assert_no_customer_updates()
 
+    def test_failure_reason_describes_customer_data_denial_without_contact_details(self) -> None:
+        self.client.get_customer_by_identifier.side_effect = ShopifyAPIError("Lookup failed", {
+            "errors": [{"message": "Access denied to sample@example.test", "extensions": {"code": "ACCESS_DENIED"}}],
+        })
+        result = self.service.sync_customer(self.payload, self.shop)
+        self.assertFalse(result.success)
+        self.assertIn("protected customer data", result.failure_reason)
+        self.assertNotIn("sample@example.test", result.failure_reason)
+        self.client.customer_create.assert_not_called()
+
     def test_invalid_identity_cannot_create_a_name_only_duplicate(self) -> None:
         result = self.service.sync_customer(CustomerSyncRequest(firstName='Name only'), self.shop)
         self.assertFalse(result.success)

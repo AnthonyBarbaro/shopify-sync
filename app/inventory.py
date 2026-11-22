@@ -188,6 +188,7 @@ class InventorySyncService:
                 source=normalized.source,
                 success=False,
                 message=str(exc),
+                failure_reason=_customer_failure_reason(exc),
                 timestamp=utc_now_iso(),
                 email=normalized.email,
                 phone=normalized.phone,
@@ -2410,6 +2411,43 @@ def _auto_archive_metafield_input(*, value: bool) -> Dict[str, str]:
         "type": "boolean",
         "value": "true" if value else "false",
     }
+
+
+def _customer_failure_reason(error: Exception) -> str:
+    if isinstance(error, AppError):
+        if error.code == "missing_customer_identifier":
+            return "No POS customer number, email, or phone was available to match."
+        if error.code == "empty_customer_payload":
+            return "The POS record has no details Shopify can import."
+        if error.status_code == 429:
+            return "Shopify rate limited the import. The connector will retry."
+        errors = error.details.get("errors") or []
+        for entry in errors:
+            if not isinstance(entry, dict):
+                continue
+            code = (entry.get("extensions") or {}).get("code")
+            message = str(entry.get("message") or "").casefold()
+            if code == "ACCESS_DENIED" or "access denied" in message or "protected customer data" in message:
+                return "Shopify denied customer data access. Check customer scopes and protected customer data approval."
+            if code in {"GRAPHQL_VALIDATION_FAILED", "undefinedField", "variableRequiresValidType"}:
+                return "Shopify rejected the customer API query. Check the configured Shopify API version."
+        if error.status_code == 403:
+            return "Shopify denied customer data access. Check customer scopes and protected customer data approval."
+        if str(error).startswith("Shopify could not create the POS customer ID metafield"):
+            return "Shopify could not set up the POS customer ID field. Check the customer metafield definition."
+        fields = {str(part) for entry in error.details.get("user_errors", []) if isinstance(entry, dict)
+                  for part in (entry.get("field") or [])}
+        if fields & {"email", "emailAddress"}:
+            return "Shopify rejected the email field on the POS record."
+        if "addresses" in fields:
+            return "Shopify rejected an address on the POS record."
+        if fields & {"phone", "phoneNumber"}:
+            return "Shopify rejected the phone field on the POS record."
+        if "metafields" in fields:
+            return "Shopify rejected a customer metafield."
+        if isinstance(error, ShopifyAPIError):
+            return "Shopify rejected the import or could not respond. The connector will retry."
+    return "The customer import failed. Check the POS Bridge server log."
 
 
 def _customer_custom_id_value(payload: CustomerSyncRequest) -> Optional[str]:

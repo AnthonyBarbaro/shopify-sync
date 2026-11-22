@@ -135,6 +135,23 @@ aggregate results for each batch.
 Recurring uploads omit contact payloads from request/feed logs. Contact details are not stored in
 `customers.json`.
 
+## Sales Board
+
+Open **POS Bridge → Settings → Sales Board** in Shopify Admin to enable or pause sales reporting,
+set the POS check interval, or enter a monthly goal in USD. The Windows connector reads these
+settings from the app. The **Sales Board** tab shows in-store sales and has a tablet view.
+
+The reporting worker reads completed POS invoice headers and detail lines, the employee roster,
+and item and department codes. It uses signed POS line extensions in cents, before tax, for net sales.
+It excludes alteration lines even on mixed tickets, and omits gift-card issues, payment-only lines,
+open orders, and unclassified lines. Net units reflect returned quantities. Sales tickets count each
+receipt with a positive merchandise line once per store or employee. A shared receipt can count for
+more than one employee. The board covers the live POS invoice history available on the computer.
+
+The worker sends one current aggregate snapshot per store. It sends employee display names and sales
+totals, with no invoice identifiers, customer information, or payments. Deploy the backend before
+updating the Windows connector so the new worker can reach the settings and reporting endpoints.
+
 ## Shopify order inbox
 
 When `ORDER_SYNC_ENABLED=true`, the connector pulls queued Shopify order create, update, cancel, and delete

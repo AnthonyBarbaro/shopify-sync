@@ -1,6 +1,7 @@
+from datetime import date
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat
 
 
 class ProductImageInput(BaseModel):
@@ -88,6 +89,57 @@ class ConnectorHeartbeatRequest(BaseModel):
     customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
 
 
+class SalesBoardTotals(BaseModel):
+    net_cents: int
+    tickets: int = Field(ge=0)
+    units: FiniteFloat
+    credits_cents: int = Field(ge=0)
+
+
+class SalesBoardCategory(SalesBoardTotals):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class SalesBoardEmployee(SalesBoardTotals):
+    employee_id: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    categories: List[SalesBoardCategory] = Field(max_length=150)
+
+
+class SalesBoardTrendPoint(BaseModel):
+    label: str = Field(min_length=1, max_length=24)
+    net_cents: int
+
+
+class SalesBoardPeriod(BaseModel):
+    start: date
+    store: SalesBoardTotals
+    employees: List[SalesBoardEmployee] = Field(max_length=200)
+    categories: List[SalesBoardCategory] = Field(max_length=150)
+    trend: List[SalesBoardTrendPoint] = Field(max_length=32)
+
+
+class SalesBoardPeriods(BaseModel):
+    today: SalesBoardPeriod
+    week: SalesBoardPeriod
+    month: SalesBoardPeriod
+    year: SalesBoardPeriod
+
+
+class SalesBoardSnapshot(BaseModel):
+    observed_at: AwareDatetime
+    business_date: date
+    first_invoice_date: Optional[date] = None
+    last_invoice_date: Optional[date] = None
+    periods: SalesBoardPeriods
+
+
+class SalesBoardSettings(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = Field(default=60, ge=30, le=900)
+    monthly_goal_cents: Optional[int] = Field(default=None, gt=0, le=100_000_000_000)
+
+
 class ProductSyncRequest(BaseModel):
     sku: Optional[str] = Field(default=None, min_length=1)
     title: Optional[str] = None
@@ -172,6 +224,7 @@ class CustomerSyncResult(BaseModel):
     source: Optional[str] = None
     success: bool
     message: str
+    failure_reason: Optional[str] = None
     timestamp: str
     customer_id: Optional[str] = None
     email: Optional[str] = None
