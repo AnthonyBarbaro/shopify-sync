@@ -72,8 +72,9 @@ retries with the same idempotency key are not added twice while the entry is ret
 History starts after this update and does not include Shopify-originated changes or initial
 catalog quantities. Failed and zero-delta adjustments are excluded.
 
-The connector defaults to inventory and POS price checks every 30 seconds. Actual updates can take
-longer during a full reconciliation, API retries, or downtime. A separate 30-second heartbeat reports
+The connector checks for POS sales and edits every 30 seconds by default. It syncs the affected SKUs
+before checking prices. During a quiet period it checks changed POS quantity files for other stock
+adjustments. Updates can take longer during a full reconciliation, API retries, or downtime. A separate 30-second heartbeat reports
 connector connectivity during long jobs; inventory, order, and customer check-ins are shown separately.
 "No check-in" means Railway has not heard from the connector for eight minutes, even if the computer
 itself has internet access. The dashboard displays the interval reported by the updated connector.
@@ -263,8 +264,8 @@ Matrix variant SKUs such as `21741. 1 1` reconcile against their managed base SK
 
 The unattended POS bridge is documented in [windows_connector/README.md](windows_connector/README.md).
 It starts with Windows, uploads product details only during the initial catalog import, processes new
-`invdtl.dbf` and `editvoid.dbf` events every 30 seconds by default, and runs one full quantity reconciliation
-after local midnight. The first upgraded run also forces this reconciliation immediately. Deploy the
+`invdtl.dbf` and `editvoid.dbf` events every 30 seconds by default, checks changed POS quantity files
+between sales, and runs a full quantity reconciliation after local midnight when activity allows. Deploy the
 Railway/backend update before updating the Windows connector; the connector rejects an older snapshot
 schema without acknowledging queued changes. It sends JSON changes rather than DBF ZIP archives and
 keeps only bounded state and rotating logs on the host computer.

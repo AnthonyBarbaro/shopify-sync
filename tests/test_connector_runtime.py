@@ -215,7 +215,8 @@ class ConnectorRuntimeTests(unittest.TestCase):
             self.assertIsNot(session, self.connector.session)
             orders_polled.set()
 
-        def blocked_cycle() -> None:
+        def blocked_cycle(*, scheduled: bool) -> None:
+            self.assertTrue(scheduled)
             cycle_started.set()
             self.assertTrue(heartbeat_received.wait(timeout=2))
             self.assertTrue(orders_polled.wait(timeout=2))

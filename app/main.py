@@ -3165,7 +3165,8 @@ async def acknowledge_connector_order_changes(
 async def connector_inventory_snapshot(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
-    snapshot = run_with_shop_retry(
+    snapshot = await run_in_threadpool(
+        run_with_shop_retry,
         shop,
         lambda active_shop: inventory_service.get_inventory_snapshot(active_shop),
     )
@@ -3461,7 +3462,8 @@ async def connector_inventory_adjustments(
             idempotency_key = _string_or_none(raw_adjustment.get("idempotency_key")) or secrets.token_hex(16)
             if len(idempotency_key) > 128:
                 raise ValueError("idempotency_key must be 128 characters or fewer")
-            result = run_with_shop_retry(
+            result = await run_in_threadpool(
+                run_with_shop_retry,
                 shop,
                 lambda active_shop: inventory_service.adjust_inventory_quantity(
                     sku=sku,
