@@ -127,6 +127,17 @@ class AppendOnlyCustomerTests(unittest.TestCase):
         self.assertNotIn("address_review", result.model_dump())
         self.assertNotIn("456 Second Street", result.model_dump_json())
 
+    def test_customer_create_formats_us_zip_plus_four_without_changing_other_postal_codes(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "Sample US", "zip": "012345678", "countryCode": "US"},
+            {"address1": "Other US", "zip": "12345 6789"},
+            {"address1": "Sample Canadian", "zip": "K1A 0B1", "countryCode": "CA"},
+        ]})
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertTrue(result.success)
+        addresses = self.client.customer_create.call_args.kwargs["input_data"]["addresses"]
+        self.assertEqual([address["zip"] for address in addresses], ["01234-5678", "12345-6789", "K1A 0B1"])
+
     def test_invalid_identity_cannot_create_a_name_only_duplicate(self) -> None:
         result = self.service.sync_customer(CustomerSyncRequest(firstName='Name only'), self.shop)
         self.assertFalse(result.success)

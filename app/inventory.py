@@ -2536,6 +2536,12 @@ def _customer_display_name(payload: CustomerSyncRequest) -> str:
 
 
 def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[str, Any]]:
+    country = (_clean_string(address.countryCode) or "US").upper()
+    postal = _clean_string(address.zip)
+    if country == "US" and postal:
+        zip_plus_four = re.fullmatch(r"([0-9]{5}) ?([0-9]{4})", postal)
+        if zip_plus_four:
+            postal = "-".join(zip_plus_four.groups())
     prepared = {
         "firstName": _clean_string(address.firstName),
         "lastName": _clean_string(address.lastName),
@@ -2544,8 +2550,8 @@ def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[st
         "address2": _clean_string(address.address2),
         "city": _clean_string(address.city),
         "provinceCode": _clean_string(address.provinceCode or address.province),
-        "zip": _clean_string(address.zip),
-        "countryCode": (_clean_string(address.countryCode) or "US").upper(),
+        "zip": postal,
+        "countryCode": country,
         "phone": _clean_string(address.phone),
     }
     if not any(prepared.get(field) for field in ("address1", "address2", "city", "provinceCode", "zip")):

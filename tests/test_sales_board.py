@@ -42,11 +42,15 @@ class SalesBoardTests(unittest.TestCase):
             ])
             write("Employee.dbf", "ID_NO FIRST_NAME LAST_NAME".split(), [("A", "Alex", "A"), ("B", "Bailey", "B")])
             write("Item.dbf", "SKU GROUP DESC".split(), [("hem", "ALT", "Hem")])
-            write("MDEPT.DBF", "DEPTCODE DESCRIPT".split(), [
+            write("depart.dbf", "DEPTCODE DESCRIPT".split(), [
                 ("MS", "Suit"), ("MDS", "Dress Shirt"), ("ALT", "Store Alteration"),
                 ("ALTCFT", "Outside Alterations"), ("ALTER", "Custom Alteration"),
             ])
-            report = SalesBoardSnapshot.model_validate(build_sales_board(sales_paths(root), today=day))
+            paths = sales_paths(root)
+            self.assertEqual(paths[-1].name, "depart.dbf")
+            report = SalesBoardSnapshot.model_validate(build_sales_board(paths, today=day))
+            (root / "depart.dbf").rename(root / "MDEPT.DBF")
+            self.assertEqual(sales_paths(root)[-1].name, "MDEPT.DBF")
 
         for _, period in report.periods:
             self.assertEqual(period.store.net_cents, 10000)

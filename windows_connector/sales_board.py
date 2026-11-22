@@ -16,19 +16,22 @@ ALTERATION_CODES = {"ALT", "ALTCFT"}
 FINANCIAL_CODES = {"GC", "GIFTCT", "HOLGC", "COUPON", "COUPON2"}
 ALTERATION = re.compile(r"\b(?:alterations?|alterati[o0]ns?|hemming|rehems?|rehemming)\b", re.I)
 MATRIX_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
-SOURCES = ("invhdr.dbf", "invdtl.dbf", "Employee.dbf", "Item.dbf", "MDEPT.DBF")
+SOURCES = ("invhdr.dbf", "invdtl.dbf", "Employee.dbf", "Item.dbf")
+DEPARTMENT_SOURCES = ("depart.dbf", "MDEPT.DBF", "Dept.dbf")
 
 
 def sales_paths(directory: Path) -> tuple[Path, ...]:
     paths = []
     for name in SOURCES:
         path = find_dbf_file(directory, name, recursive=True)
-        if path is None and name == "MDEPT.DBF":
-            path = find_dbf_file(directory, "Dept.dbf", recursive=True)
         if path is None:
             raise FileNotFoundError(f"Missing sales source {name}")
         paths.append(path)
-    return tuple(paths)
+    for name in DEPARTMENT_SOURCES:
+        path = find_dbf_file(directory, name, recursive=True)
+        if path is not None:
+            return (*paths, path)
+    raise FileNotFoundError(f"Missing sales department table; looked for {', '.join(DEPARTMENT_SOURCES)}")
 
 
 def sales_source_signature(paths: tuple[Path, ...]) -> tuple[tuple[Path, int, int, int], ...]:

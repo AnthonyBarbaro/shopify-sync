@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4"
+CONNECTOR_VERSION = "1.4.1"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -404,6 +404,8 @@ class Connector:
                         snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
                         response = session.post(f"{self.base_url}/sync/sales-board", json=snapshot, timeout=30)
                         response.raise_for_status()
+                        if last_sent is None and response.json().get("saved") is True:
+                            self.logger.info("sales_board_refreshed department_file=%s", paths[-1].name)
                         last_sent = time.monotonic()
                 except Exception:
                     self.logger.exception("sales_board_sync_failed")

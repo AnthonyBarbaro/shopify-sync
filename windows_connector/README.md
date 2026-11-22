@@ -146,7 +146,8 @@ set the POS check interval, or enter a monthly goal in USD. The Windows connecto
 settings from the app. The **Sales Board** tab shows in-store sales and has a tablet view.
 
 The reporting worker reads completed POS invoice headers and detail lines, the employee roster,
-and item and department codes. It uses signed POS line extensions in cents, before tax, for net sales.
+and item and department codes. It prefers the register's `depart.dbf` and also supports `MDEPT.DBF`
+or `Dept.dbf`. It uses signed POS line extensions in cents, before tax, for net sales.
 It excludes alteration lines even on mixed tickets, and omits gift-card issues, payment-only lines,
 open orders, and unclassified lines. Net units reflect returned quantities. Sales tickets count each
 receipt with a positive merchandise line once per store or employee. A shared receipt can count for
