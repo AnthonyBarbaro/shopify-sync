@@ -138,6 +138,37 @@ class AppendOnlyCustomerTests(unittest.TestCase):
         addresses = self.client.customer_create.call_args.kwargs["input_data"]["addresses"]
         self.assertEqual([address["zip"] for address in addresses], ["01234-5678", "12345-6789", "K1A 0B1"])
 
+    def test_legacy_pos_address_uses_canada_only_when_province_and_postal_code_agree(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "Canadian mailing address", "provinceCode": "on", "zip": "k1a0b1", "countryCode": "US"},
+            {"address1": "US mailing address", "provinceCode": "MI", "zip": "48038", "countryCode": "US"},
+        ]})
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertTrue(result.success)
+        addresses = self.client.customer_create.call_args.kwargs["input_data"]["addresses"]
+        self.assertEqual([(a["countryCode"], a["provinceCode"], a["zip"]) for a in addresses], [
+            ("CA", "ON", "K1A 0B1"), ("US", "MI", "48038"),
+        ])
+
+    def test_province_validation_retry_preserves_every_address_and_customer_identity(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "Primary mailing address", "provinceCode": "MI", "zip": "48038"},
+            {"address1": "Secondary mailing address", "provinceCode": "OH", "zip": "44101"},
+        ]})
+        self.client.customer_create.side_effect = [ShopifyAPIError("Province rejected", {
+            "user_errors": [{"field": ["input", "addresses[1]", "province"], "message": "Province is invalid"}],
+        }), self.client.customer_create.return_value]
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertTrue(result.success)
+        self.assertTrue(result.details["created"])
+        first, second = [call.kwargs["input_data"] for call in self.client.customer_create.call_args_list]
+        self.assertEqual(first["addresses"][1]["provinceCode"], "OH")
+        self.assertEqual(second["addresses"][0], first["addresses"][0])
+        self.assertEqual(second["addresses"][1]["province"], "OH")
+        self.assertNotIn("provinceCode", second["addresses"][1])
+        self.assertEqual(second["metafields"], first["metafields"])
+        self.assert_no_customer_updates()
+
     def test_invalid_identity_cannot_create_a_name_only_duplicate(self) -> None:
         result = self.service.sync_customer(CustomerSyncRequest(firstName='Name only'), self.shop)
         self.assertFalse(result.success)

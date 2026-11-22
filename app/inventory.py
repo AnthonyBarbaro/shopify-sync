@@ -41,6 +41,7 @@ from app.utils import (
 
 CUSTOMER_CUSTOM_ID_NAMESPACE = "pos"
 CUSTOMER_CUSTOM_ID_KEY = "legacy_customer_id"
+CANADIAN_PROVINCE_CODES = frozenset("AB BC MB NB NL NS NT NU ON PE QC SK YT".split())
 AUTO_ARCHIVED_ZERO_STOCK_NAMESPACE = "pos"
 AUTO_ARCHIVED_ZERO_STOCK_KEY = "auto_archived_zero_stock"
 MATRIX_VARIANT_SKU_RE = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
@@ -567,10 +568,19 @@ class InventorySyncService:
                     shop.shop_domain, shop.access_token, input_data=customer_input,
                 )
                 created = True
-            except ShopifyAPIError:
+            except ShopifyAPIError as error:
                 customer = self._find_existing_customer(shop, identifiers)
                 if customer is None:
-                    raise
+                    compatible = _customer_address_province_retry(error, customer_input)
+                    if compatible is None:
+                        raise
+                    try:
+                        customer = self.shopify_client.customer_create(shop.shop_domain, shop.access_token, input_data=compatible)
+                        created = True
+                    except ShopifyAPIError:
+                        customer = self._find_existing_customer(shop, identifiers)
+                        if customer is None:
+                            raise
 
         return CustomerSyncResult(
             shop_domain=shop.shop_domain,
@@ -2414,7 +2424,50 @@ def _auto_archive_metafield_input(*, value: bool) -> Dict[str, str]:
 
 
 def _customer_import_addresses(payload: CustomerSyncRequest) -> List[Dict[str, Any]]:
-    return [prepared for address in payload.addresses if (prepared := _prepare_customer_address(address))][:10]
+    legacy_pos = bool(payload.source and payload.source.casefold().endswith(".dbf"))
+    return [prepared for address in payload.addresses
+            if (prepared := _prepare_customer_address(address, legacy_pos=legacy_pos))][:10]
+
+
+def _customer_error_path(entry: dict[str, Any]) -> list[str]:
+    fields = entry.get("field")
+    if not isinstance(fields, list):
+        return []
+    return [part for field in fields if isinstance(field, str) for part in re.split(r"[.\[\]]+", field) if part]
+
+
+def _customer_address_province_retry(error: ShopifyAPIError, customer_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    errors = error.details.get("user_errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    affected = set()
+    unknown_index = False
+    for entry in errors:
+        if not isinstance(entry, dict):
+            return None
+        path = [part.casefold() for part in _customer_error_path(entry)]
+        if not path or path[-1] not in {"province", "provincecode"} or not {"address", "addresses"}.intersection(path):
+            return None
+        boundary = next(i for i, part in enumerate(path) if part in {"address", "addresses"})
+        suffix = path[boundary + 1:]
+        if suffix and re.fullmatch(r"[0-9]{1,3}", suffix[0]):
+            affected.add(int(suffix[0]))
+        else:
+            unknown_index = True
+
+    # Shopify's customerCreate example passes the province abbreviation as `province`.
+    # Keep the same postal address and try that documented form only for a province rejection.
+    addresses = []
+    changed = False
+    for index, address in enumerate(customer_input.get("addresses", [])):
+        updated = dict(address)
+        province = updated.get("provinceCode")
+        if ((unknown_index or index in affected) and updated.get("countryCode") in {"US", "CA"}
+                and isinstance(province, str) and re.fullmatch(r"[A-Z]{2}", province)):
+            updated["province"] = updated.pop("provinceCode")
+            changed = True
+        addresses.append(updated)
+    return {**customer_input, "addresses": addresses} if changed else None
 
 
 def _customer_address_review(error: Exception, payload: CustomerSyncRequest) -> Optional[Dict[str, Any]]:
@@ -2428,10 +2481,9 @@ def _customer_address_review(error: Exception, payload: CustomerSyncRequest) -> 
     candidates = set()
     ambiguous = False
     for entry in errors[:10]:
-        if not isinstance(entry, dict) or not isinstance(entry.get("field"), list):
+        if not isinstance(entry, dict):
             continue
-        path = [part for field in entry["field"] if isinstance(field, str)
-                for part in re.split(r"[.\[\]]+", field) if part]
+        path = _customer_error_path(entry)
         address_path = next((i for i, part in enumerate(path) if part.casefold() in {"addresses", "address"}), None)
         if address_path is None:
             continue
@@ -2484,11 +2536,11 @@ def _customer_failure_reason(error: Exception) -> str:
             return "Shopify denied customer data access. Check customer scopes and protected customer data approval."
         if str(error).startswith("Shopify could not create the POS customer ID metafield"):
             return "Shopify could not set up the POS customer ID field. Check the customer metafield definition."
-        fields = {str(part) for entry in error.details.get("user_errors", []) if isinstance(entry, dict)
-                  for part in (entry.get("field") or [])}
+        fields = {part for entry in error.details.get("user_errors", []) if isinstance(entry, dict)
+                  for part in _customer_error_path(entry)}
         if fields & {"email", "emailAddress"}:
             return "Shopify rejected the email field on the POS record."
-        if "addresses" in fields:
+        if fields & {"address", "addresses"}:
             return "Shopify rejected an address on the POS record."
         if fields & {"phone", "phoneNumber"}:
             return "Shopify rejected the phone field on the POS record."
@@ -2535,9 +2587,17 @@ def _customer_display_name(payload: CustomerSyncRequest) -> str:
     return name or payload.company or payload.email or payload.phone or payload.pos_customer_number or "POS customer"
 
 
-def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[str, Any]]:
+def _prepare_customer_address(address: CustomerAddressInput, *, legacy_pos: bool = False) -> Optional[Dict[str, Any]]:
     country = (_clean_string(address.countryCode) or "US").upper()
+    province = _clean_string(address.provinceCode or address.province)
+    if province and (country in {"US", "CA"} or legacy_pos):
+        province = province.upper()
     postal = _clean_string(address.zip)
+    if legacy_pos and country == "US" and province in CANADIAN_PROVINCE_CODES and postal:
+        canadian_postal = re.fullmatch(r"([A-Z][0-9][A-Z]) ?([0-9][A-Z][0-9])", postal.upper())
+        if canadian_postal:
+            country = "CA"
+            postal = " ".join(canadian_postal.groups())
     if country == "US" and postal:
         zip_plus_four = re.fullmatch(r"([0-9]{5}) ?([0-9]{4})", postal)
         if zip_plus_four:
@@ -2549,7 +2609,7 @@ def _prepare_customer_address(address: CustomerAddressInput) -> Optional[Dict[st
         "address1": _clean_string(address.address1),
         "address2": _clean_string(address.address2),
         "city": _clean_string(address.city),
-        "provinceCode": _clean_string(address.provinceCode or address.province),
+        "provinceCode": province,
         "zip": postal,
         "countryCode": country,
         "phone": _clean_string(address.phone),
