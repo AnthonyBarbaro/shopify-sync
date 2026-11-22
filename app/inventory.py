@@ -42,9 +42,21 @@ from app.utils import (
 CUSTOMER_CUSTOM_ID_NAMESPACE = "pos"
 CUSTOMER_CUSTOM_ID_KEY = "legacy_customer_id"
 CANADIAN_PROVINCE_CODES = frozenset("AB BC MB NB NL NS NT NU ON PE QC SK YT".split())
+MAX_CUSTOMER_CREATE_ATTEMPTS = 5
+CUSTOMER_CONTACT_FIELDS = {"email": "email", "phone": "phone", "firstname": "firstName", "lastname": "lastName"}
+MAILING_ADDRESS_FIELDS = {field.casefold(): field for field in (
+    "firstName", "lastName", "company", "address1", "address2", "city", "province", "provinceCode", "zip", "countryCode", "phone",
+)}
+MAILING_ADDRESS_FIELDS.update({"state": "provinceCode", "postalcode": "zip", "country": "countryCode"})
 AUTO_ARCHIVED_ZERO_STOCK_NAMESPACE = "pos"
 AUTO_ARCHIVED_ZERO_STOCK_KEY = "auto_archived_zero_stock"
 MATRIX_VARIANT_SKU_RE = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
+
+
+class CustomerCreateFailure(ShopifyAPIError):
+    def __init__(self, error: ShopifyAPIError, address_review: Optional[Dict[str, Any]]) -> None:
+        super().__init__(str(error), error.details, status_code=error.status_code)
+        self.address_review = address_review
 
 
 class InventorySyncService:
@@ -190,7 +202,7 @@ class InventorySyncService:
                 success=False,
                 message=str(exc),
                 failure_reason=_customer_failure_reason(exc),
-                address_review=_customer_address_review(exc, normalized),
+                address_review=exc.address_review if isinstance(exc, CustomerCreateFailure) else None,
                 timestamp=utc_now_iso(),
                 email=normalized.email,
                 phone=normalized.phone,
@@ -557,42 +569,52 @@ class InventorySyncService:
         created = False
         customer_input: Dict[str, Any] = {}
         metafields: List[Dict[str, Any]] = []
+        skipped_fields: List[str] = []
+        address_review = None
         if customer is None:
             customer_input = self._build_customer_create_input(payload)
             metafields = self._build_customer_metafields(payload, custom_id=custom_id)
             if metafields:
                 customer_input["metafields"] = metafields
-            try:
-                # Create-only also protects a customer created between the lookup and this request.
-                customer = self.shopify_client.customer_create(
-                    shop.shop_domain, shop.access_token, input_data=customer_input,
-                )
-                created = True
-            except ShopifyAPIError as error:
-                customer = self._find_existing_customer(shop, identifiers)
-                if customer is None:
+            address_numbers = list(range(1, len(customer_input.get("addresses", [])) + 1))
+            for attempt in range(MAX_CUSTOMER_CREATE_ATTEMPTS):
+                try:
+                    customer = self.shopify_client.customer_create(shop.shop_domain, shop.access_token, input_data=customer_input)
+                    created = True
+                    break
+                except ShopifyAPIError as error:
+                    customer = self._find_existing_customer(shop, identifiers)
+                    if customer is not None:
+                        break
+                    review = _customer_address_review(error, customer_input.get("addresses", []), address_numbers)
+                    if attempt + 1 == MAX_CUSTOMER_CREATE_ATTEMPTS:
+                        raise CustomerCreateFailure(error, address_review or review) from error
                     compatible = _customer_address_province_retry(error, customer_input)
-                    if compatible is None:
-                        raise
-                    try:
-                        customer = self.shopify_client.customer_create(shop.shop_domain, shop.access_token, input_data=compatible)
-                        created = True
-                    except ShopifyAPIError:
-                        customer = self._find_existing_customer(shop, identifiers)
-                        if customer is None:
-                            raise
+                    if compatible is not None:
+                        customer_input = compatible
+                        continue
+                    # The POS ID stays in every create attempt, including attempts without contact fields.
+                    reduced = _omit_rejected_customer_fields(error, customer_input, address_numbers) if custom_id else None
+                    if reduced is None:
+                        raise CustomerCreateFailure(error, address_review or review) from error
+                    customer_input, address_numbers, omitted = reduced
+                    skipped_fields.extend(omitted)
+                    if review:
+                        address_review = _merge_customer_address_reviews(address_review, review)
 
         return CustomerSyncResult(
             shop_domain=shop.shop_domain,
             pos_customer_number=payload.pos_customer_number,
             source=payload.source,
             success=True,
-            message="Customer added successfully." if created else "Existing Shopify customer preserved; no changes made.",
+            message=("Customer added with some fields skipped." if skipped_fields else "Customer added successfully.")
+            if created else "Existing Shopify customer preserved; no changes made.",
             timestamp=utc_now_iso(),
             customer_id=customer["id"],
-            email=customer.get("email") or payload.email,
-            phone=customer.get("phone") or payload.phone,
+            email=customer.get("email") or (customer_input.get("email") if created else payload.email),
+            phone=customer.get("phone") or (customer_input.get("phone") if created else payload.phone),
             name=customer.get("displayName") or _customer_display_name(payload),
+            address_review=address_review if created else None,
             details={
                 "append_only": True,
                 "created": created,
@@ -600,6 +622,7 @@ class InventorySyncService:
                 "metafield_count": len(metafields) if created else 0,
                 "address_count": len(customer_input.get("addresses") or []) if created else 0,
                 "tag_count": len(customer_input.get("tags") or []) if created else 0,
+                "skipped_fields": skipped_fields if created else [],
             },
         )
 
@@ -2470,13 +2493,85 @@ def _customer_address_province_retry(error: ShopifyAPIError, customer_input: Dic
     return {**customer_input, "addresses": addresses} if changed else None
 
 
-def _customer_address_review(error: Exception, payload: CustomerSyncRequest) -> Optional[Dict[str, Any]]:
-    if not isinstance(error, ShopifyAPIError):
+def _omit_rejected_customer_fields(
+    error: ShopifyAPIError, customer_input: Dict[str, Any], address_numbers: List[int],
+) -> Optional[tuple[Dict[str, Any], List[int], List[str]]]:
+    errors = error.details.get("user_errors")
+    if not isinstance(errors, list) or not errors:
         return None
+    revised = dict(customer_input)
+    addresses = [dict(address) for address in customer_input.get("addresses", [])]
+    skipped = set()
+    dropped = set()
+    for entry in errors:
+        if not isinstance(entry, dict):
+            return None
+        path = [part.casefold() for part in _customer_error_path(entry)]
+        if path[:1] == ["input"]:
+            path = path[1:]
+        if not path:
+            return None
+        if path[0] not in {"address", "addresses"}:
+            field = CUSTOMER_CONTACT_FIELDS.get(path[0]) if len(path) == 1 else None
+            if field is None or field not in customer_input:
+                return None
+            revised.pop(field, None)
+            skipped.add(field)
+            continue
+
+        suffix = path[1:]
+        if path == ["addresses"] and addresses:
+            dropped.update(range(len(addresses)))
+            continue
+        if suffix and re.fullmatch(r"[0-9]{1,3}", suffix[0]):
+            index = int(suffix.pop(0))
+        elif len(addresses) == 1:
+            index = 0
+        else:
+            return None
+        if index >= len(addresses) or len(suffix) > 1:
+            return None
+        label = f"address {address_numbers[index]}"
+        if not suffix:
+            dropped.add(index)
+            continue
+        field = MAILING_ADDRESS_FIELDS.get(suffix[0])
+        if field is None:
+            return None
+        address = addresses[index]
+        possible_keys = ("province", "provinceCode") if field in {"province", "provinceCode"} else (field,)
+        # A country-less address can be assigned to the wrong country. Skip the
+        # address if its country is rejected or Shopify requires a field we omitted.
+        if field == "countryCode" or not any(key in customer_input["addresses"][index] for key in possible_keys):
+            dropped.add(index)
+        else:
+            for key in possible_keys:
+                address.pop(key, None)
+            skipped.add(f"{label} {field}")
+
+    retained = []
+    retained_numbers = []
+    for index, address in enumerate(addresses):
+        if index in dropped or not any(address.get(k) for k in ("address1", "address2", "city", "province", "provinceCode", "zip")):
+            skipped.add(f"address {address_numbers[index]}")
+        else:
+            retained.append(address)
+            retained_numbers.append(address_numbers[index])
+    if retained:
+        revised["addresses"] = retained
+    else:
+        revised.pop("addresses", None)
+    if revised == customer_input or not any(revised.get(field) for field in CUSTOMER_CONTACT_FIELDS.values()):
+        return None
+    return revised, retained_numbers, sorted(skipped)
+
+
+def _customer_address_review(
+    error: ShopifyAPIError, addresses: List[Dict[str, Any]], address_numbers: List[int],
+) -> Optional[Dict[str, Any]]:
     errors = error.details.get("user_errors")
     if not isinstance(errors, list):
         return None
-    addresses = _customer_import_addresses(payload)
     issues = []
     candidates = set()
     ambiguous = False
@@ -2502,15 +2597,32 @@ def _customer_address_review(error: Exception, payload: CustomerSyncRequest) -> 
         # The exact Shopify response may repeat a contact value. Show the mailing address, not the phone or email.
         message = re.sub(r"\b[\w.+-]+@[\w.-]+\.\w+\b", "[email omitted]", message)
         message = re.sub(r"(?<!\w)\+?\d(?:[ .()\-]*\d){6,}(?!\w)", "[number omitted]", message)
-        issues.append({"field": ".".join(path)[:180], "message": message[:500], "address_number": None if index is None else index + 1})
+        issues.append({"field": ".".join(path)[:180], "message": message[:500], "address_number": None if index is None else address_numbers[index]})
     if not issues:
         return None
     allowed = ("address1", "address2", "city", "provinceCode", "zip", "countryCode")
+    submitted = []
+    for index in range(len(addresses)) if ambiguous else sorted(candidates):
+        address = dict(addresses[index])
+        if "province" in address:
+            address.setdefault("provinceCode", address["province"])
+        submitted.append({"number": address_numbers[index], **{key: address[key][:250] for key in allowed if key in address}})
     return {
         "issues": issues,
         "ambiguous": ambiguous,
-        "addresses": [{"number": index + 1, **{key: addresses[index][key][:250] for key in allowed if key in addresses[index]}}
-                      for index in (range(len(addresses)) if ambiguous else sorted(candidates))],
+        "addresses": submitted,
+    }
+
+
+def _merge_customer_address_reviews(previous: Optional[Dict[str, Any]], current: Dict[str, Any]) -> Dict[str, Any]:
+    if previous is None:
+        return current
+    addresses = {address["number"]: address for address in current["addresses"]}
+    addresses.update({address["number"]: address for address in previous["addresses"]})
+    return {
+        "issues": [*previous["issues"], *current["issues"]],
+        "ambiguous": previous["ambiguous"] or current["ambiguous"],
+        "addresses": [addresses[number] for number in sorted(addresses)],
     }
 
 

@@ -169,6 +169,53 @@ class AppendOnlyCustomerTests(unittest.TestCase):
         self.assertEqual(second["metafields"], first["metafields"])
         self.assert_no_customer_updates()
 
+    def test_customer_create_omits_only_rejected_zip_and_phone(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "Primary mailing address", "provinceCode": "MI", "zip": "48038"},
+            {"address1": "Secondary mailing address", "provinceCode": "OH", "zip": "99999"},
+        ]})
+        self.client.customer_create.side_effect = [ShopifyAPIError("Fields rejected", {
+            "user_errors": [{"field": ["input", "addresses", "1", "zip"], "message": "ZIP is invalid"},
+                            {"field": ["input", "phone"], "message": "Phone is invalid"}],
+        }), self.client.customer_create.return_value]
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertTrue(result.success)
+        first, second = [call.kwargs["input_data"] for call in self.client.customer_create.call_args_list]
+        self.assertNotIn("phone", second)
+        self.assertNotIn("zip", second["addresses"][1])
+        self.assertEqual(second["addresses"][1]["address1"], first["addresses"][1]["address1"])
+        self.assertEqual(second["addresses"][0], first["addresses"][0])
+        self.assertEqual(second["metafields"], first["metafields"])
+        self.assertEqual(second["email"], first["email"])
+        self.assertIsNone(result.phone)
+        self.assertEqual(result.details["skipped_fields"], ["address 2 zip", "phone"])
+        self.assertEqual(result.address_review["addresses"][0]["zip"], "99999")
+        self.assert_no_customer_updates()
+
+    def test_rejected_required_address_field_skips_only_that_address(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "Primary mailing address", "countryCode": "US"},
+            {"address1": "Secondary mailing address", "countryCode": "CA"},
+        ]})
+        self.client.customer_create.side_effect = [ShopifyAPIError("Address country rejected", {
+            "user_errors": [{"field": ["input", "addresses", "0", "countryCode"], "message": "Country is invalid"}],
+        }), self.client.customer_create.return_value]
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertTrue(result.success)
+        self.assertEqual(result.details["skipped_fields"], ["address 1"])
+        addresses = self.client.customer_create.call_args.kwargs["input_data"]["addresses"]
+        self.assertEqual([address["address1"] for address in addresses], ["Secondary mailing address"])
+
+    def test_ambiguous_address_subfield_does_not_drop_multiple_addresses(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {"address1": "First Street", "zip": "48038"}, {"address1": "Second Street", "zip": "44101"},
+        ]})
+        self.client.customer_create.side_effect = ShopifyAPIError("ZIP rejected", {
+            "user_errors": [{"field": ["input", "addresses", "zip"], "message": "ZIP is invalid"}],
+        })
+        self.assertFalse(self.service.sync_customer(payload, self.shop).success)
+        self.client.customer_create.assert_called_once()
+
     def test_invalid_identity_cannot_create_a_name_only_duplicate(self) -> None:
         result = self.service.sync_customer(CustomerSyncRequest(firstName='Name only'), self.shop)
         self.assertFalse(result.success)

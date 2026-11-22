@@ -721,7 +721,7 @@ function renderCustomerSyncHistory(items) {
               ${item.has_address_review ? `<button class="text-link customer-address-toggle" type="button" data-customer-address="${escapeHtml(item.id)}" aria-expanded="${state.customerAddressReview?.eventId === String(item.id)}" aria-controls="customer-address-${escapeHtml(item.id)}">${state.customerAddressReview?.eventId === String(item.id) ? "Hide address details" : "View address details"}</button>` : ""}
             </div>
           </div>
-          ${statusBadge(...(outcomes[item.outcome] || outcomes.processed))}
+          ${statusBadge(...(item.outcome === "created" && item.reason ? ["Added with skipped fields", "warning"] : outcomes[item.outcome] || outcomes.processed))}
           ${item.has_address_review ? renderCustomerAddressReview(item.id) : ""}
         </article>
       `).join("")}

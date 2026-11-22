@@ -134,8 +134,12 @@ inventory. The Customers tab shows check-ins and recent import results. The Wind
 aggregate results for each batch.
 For an address rejection, **View address details** shows the submitted mailing address fields and
 Shopify's validation error when available. Details are accessible in the signed-in shop dashboard
-for 24 hours after the last rejection and are cleared when the record syncs. Older failures can
-show details after the connector retries them.
+for 24 hours after the last rejection or partial import. Older failures can show details after the
+connector retries them. If Shopify specifically rejects a name, email, phone, or address field, a
+new customer with a stable POS ID can be created without that field. An explicitly rejected address
+is omitted if its fields cannot be accepted safely. The Customers tab records **Added with skipped
+fields**. Update the omitted fields in Shopify after reviewing them. Routine sync preserves records
+that already exist in Shopify.
 Recurring uploads omit contact payloads from request/feed logs. Contact details are not stored in
 `customers.json`.
 

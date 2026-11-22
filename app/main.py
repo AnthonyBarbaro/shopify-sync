@@ -2552,6 +2552,9 @@ def _customer_history_event(row: CustomerSyncResult) -> CustomerHistoryEvent:
     if not row.success:
         return CustomerHistoryEvent(row.pos_customer_number, "failed", row.failure_reason or "Customer sync failed.", row.address_review)
     outcome = "created" if row.details.get("created") is True else "matched" if row.details.get("skipped_existing") is True else "processed"
+    skipped_fields = row.details.get("skipped_fields")
+    if outcome == "created" and skipped_fields:
+        return CustomerHistoryEvent(row.pos_customer_number, outcome, f"Skipped: {', '.join(skipped_fields)}", row.address_review)
     return CustomerHistoryEvent(row.pos_customer_number, outcome)
 
 

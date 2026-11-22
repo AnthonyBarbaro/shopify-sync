@@ -1074,7 +1074,7 @@ class DatabaseStore:
                     ).fetchone()
                     now = utc_now_iso()
                     ciphertext = None
-                    if number and event.outcome == "failed" and event.address_review:
+                    if number and event.outcome in {"failed", "created"} and event.address_review:
                         raw = json.dumps(event.address_review, separators=(",", ":")).encode("utf-8")
                         ciphertext = self._fernet.encrypt(raw).decode("ascii")
                     reviewed_at = now if ciphertext else None
