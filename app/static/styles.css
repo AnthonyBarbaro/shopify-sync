@@ -167,6 +167,17 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .order-row > .badge { justify-self: end; }
 .customer-history .order-row { grid-template-columns: minmax(0, 1fr) auto; }
 .customer-history .order-main, .customer-history .order-row > .badge { grid-row: auto; }
+.customer-address-toggle { border: 0; background: transparent; padding: 0; cursor: pointer; }
+.customer-address-review { grid-column: 1 / -1; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #f7faf7; overflow-wrap: anywhere; }
+.customer-address-heading { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.customer-address-heading small { color: var(--muted); }
+.customer-address-review ul { padding-left: 18px; }
+.customer-address-review li { margin: 7px 0; }
+.customer-address-review li span { display: block; margin-top: 3px; }
+.customer-address-review code { font-size: 11px; color: var(--muted); }
+.customer-address-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 10px; }
+.customer-address-cards > div { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1fr); gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; background: white; font-size: 12px; }
+.customer-address-cards strong { grid-column: 1 / -1; }
 .order-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .order-main > div { min-width: 0; }
 .order-main strong, .order-main small, .order-meta strong, .order-meta small, .price-change strong, .price-change small { display: block; }

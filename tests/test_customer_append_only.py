@@ -109,6 +109,24 @@ class AppendOnlyCustomerTests(unittest.TestCase):
         self.assertNotIn("sample@example.test", result.failure_reason)
         self.client.customer_create.assert_not_called()
 
+    def test_address_failure_points_to_the_exact_submitted_address(self) -> None:
+        payload = CustomerSyncRequest.model_validate({**self.payload.model_dump(), "addresses": [
+            {}, {"address1": "123 First Street", "zip": "10001"},
+            {"address1": "456 Second Street", "zip": "99999", "phone": "+15551234567"},
+        ]})
+        self.client.customer_create.side_effect = ShopifyAPIError("Shopify rejected this customer", {
+            "user_errors": [{"field": ["input", "addresses", "1", "zip"], "message": "ZIP code does not match the state"}],
+        })
+        result = self.service.sync_customer(payload, self.shop)
+        self.assertFalse(result.success)
+        self.assertEqual(result.address_review["issues"][0]["address_number"], 2)
+        self.assertEqual(result.address_review["issues"][0]["field"], "input.addresses.1.zip")
+        self.assertEqual(result.address_review["addresses"], [
+            {"number": 2, "address1": "456 Second Street", "zip": "99999", "countryCode": "US"},
+        ])
+        self.assertNotIn("address_review", result.model_dump())
+        self.assertNotIn("456 Second Street", result.model_dump_json())
+
     def test_invalid_identity_cannot_create_a_name_only_duplicate(self) -> None:
         result = self.service.sync_customer(CustomerSyncRequest(firstName='Name only'), self.shop)
         self.assertFalse(result.success)

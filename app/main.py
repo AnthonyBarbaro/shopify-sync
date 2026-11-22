@@ -35,7 +35,7 @@ from app.auth import (
     verify_shopify_webhook_hmac,
 )
 from app.config import get_settings
-from app.db import DatabaseStore, PosCredentialRecord, ShopRecord
+from app.db import CustomerHistoryEvent, DatabaseStore, PosCredentialRecord, ShopRecord
 from app.inventory import InventorySyncService
 from app.models import (
     BulkSyncResponse,
@@ -1645,6 +1645,16 @@ def customer_sync_history(
                         headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/customer-sync-history/{event_id}/address", response_model=None)
+def customer_address_review(request: Request, event_id: int) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    review = db.get_customer_address_review(shop.shop_domain, event_id=event_id)
+    headers = {"Cache-Control": "no-store"}
+    if review is None:
+        return JSONResponse({"error": {"message": "These address details are no longer available."}}, status_code=404, headers=headers)
+    return JSONResponse(review, headers=headers)
+
+
 @app.get("/api/sales-board/settings")
 def sales_board_settings(request: Request) -> SalesBoardSettings:
     shop, _session = _get_session_context(request)
@@ -2538,11 +2548,11 @@ async def _handle_external_customer_sync(request: Request, shop: ShopRecord) -> 
     return result
 
 
-def _customer_history_event(row: CustomerSyncResult) -> tuple[str | None, str, str | None]:
+def _customer_history_event(row: CustomerSyncResult) -> CustomerHistoryEvent:
     if not row.success:
-        return row.pos_customer_number, "failed", row.failure_reason or "Customer sync failed."
+        return CustomerHistoryEvent(row.pos_customer_number, "failed", row.failure_reason or "Customer sync failed.", row.address_review)
     outcome = "created" if row.details.get("created") is True else "matched" if row.details.get("skipped_existing") is True else "processed"
-    return row.pos_customer_number, outcome, None
+    return CustomerHistoryEvent(row.pos_customer_number, outcome)
 
 
 async def _handle_external_customer_bulk_sync(request: Request, shop: ShopRecord) -> CustomerBulkSyncResponse | JSONResponse:
@@ -3860,6 +3870,7 @@ async def compliance_webhooks(request: Request) -> JSONResponse:
     body = await request.body()
     shop_domain = verify_webhook_request(request, body)
     if request.url.path.endswith("/customers/redact") and db.get_shop(shop_domain) is not None:
+        db.clear_customer_address_reviews(shop_domain)
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:

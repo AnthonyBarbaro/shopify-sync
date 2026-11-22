@@ -1,10 +1,12 @@
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
-from app.db import DatabaseStore
+from app.db import CustomerHistoryEvent, DatabaseStore
 from app.models import SalesBoardSnapshot
+from app.utils import utc_now
 from windows_connector.order_dbf import DbfField, _serialize_dbf
 from windows_connector.sales_board import build_sales_board, sales_paths
 
@@ -70,11 +72,32 @@ class SalesBoardTests(unittest.TestCase):
     def test_customer_log_retains_creation_and_deduplicates_consecutive_failure_retries(self):
         with tempfile.TemporaryDirectory() as directory:
             db = DatabaseStore(str(Path(directory) / "test.sqlite"), "test")
-            rows = [("1", "created", None), ("2", "failed", "Missing permission"),
-                    ("2", "failed", "Missing permission"), ("2", "matched", None)]
+            rows = [CustomerHistoryEvent("1", "created"), CustomerHistoryEvent("2", "failed", "Missing permission"),
+                    CustomerHistoryEvent("2", "failed", "Missing permission"), CustomerHistoryEvent("2", "matched")]
             db.record_customer_sync_history("one", rows)
             newest = db.list_customer_sync_history("one", before=2**63 - 1, outcome=None)
             self.assertEqual([row["outcome"] for row in newest], ["matched", "failed", "created"])
             older = db.list_customer_sync_history("one", before=newest[0]["id"], outcome="failed")
             self.assertEqual([(row["pos_customer_number"], row["reason"]) for row in older], [("2", "Missing permission")])
             self.assertEqual(db.list_customer_sync_history("two", before=2**63 - 1, outcome=None), [])
+
+    def test_customer_address_review_is_encrypted_scoped_and_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = DatabaseStore(str(Path(directory) / "test.sqlite"), "test")
+            address = {"addresses": [{"address1": "123 Private Street"}]}
+            db.record_customer_sync_history("one", [CustomerHistoryEvent("1", "failed", "Address rejected")])
+            db.record_customer_sync_history("one", [CustomerHistoryEvent("1", "failed", "Address rejected", address)])
+            rows = db.list_customer_sync_history("one", before=2**63 - 1, outcome=None)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertTrue(row["has_address_review"])
+            self.assertNotIn("Private Street", str(row))
+            with db._connect() as connection:
+                data = connection.execute("SELECT address_review_ciphertext FROM customer_sync_history").fetchone()[0]
+                self.assertNotIn("Private Street", data)
+            self.assertIsNone(db.get_customer_address_review("two", event_id=row["id"]))
+            self.assertEqual(db.get_customer_address_review("one", event_id=row["id"])["addresses"], address["addresses"])
+            with mock.patch("app.db.utc_now", return_value=utc_now() + timedelta(hours=25)):
+                self.assertIsNone(db.get_customer_address_review("one", event_id=row["id"]))
+            db.record_customer_sync_history("one", [CustomerHistoryEvent("1", "created")])
+            self.assertIsNone(db.get_customer_address_review("one", event_id=row["id"]))

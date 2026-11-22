@@ -32,10 +32,12 @@ const state = {
   customerLogOutcome: "",
   customerLogBefore: null,
   customerLogRequest: 0,
+  customerAddressReview: null,
 }
 
 document.addEventListener("DOMContentLoaded", () => boot())
 window.addEventListener("popstate", () => {
+  state.customerAddressReview = null
   render()
   if (window.location.pathname === "/app/sales") refreshSales()
   if (window.location.pathname === "/app/customers") refreshCustomerLog()
@@ -91,6 +93,7 @@ document.addEventListener("click", async (event) => {
     state.customerLogOutcome = historyFilter.dataset.customerOutcome
     state.customerLogBefore = null
     state.customerLog = null
+    state.customerAddressReview = null
     await refreshCustomerLog()
     return
   }
@@ -99,7 +102,14 @@ document.addEventListener("click", async (event) => {
   if (historyPage) {
     state.customerLogBefore = historyPage.dataset.customerBefore || null
     state.customerLog = null
+    state.customerAddressReview = null
     await refreshCustomerLog()
+    return
+  }
+
+  const addressReview = event.target.closest("[data-customer-address]")
+  if (addressReview) {
+    await toggleCustomerAddress(addressReview.dataset.customerAddress)
     return
   }
 
@@ -177,6 +187,23 @@ async function refreshCustomerLog() {
     state.customerLogError = error
   }
   if (window.location.pathname === "/app/customers") render()
+}
+
+async function toggleCustomerAddress(eventId) {
+  if (state.customerAddressReview?.eventId === eventId) {
+    state.customerAddressReview = null
+    render()
+    return
+  }
+  const review = { eventId, data: null, error: null }
+  state.customerAddressReview = review
+  render()
+  try {
+    review.data = await fetchJson(`/api/customer-sync-history/${encodeURIComponent(eventId)}/address`)
+  } catch (error) {
+    review.error = error.message
+  }
+  if (state.customerAddressReview === review && window.location.pathname === "/app/customers") render()
 }
 
 async function ensureSalesSettings() {
@@ -297,6 +324,7 @@ async function testShopify() {
 function navigate(path) {
   window.history.pushState({}, "", `${path}${window.location.search}`)
   state.salesSettingsDirty = false
+  state.customerAddressReview = null
   if (path === "/app/settings") {
     state.salesSettingsError = null
     ensureConnection().then(render).catch((error) => {
@@ -690,13 +718,33 @@ function renderCustomerSyncHistory(items) {
               <strong>${item.pos_customer_number ? `POS customer #${escapeHtml(item.pos_customer_number)}` : "POS customer"}</strong>
               <small>${escapeHtml(formatDate(item.received_at))}</small>
               ${item.reason ? `<small>${escapeHtml(item.reason)}</small>` : ""}
+              ${item.has_address_review ? `<button class="text-link customer-address-toggle" type="button" data-customer-address="${escapeHtml(item.id)}" aria-expanded="${state.customerAddressReview?.eventId === String(item.id)}" aria-controls="customer-address-${escapeHtml(item.id)}">${state.customerAddressReview?.eventId === String(item.id) ? "Hide address details" : "View address details"}</button>` : ""}
             </div>
           </div>
           ${statusBadge(...(outcomes[item.outcome] || outcomes.processed))}
+          ${item.has_address_review ? renderCustomerAddressReview(item.id) : ""}
         </article>
       `).join("")}
     </div>
   `
+}
+
+function renderCustomerAddressReview(id) {
+  const review = state.customerAddressReview
+  const attributes = `id="customer-address-${escapeHtml(id)}" class="customer-address-review"`
+  if (review?.eventId !== String(id)) return `<div ${attributes} hidden></div>`
+  if (review.error) return `<div ${attributes} role="status">${escapeHtml(review.error)}</div>`
+  if (!review.data) return `<div ${attributes} role="status">Loading address details…</div>`
+  const { issues, ambiguous, addresses, reviewed_at } = review.data
+  return `<div ${attributes}>
+    <div class="customer-address-heading"><strong>Shopify validation</strong><small>${escapeHtml(formatDate(reviewed_at))}</small></div>
+    <ul>${issues.map((issue) => `<li>${issue.address_number ? `<strong>Address ${escapeHtml(issue.address_number)}</strong> · ` : ""}<code>${escapeHtml(issue.field)}</code><span>${escapeHtml(issue.message)}</span></li>`).join("")}</ul>
+    ${ambiguous && addresses.length > 1 ? `<p>Shopify did not identify which submitted address caused at least one of these errors.</p>` : ""}
+    <div class="customer-address-cards">${addresses.map((address) => `<div>
+      <strong>Submitted address ${escapeHtml(address.number)}</strong>
+      ${[["Street", address.address1], ["Unit", address.address2], ["City", address.city], ["State / province", address.provinceCode], ["ZIP / postal code", address.zip], ["Country", address.countryCode]].map(([label, value]) => `<span>${label}</span><span>${escapeHtml(value || "—")}</span>`).join("")}
+    </div>`).join("")}</div>
+  </div>`
 }
 
 function renderOrderList(items, compact) {

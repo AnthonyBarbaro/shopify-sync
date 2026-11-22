@@ -153,6 +153,18 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         status, result = await self.post(None, path="/sync/sales-board/settings", method="GET")
         self.assertEqual((status, result), (200, {"enabled": False, "interval_seconds": 90}))
 
+    async def test_customer_address_review_requires_a_shop_dashboard_session(self) -> None:
+        path = "/api/customer-sync-history/17/address"
+        status, _ = await self.post(None, path=path, method="GET")
+        self.assertEqual(status, 401)
+        self.main.db.get_customer_address_review.assert_not_called()
+        with mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})):
+            self.main.db.get_customer_address_review.return_value = {"addresses": [{"zip": "99999"}]}
+            status, payload = await self.post(None, path=path, method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["addresses"], [{"zip": "99999"}])
+        self.main.db.get_customer_address_review.assert_called_once_with(self.shop.shop_domain, event_id=17)
+
     async def test_force_sync_requires_dashboard_session_and_uses_its_shop(self) -> None:
         status, _body = await self.post({}, path="/api/connector/force-sync")
         self.assertEqual(status, 401)

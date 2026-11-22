@@ -132,6 +132,10 @@ Enable the customer permissions on Railway and in Shopify before upgrading Windo
 customer uploads use separate sessions and state files. Customer upload failures do not stop
 inventory. The Customers tab shows check-ins and recent import results. The Windows log has
 aggregate results for each batch.
+For an address rejection, **View address details** shows the submitted mailing address fields and
+Shopify's validation error when available. Details are accessible in the signed-in shop dashboard
+for 24 hours after the last rejection and are cleared when the record syncs. Older failures can
+show details after the connector retries them.
 Recurring uploads omit contact payloads from request/feed logs. Contact details are not stored in
 `customers.json`.
 

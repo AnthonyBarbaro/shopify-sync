@@ -225,6 +225,7 @@ class CustomerSyncResult(BaseModel):
     success: bool
     message: str
     failure_reason: Optional[str] = None
+    address_review: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
     timestamp: str
     customer_id: Optional[str] = None
     email: Optional[str] = None

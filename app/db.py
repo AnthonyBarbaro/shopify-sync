@@ -4,13 +4,25 @@ import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from app.utils import AuthorizationError, setup_logging, utc_now_iso
+from app.utils import AuthorizationError, setup_logging, utc_now, utc_now_iso
+
+
+ADDRESS_REVIEW_TTL = timedelta(hours=24)
+
+
+@dataclass(frozen=True)
+class CustomerHistoryEvent:
+    pos_customer_number: str | None
+    outcome: str
+    reason: str | None = None
+    address_review: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -403,6 +415,10 @@ class DatabaseStore:
             )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_customer_history_shop ON customer_sync_history(shop_domain, id DESC)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_customer_history_identity ON customer_sync_history(shop_domain, pos_customer_number, id DESC)")
+            self._ensure_column(connection, "customer_sync_history", "address_review_ciphertext", "TEXT")
+            self._ensure_column(connection, "customer_sync_history", "address_review_at", "TEXT")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_customer_address_review_expiry ON customer_sync_history(address_review_at) WHERE address_review_at IS NOT NULL")
+            self._prune_customer_address_reviews(connection)
             self._ensure_column(connection, "connector_heartbeats", "last_customer_poll_at", "TEXT")
             self._ensure_column(connection, "connector_heartbeats", "connector_settings", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "product_title", "TEXT")
@@ -1033,24 +1049,56 @@ class DatabaseStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def record_customer_sync_history(self, shop_domain: str, events: list[tuple[str | None, str, str | None]]) -> None:
+    @staticmethod
+    def _prune_customer_address_reviews(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            UPDATE customer_sync_history SET address_review_at=NULL, address_review_ciphertext=NULL
+            WHERE address_review_at < ?
+            """,
+            ((utc_now() - ADDRESS_REVIEW_TTL).isoformat(),),
+        )
+
+    def record_customer_sync_history(self, shop_domain: str, events: list[CustomerHistoryEvent]) -> None:
         try:
             with self._connect() as connection:
-                connection.executemany(
-                    """
-                    INSERT INTO customer_sync_history (shop_domain, pos_customer_number, outcome, reason, received_at)
-                    SELECT ?, ?, ?, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM (
-                            SELECT outcome, reason FROM customer_sync_history
-                            WHERE shop_domain = ? AND pos_customer_number IS ?
-                            ORDER BY id DESC LIMIT 1
-                        ) WHERE outcome = ? AND reason IS ? AND outcome = 'failed'
+                self._prune_customer_address_reviews(connection)
+                for event in events:
+                    number = event.pos_customer_number
+                    latest = connection.execute(
+                        """
+                        SELECT id, outcome, reason, address_review_at FROM customer_sync_history
+                        WHERE shop_domain = ? AND pos_customer_number IS ? ORDER BY id DESC LIMIT 1
+                        """,
+                        (shop_domain, number),
+                    ).fetchone()
+                    now = utc_now_iso()
+                    ciphertext = None
+                    if number and event.outcome == "failed" and event.address_review:
+                        raw = json.dumps(event.address_review, separators=(",", ":")).encode("utf-8")
+                        ciphertext = self._fernet.encrypt(raw).decode("ascii")
+                    reviewed_at = now if ciphertext else None
+                    repeated_failure = latest and event.outcome == latest["outcome"] == "failed" and event.reason == latest["reason"]
+                    if repeated_failure:
+                        if ciphertext or latest["address_review_at"]:
+                            connection.execute(
+                                "UPDATE customer_sync_history SET address_review_at=?, address_review_ciphertext=? WHERE id=?",
+                                (reviewed_at, ciphertext, latest["id"]),
+                            )
+                        continue
+                    if latest and latest["address_review_at"]:
+                        connection.execute(
+                            "UPDATE customer_sync_history SET address_review_at=NULL, address_review_ciphertext=NULL WHERE id=?",
+                            (latest["id"],),
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO customer_sync_history
+                            (shop_domain, pos_customer_number, outcome, reason, received_at, address_review_at, address_review_ciphertext)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (shop_domain, number, event.outcome, event.reason, now, reviewed_at, ciphertext),
                     )
-                    """,
-                    [(shop_domain, number, outcome, reason, utc_now_iso(), shop_domain, number, outcome, reason)
-                     for number, outcome, reason in events],
-                )
         except sqlite3.Error:
             self.logger.exception("customer_history_write_failed")
 
@@ -1058,13 +1106,44 @@ class DatabaseStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, pos_customer_number, outcome, reason, received_at FROM customer_sync_history
+                SELECT id, pos_customer_number, outcome, reason, received_at,
+                    COALESCE(address_review_at >= ?, 0) AS has_address_review
+                FROM customer_sync_history
                 WHERE shop_domain = ? AND id < ? AND (? IS NULL OR outcome = ?)
                 ORDER BY id DESC LIMIT 51
                 """,
-                (shop_domain, before, outcome, outcome),
+                ((utc_now() - ADDRESS_REVIEW_TTL).isoformat(), shop_domain, before, outcome, outcome),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_customer_address_review(self, shop_domain: str, *, event_id: int) -> dict[str, Any] | None:
+        if not 1 <= event_id < 2**63:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT address_review_at, address_review_ciphertext FROM customer_sync_history
+                WHERE shop_domain = ? AND id = ? AND address_review_at >= ?
+                """,
+                (shop_domain, event_id, (utc_now() - ADDRESS_REVIEW_TTL).isoformat()),
+            ).fetchone()
+        if row is None or not row["address_review_ciphertext"]:
+            return None
+        try:
+            data = json.loads(self._fernet.decrypt(row["address_review_ciphertext"].encode("ascii")))
+        except (InvalidToken, ValueError):
+            return None
+        return {**data, "reviewed_at": row["address_review_at"]}
+
+    def clear_customer_address_reviews(self, shop_domain: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE customer_sync_history SET address_review_at=NULL, address_review_ciphertext=NULL
+                WHERE shop_domain = ? AND address_review_at IS NOT NULL
+                """,
+                (shop_domain,),
+            )
 
     def feed_event_count(self, shop_domain: str) -> int:
         with self._connect() as connection:

@@ -189,6 +189,7 @@ class InventorySyncService:
                 success=False,
                 message=str(exc),
                 failure_reason=_customer_failure_reason(exc),
+                address_review=_customer_address_review(exc, normalized),
                 timestamp=utc_now_iso(),
                 email=normalized.email,
                 phone=normalized.phone,
@@ -637,10 +638,9 @@ class InventorySyncService:
         if payload.taxExempt is not None:
             customer_input["taxExempt"] = bool(payload.taxExempt)
 
-        addresses = [_prepare_customer_address(address) for address in payload.addresses]
-        addresses = [address for address in addresses if address]
+        addresses = _customer_import_addresses(payload)
         if addresses:
-            customer_input["addresses"] = addresses[:10]
+            customer_input["addresses"] = addresses
 
         if not customer_input:
             raise SyncProcessingError(
@@ -2410,6 +2410,55 @@ def _auto_archive_metafield_input(*, value: bool) -> Dict[str, str]:
         "key": AUTO_ARCHIVED_ZERO_STOCK_KEY,
         "type": "boolean",
         "value": "true" if value else "false",
+    }
+
+
+def _customer_import_addresses(payload: CustomerSyncRequest) -> List[Dict[str, Any]]:
+    return [prepared for address in payload.addresses if (prepared := _prepare_customer_address(address))][:10]
+
+
+def _customer_address_review(error: Exception, payload: CustomerSyncRequest) -> Optional[Dict[str, Any]]:
+    if not isinstance(error, ShopifyAPIError):
+        return None
+    errors = error.details.get("user_errors")
+    if not isinstance(errors, list):
+        return None
+    addresses = _customer_import_addresses(payload)
+    issues = []
+    candidates = set()
+    ambiguous = False
+    for entry in errors[:10]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("field"), list):
+            continue
+        path = [part for field in entry["field"] if isinstance(field, str)
+                for part in re.split(r"[.\[\]]+", field) if part]
+        address_path = next((i for i, part in enumerate(path) if part.casefold() in {"addresses", "address"}), None)
+        if address_path is None:
+            continue
+        index = None
+        suffix = path[address_path + 1:]
+        if suffix and suffix[0].isascii() and suffix[0].isdigit() and len(suffix[0]) <= 3:
+            index = int(suffix[0])
+        elif len(addresses) == 1:
+            index = 0
+        if index is not None and 0 <= index < len(addresses):
+            candidates.add(index)
+        else:
+            index = None
+            ambiguous = True
+        message = str(entry.get("message") or "Shopify rejected this address field.")
+        # The exact Shopify response may repeat a contact value. Show the mailing address, not the phone or email.
+        message = re.sub(r"\b[\w.+-]+@[\w.-]+\.\w+\b", "[email omitted]", message)
+        message = re.sub(r"(?<!\w)\+?\d(?:[ .()\-]*\d){6,}(?!\w)", "[number omitted]", message)
+        issues.append({"field": ".".join(path)[:180], "message": message[:500], "address_number": None if index is None else index + 1})
+    if not issues:
+        return None
+    allowed = ("address1", "address2", "city", "provinceCode", "zip", "countryCode")
+    return {
+        "issues": issues,
+        "ambiguous": ambiguous,
+        "addresses": [{"number": index + 1, **{key: addresses[index][key][:250] for key in allowed if key in addresses[index]}}
+                      for index in (range(len(addresses)) if ambiguous else sorted(candidates))],
     }
 
 
