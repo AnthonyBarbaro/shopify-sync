@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat
 
@@ -133,19 +133,36 @@ class SalesBoardPeriods(BaseModel):
 
 
 class SalesBoardReceiptLine(BaseModel):
-    sku: str = Field(min_length=1, max_length=80)
+    sku: str | None = Field(default=None, min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=160)
     units: FiniteFloat
     net_cents: int
     gross_profit_cents: int | None = None
+    is_alteration: bool = False
 
 
-class SalesBoardReceipt(SalesBoardTotals):
+class SalesBoardReceiptDetails(SalesBoardTotals):
+    lines: List[SalesBoardReceiptLine]
+
+
+class SalesBoardReceipt(SalesBoardReceiptDetails):
     invoice: str = Field(min_length=1, max_length=80)
     date: date
     register_id: str = Field(max_length=80)
     time: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    lines: List[SalesBoardReceiptLine]
+    with_alterations: SalesBoardReceiptDetails | None = None
+
+
+class SalesBoardStoreSnapshot(BaseModel):
+    customer_count: int | None = None
+    positive_balance_cents: int | None = None
+    inventory_items: int
+    in_stock: int
+    negative_stock: int
+    inventory_cost_cents: int
+    inventory_retail_cents: int
+    missing_stock_costs: int
+    missing_stock_prices: int
 
 
 class SalesBoardSnapshot(BaseModel):
@@ -154,7 +171,33 @@ class SalesBoardSnapshot(BaseModel):
     first_invoice_date: Optional[date] = None
     last_invoice_date: Optional[date] = None
     periods: SalesBoardPeriods
+    periods_with_alterations: SalesBoardPeriods | None = None
     receipts: Dict[str, List[SalesBoardReceipt]] | None = None
+    store_snapshot: SalesBoardStoreSnapshot | None = None
+
+
+class SalesReportLine(BaseModel):
+    date: date
+    hour: int | None = Field(default=None, ge=0, le=23)
+    ticket: int = Field(ge=1)
+    rep: str = Field(max_length=160)
+    rep_id: str = Field(max_length=80)
+    sku: str | None = Field(default=None, max_length=80)
+    product: str | None = Field(default=None, max_length=160)
+    brand: str | None = Field(default=None, max_length=160)
+    category: str = Field(max_length=100)
+    department_code: str | None = Field(default=None, max_length=40)
+    department: str | None = Field(default=None, max_length=100)
+    net_cents: int
+    tax_cents: int = 0
+    units: FiniteFloat
+    cost_cents: int | None = None
+    is_alteration: bool = False
+
+
+class SalesReportUpload(BaseModel):
+    observed_at: AwareDatetime
+    months: Dict[Annotated[str, Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")], List[SalesReportLine]] = Field(min_length=1, max_length=6)
 
 
 class SalesBoardSettings(BaseModel):

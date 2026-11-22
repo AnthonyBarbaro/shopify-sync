@@ -3,6 +3,8 @@ const routes = {
   "/app/orders": { title: "Orders", render: renderOrders },
   "/app/customers": { title: "Customers", render: renderCustomers },
   "/app/sales": { title: "Sales Board", render: renderSalesBoard },
+  "/app/reports": { title: "Sales Reports", render: () => renderSalesReports() },
+  "/app/reports/year-over-year": { title: "Year over Year", render: () => renderSalesYearOverYear() },
   "/app/settings": { title: "Settings", render: renderSettings },
 }
 
@@ -21,6 +23,7 @@ const state = {
   salesLoading: false,
   salesError: null,
   salesPeriod: "month",
+  salesIncludeAlterations: false,
   salesEmployee: null,
   salesReceiptView: null,
   salesFocus: false,
@@ -28,6 +31,22 @@ const state = {
   salesSettingsBusy: false,
   salesSettingsError: null,
   salesSettingsDirty: false,
+  reports: null,
+  reportFilters: null,
+  reportRequest: 0,
+  reportLoading: false,
+  reportError: null,
+  reportGroup: "products",
+  reportSort: "net_cents",
+  reportSearch: "",
+  reportPage: 0,
+  yearReport: null,
+  yearReportFilters: null,
+  yearReportRequest: 0,
+  yearReportLoading: false,
+  yearReportError: null,
+  yearReportTax: false,
+  yearReportSort: "0",
   customerLog: null,
   customerLogError: null,
   customerLogOutcome: "",
@@ -41,14 +60,73 @@ window.addEventListener("popstate", () => {
   state.customerAddressReview = null
   render()
   if (window.location.pathname === "/app/sales") refreshSales()
+  if (window.location.pathname === "/app/reports") refreshSalesReports()
+  if (window.location.pathname === "/app/reports/year-over-year") refreshSalesYearOverYear()
   if (window.location.pathname === "/app/customers") refreshCustomerLog()
 })
 
 document.addEventListener("input", (event) => {
   if (event.target.closest("[data-sales-settings]")) state.salesSettingsDirty = true
+  if (event.target.matches("[data-report-search]")) {
+    state.reportSearch = event.target.value
+    state.reportPage = 0
+    renderReportRankingResults()
+  }
+  const form = event.target.closest("[data-report-form]")
+  if (form && !event.target.matches("[data-report-year]")) {
+    if (["start", "end"].includes(event.target.name)) form.elements.year.value = ""
+    state.reportFilters = readReportFilters(form)
+  }
+  const yearForm = event.target.closest("[data-year-report-form]")
+  if (yearForm) state.yearReportFilters = readYearReportFilters(yearForm)
+})
+
+document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-year-report-tax]")) {
+    state.yearReportTax = event.target.checked
+    render()
+    document.querySelector("[data-year-report-tax]")?.focus({ preventScroll: true })
+    return
+  }
+  if (event.target.matches("[data-year-report-sort]")) {
+    state.yearReportSort = event.target.value
+    renderYearReportDepartments()
+    return
+  }
+  if (event.target.matches("[data-report-year]") && event.target.value) {
+    setReportYear(event.target.form, Number(event.target.value), false)
+    return
+  }
+  if (event.target.matches("[data-report-compare]")) {
+    const comparison = event.target.form.querySelector("[data-comparison-dates]")
+    comparison.hidden = !event.target.checked
+    comparison.disabled = !event.target.checked
+    return
+  }
+  if (event.target.matches("[data-report-sort]")) {
+    state.reportSort = event.target.value
+    state.reportPage = 0
+    renderReportRankingResults()
+    return
+  }
+  if (!event.target.matches("[data-sales-alterations]")) return
+  state.salesIncludeAlterations = event.target.checked
+  reloadSelectedSalesRep()
 })
 
 document.addEventListener("submit", async (event) => {
+  if (event.target.matches("[data-year-report-form]")) {
+    event.preventDefault()
+    state.yearReportFilters = readYearReportFilters(event.target)
+    await refreshSalesYearOverYear()
+    return
+  }
+  if (event.target.matches("[data-report-form]")) {
+    event.preventDefault()
+    state.reportFilters = readReportFilters(event.target)
+    await refreshSalesReports(state.reportFilters)
+    return
+  }
   if (!event.target.matches("[data-sales-settings]")) return
   event.preventDefault()
   await saveSalesSettings(event.target)
@@ -62,14 +140,56 @@ document.addEventListener("click", async (event) => {
     return
   }
 
+  const fullYear = event.target.closest("[data-report-full-year]")
+  if (fullYear) {
+    const form = fullYear.form
+    const year = Number(form.elements.year.value || form.elements.start.value.slice(0, 4))
+    if (year) setReportYear(form, year, true)
+    return
+  }
+
+  const group = event.target.closest("[data-report-group]")
+  if (group) {
+    state.reportGroup = group.dataset.reportGroup
+    state.reportSearch = ""
+    state.reportPage = 0
+    render()
+    document.querySelector(`[data-report-group="${state.reportGroup}"]`)?.focus()
+    return
+  }
+
+  const rankingPage = event.target.closest("[data-report-page]")
+  if (rankingPage) {
+    state.reportPage = Number(rankingPage.dataset.reportPage)
+    renderReportRankingResults()
+    document.getElementById("sales-ranking-heading")?.focus()
+    return
+  }
+
+  if (event.target.closest("[data-report-download]")) {
+    downloadReportRanking()
+    return
+  }
+
+  if (event.target.closest("[data-report-refresh]")) {
+    await refreshSalesReports(state.reportFilters)
+    return
+  }
+
+  if (event.target.closest("[data-year-report-refresh]")) {
+    await refreshSalesYearOverYear()
+    return
+  }
+
+  if (event.target.closest("[data-year-report-print]")) {
+    window.print()
+    return
+  }
+
   const period = event.target.closest("[data-sales-period]")
   if (period) {
     state.salesPeriod = period.dataset.salesPeriod
-    state.salesReceiptView = null
-    render()
-    if (state.sales?.snapshot?.periods[state.salesPeriod].employees.some((person) => person.employee_id === state.salesEmployee)) {
-      loadSalesReceipts()
-    }
+    reloadSelectedSalesRep()
     return
   }
 
@@ -168,11 +288,13 @@ async function boot() {
   ])
   render()
   if (window.location.pathname === "/app/sales") refreshSales()
+  if (window.location.pathname === "/app/reports") refreshSalesReports()
+  if (window.location.pathname === "/app/reports/year-over-year") refreshSalesYearOverYear()
   if (window.location.pathname === "/app/customers") refreshCustomerLog()
 
   window.setInterval(() => {
     if (window.location.pathname === "/app/sales") refreshSales()
-    else {
+    else if (!window.location.pathname.startsWith("/app/reports")) {
       refreshBridge(false).catch((error) => console.error(error))
       if (window.location.pathname === "/app/customers" && !state.customerLogBefore) refreshCustomerLog()
     }
@@ -184,6 +306,10 @@ async function refreshSales() {
   state.salesLoading = true
   try {
     state.sales = await fetchJson("/api/sales-board")
+    if (state.salesIncludeAlterations && !state.sales.snapshot?.periods_with_alterations) {
+      state.salesIncludeAlterations = false
+      state.salesReceiptView = null
+    }
     state.salesError = null
   } catch (error) {
     state.salesError = error
@@ -193,7 +319,7 @@ async function refreshSales() {
       render()
       const view = state.salesReceiptView
       const snapshot = state.sales?.snapshot
-      if (snapshot?.periods[state.salesPeriod].employees.some((person) => person.employee_id === state.salesEmployee)
+      if (selectedSalesRep()
           && (!view || (view.page === 1 && view.observedAt !== snapshot.observed_at))) {
         loadSalesReceipts(1, view?.data)
       }
@@ -201,14 +327,34 @@ async function refreshSales() {
   }
 }
 
+function displayedSalesPeriods(snapshot = state.sales?.snapshot) {
+  return state.salesIncludeAlterations && snapshot?.periods_with_alterations
+    ? snapshot.periods_with_alterations : snapshot?.periods
+}
+
+function selectedSalesRep() {
+  return displayedSalesPeriods()?.[state.salesPeriod].employees
+    .find((person) => person.employee_id === state.salesEmployee)
+}
+
+function reloadSelectedSalesRep() {
+  state.salesReceiptView = null
+  if (selectedSalesRep()) loadSalesReceipts()
+  else render()
+}
+
 async function loadSalesReceipts(page = 1, previousData = null) {
   const view = {
     employee: state.salesEmployee, period: state.salesPeriod, page,
+    includeAlterations: state.salesIncludeAlterations,
     data: previousData, error: null, observedAt: state.sales?.snapshot?.observed_at,
   }
   state.salesReceiptView = view
   if (!previousData) render()
-  const query = new URLSearchParams({ employee_id: view.employee, period: view.period, page })
+  const query = new URLSearchParams({
+    employee_id: view.employee, period: view.period, page,
+    include_alterations: view.includeAlterations,
+  })
   try {
     view.data = await fetchJson(`/api/sales-board/receipts?${query}`)
   } catch (error) {
@@ -379,6 +525,8 @@ function navigate(path) {
   }
   render()
   if (path === "/app/sales") refreshSales()
+  if (path === "/app/reports") refreshSalesReports(state.reportFilters)
+  if (path === "/app/reports/year-over-year") refreshSalesYearOverYear()
   if (path === "/app/customers") refreshCustomerLog()
   window.scrollTo({ top: 0, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" })
 }
@@ -401,7 +549,9 @@ function render() {
   const chartOffset = chart?.scrollLeft
   const receipts = route === "/app/sales" ? app.querySelector("[data-sales-receipts]") : null
   const openReceipts = new Set(Array.from(receipts?.querySelectorAll("details[open]") || [], (detail) => detail.dataset.receipt))
+  const alterationsFocused = document.activeElement?.matches("[data-sales-alterations]")
   app.innerHTML = routes[route].render()
+  if (alterationsFocused) app.querySelector("[data-sales-alterations]")?.focus({ preventScroll: true })
   if (chart?.dataset.salesChart === state.salesPeriod && chartOffset) {
     app.querySelector("[data-sales-chart]")?.scrollTo(chartOffset, 0)
   }
@@ -610,7 +760,7 @@ function salesCostNote(totals) {
   if (totals.missing_cost_lines == null) return "Update the Windows connector to see profit and margin."
   if (!totals.missing_cost_lines) return ""
   const count = totals.missing_cost_lines
-  return `${formatSalesCount(count)} merchandise line${count === 1 ? "" : "s"} without a recorded cost. Profit and margin cover lines with known costs.`
+  return `${formatSalesCount(count)} sales line${count === 1 ? "" : "s"} without a recorded cost. Profit and margin cover lines with known costs.`
 }
 
 function salesPartial(totals) {
@@ -642,25 +792,31 @@ function renderSalesBoard() {
     </section>`
   }
 
-  const period = snapshot.periods[state.salesPeriod]
+  const periods = displayedSalesPeriods(snapshot)
+  const period = periods[state.salesPeriod]
   const totals = period.store
   const ranked = period.employees.filter((person) => person.employee_id !== "unassigned")
   const unassigned = period.employees.find((person) => person.employee_id === "unassigned")
   const selected = period.employees.find((person) => person.employee_id === state.salesEmployee)
   const stale = Date.now() - Date.parse(snapshot.observed_at) > 12 * 60 * 1000
   const goal = state.sales.settings?.monthly_goal_cents
-  const monthlyNet = snapshot.periods.month.store.net_cents
+  const monthlyNet = periods.month.store.net_cents
+  const alterationsAvailable = Boolean(snapshot.periods_with_alterations)
   const goalPercent = goal ? Math.round(monthlyNet / goal * 100) : 0
   const status = state.salesError ? "Refresh failed · showing saved totals" : stale ? "POS update delayed" : "POS data current"
   const dates = `${salesDate(period.start)}${period.start === snapshot.business_date ? "" : ` – ${salesDate(snapshot.business_date)}`}`
   return `<section class="page sales-board ${focused}">
     <div class="sales-header">
-      <div><h1>Sales Board</h1><p>In-store sales · Alterations excluded</p></div>
+      <div><h1>Sales Board</h1><p>In-store sales · Alterations ${state.salesIncludeAlterations ? "included" : "excluded"}</p></div>
       ${actions}
     </div>
     <div class="sales-toolbar">
-      <div class="sales-periods" role="group" aria-label="Reporting period">${Object.entries(settings).map(([key, label]) =>
-        `<button type="button" data-sales-period="${key}" aria-pressed="${key === state.salesPeriod}">${label}</button>`).join("")}</div>
+      <div class="sales-filters">
+        <div class="sales-periods" role="group" aria-label="Reporting period">${Object.entries(settings).map(([key, label]) =>
+          `<button type="button" data-sales-period="${key}" aria-pressed="${key === state.salesPeriod}">${label}</button>`).join("")}</div>
+        <label class="sales-alterations"><input type="checkbox" data-sales-alterations ${state.salesIncludeAlterations ? "checked" : ""} ${alterationsAvailable ? "" : 'disabled aria-describedby="sales-alterations-help"'}> Include alteration sales</label>
+        ${alterationsAvailable ? "" : `<small id="sales-alterations-help" class="sales-muted">Update the Windows connector to include alterations.</small>`}
+      </div>
       <div class="sales-freshness">${statusBadge(status, stale || state.salesError ? "warning" : "success")} <span>Updated ${escapeHtml(formatDate(snapshot.observed_at))}</span></div>
     </div>
     <div class="sales-scorecard">
@@ -678,7 +834,7 @@ function renderSalesBoard() {
         <div class="panel-head"><h2 id="sales-leaderboard-heading">Employee leaderboard</h2><span class="panel-label">${settings[state.salesPeriod]}</span></div>
         ${ranked.length || unassigned ? `<div class="sales-leader-labels" aria-hidden="true"><span>Employee</span><span class="sales-leader-tickets">Tickets</span><span>Net sales</span><span>Gross profit</span><span>Margin</span></div>
           ${ranked.map((person, index) => renderSalesEmployee(person, index + 1)).join("")}
-          ${unassigned ? renderSalesEmployee(unassigned, null) : ""}` : `<div class="empty"><strong>No merchandise sales in this period</strong></div>`}
+          ${unassigned ? renderSalesEmployee(unassigned, null) : ""}` : `<div class="empty"><strong>No sales in this period</strong></div>`}
       </section>
       <div class="sales-side">
         <section class="panel">
@@ -734,28 +890,30 @@ function salesMonth(label) {
   return new Date(`${label}-01T00:00:00Z`).toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })
 }
 
-function renderSalesTrend(trend, period) {
+function renderSalesTrend(trend, period, heading = "sales-trend-heading") {
   const points = period === "today" ? trend.filter(({ label }) => label >= "09:00" && label < "21:00") : trend
   const scale = Math.max(1, ...points.map(({ net_cents }) => Math.abs(net_cents)))
-  return `<div class="sales-trend-scroll" data-sales-chart="${period}" tabindex="0" role="region" aria-labelledby="sales-trend-heading">
+  return `<div class="sales-trend-scroll" data-sales-chart="${period}" tabindex="0" role="region" aria-labelledby="${heading}">
     <ul class="sales-trend">${points.map(({ label, net_cents }) => {
       const day = period === "week" || period === "month"
-      const dateText = day ? label.slice(5).split("-").map(Number).join("-") : period === "year" ? salesMonth(label) : salesClock(label)
-      const weekday = day ? new Date(`${label}T00:00:00Z`).toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }) : ""
+      const dateText = day ? label.slice(5).split("-").map(Number).join("-") :
+        period === "year" || period === "report-months" ? salesMonth(label) : period === "today" ? salesClock(label) : label
+      const sublabel = day ? new Date(`${label}T00:00:00Z`).toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }) :
+        period === "report-months" ? label.slice(0, 4) : ""
       return `<li>
         <span class="sales-trend-bar ${net_cents < 0 ? "is-negative" : ""}" style="--bar:${Math.abs(net_cents) / scale * 100}%">
           <i aria-hidden="true"></i><strong>${salesMoney(net_cents)}</strong>
         </span>
-        <span class="sales-trend-label">${escapeHtml(dateText)}${weekday ? `<small>${escapeHtml(weekday)}</small>` : ""}</span>
+        <span class="sales-trend-label">${escapeHtml(dateText)}${sublabel ? `<small>${escapeHtml(sublabel)}</small>` : ""}</span>
       </li>`
     }).join("")}</ul>
   </div>`
 }
 
-function renderSalesMonths(trend) {
+function renderSalesMonths(trend, showYear = false) {
   return `<div class="sales-table-scroll"><table class="sales-table">
     <thead><tr><th scope="col">Month</th><th scope="col">Net sales</th><th scope="col">Gross profit</th><th scope="col">Gross margin</th></tr></thead>
-    <tbody>${trend.map((month) => `<tr><th scope="row">${salesMonth(month.label)}</th><td>${salesMoney(month.net_cents)}</td><td>${salesMoney(month.gross_profit_cents)}${salesPartial(month)}</td><td>${salesMargin(month.gross_margin_percent)}</td></tr>`).join("")}</tbody>
+    <tbody>${trend.map((month) => `<tr><th scope="row">${salesMonth(month.label)}${showYear ? ` ${month.label.slice(0, 4)}` : ""}</th><td>${salesMoney(month.net_cents)}</td><td>${salesMoney(month.gross_profit_cents)}${salesPartial(month)}</td><td>${salesMargin(month.gross_margin_percent)}</td></tr>`).join("")}</tbody>
   </table></div>`
 }
 
@@ -763,9 +921,9 @@ function renderSalesReceipts(view, periodLabel) {
   const body = !view || (!view.data && !view.error) ? `<p class="sales-muted">Loading sales…</p>` :
     view.error ? `<p class="sales-muted" role="status">${escapeHtml(view.error.message)} <button class="button secondary" type="button" data-sales-receipt-page="${view.page}">Retry</button></p>` :
     !view.data.available ? `<p class="sales-muted">Update the Windows connector to see individual sales.</p>` :
-    !view.data.items.length ? `<p class="sales-muted">No merchandise receipts on this page.</p>` :
+    !view.data.items.length ? `<p class="sales-muted">No receipts on this page.</p>` :
     view.data.items.map(renderSalesReceipt).join("")
-  return `<div class="sales-receipts" data-sales-receipts="${escapeHtml(JSON.stringify([view?.employee, view?.period, view?.page]))}">
+  return `<div class="sales-receipts" data-sales-receipts="${escapeHtml(JSON.stringify([view?.employee, view?.period, view?.page, view?.includeAlterations]))}">
     <div class="panel-head"><h3 id="sales-receipts-heading" tabindex="-1">Sales and returns</h3><span class="panel-label">${escapeHtml(periodLabel)}</span></div>
     ${body}
     ${view && (view.page > 1 || view.data?.has_more) ? `<div class="sales-receipt-pages">
@@ -788,7 +946,7 @@ function renderSalesReceipt(receipt) {
       ${receipt.missing_cost_lines ? `<p class="sales-muted">${escapeHtml(salesCostNote(receipt))}</p>` : ""}
       <div class="sales-table-scroll"><table class="sales-table">
         <thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Net sales</th><th scope="col">Gross profit</th></tr></thead>
-        <tbody>${receipt.lines.map((line) => `<tr><th scope="row">${escapeHtml(line.name)}<small>SKU ${escapeHtml(line.sku)}</small></th><td>${formatSalesCount(line.units)}</td><td>${salesMoney(line.net_cents)}</td><td>${salesMoney(line.gross_profit_cents)}</td></tr>`).join("")}</tbody>
+        <tbody>${receipt.lines.map((line) => `<tr><th scope="row">${escapeHtml(line.name)}${line.is_alteration ? " <span class=\"sales-line-kind\">Alteration</span>" : ""}${line.sku ? `<small>SKU ${escapeHtml(line.sku)}</small>` : ""}</th><td>${formatSalesCount(line.units)}</td><td>${salesMoney(line.net_cents)}</td><td>${salesMoney(line.gross_profit_cents)}</td></tr>`).join("")}</tbody>
       </table></div>
     </div>
   </details>`
@@ -1067,7 +1225,7 @@ function normalizeRoute(path) {
 
 function updateTabs(route) {
   document.querySelectorAll(".tabs a").forEach((link) => {
-    const active = link.getAttribute("href") === route
+    const active = link.getAttribute("href") === (route.startsWith("/app/reports/") ? "/app/reports" : route)
     link.classList.toggle("active", active)
     if (active) link.setAttribute("aria-current", "page")
     else link.removeAttribute("aria-current")

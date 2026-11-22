@@ -109,8 +109,11 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .sales-header { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
 .sales-header h1 { margin: 0; font: 700 clamp(32px, 6vw, 52px)/1.05 Georgia, serif; letter-spacing: -.06em; }
 .sales-header p { margin: 7px 0 0; color: var(--muted); }
-.sales-actions, .sales-toolbar, .sales-freshness { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sales-actions, .sales-toolbar, .sales-freshness, .sales-filters { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .sales-toolbar { justify-content: space-between; }
+.sales-alterations { display: inline-flex; align-items: center; gap: 7px; min-height: 42px; cursor: pointer; font-weight: 600; }
+.sales-alterations input { width: 17px; height: 17px; margin: 0; accent-color: var(--green); }
+.sales-alterations:has(input:disabled) { color: var(--muted); cursor: default; }
 .sales-freshness { font-size: 11px; color: var(--muted); }
 .sales-periods { display: flex; gap: 5px; flex-wrap: wrap; }
 .sales-periods button { min-height: 42px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 7px; background: white; color: var(--ink); cursor: pointer; }
@@ -169,6 +172,45 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .sales-table th, .sales-table td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
 .sales-table th:first-child { text-align: left; white-space: normal; }
 .sales-table thead { color: var(--muted); }
+.sales-line-kind { color: var(--muted); font-size: 10px; font-weight: 400; }
+.reports-form, .reports-ranking-tools { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; }
+.reports-nav { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
+.reports-nav a { padding: 12px 15px; border-bottom: 2px solid transparent; text-decoration: none; font-weight: 650; }
+.reports-nav a[aria-current="page"] { border-bottom-color: var(--green); color: var(--green-dark); }
+.reports-form > label:not(.sales-alterations), .report-comparison-dates label, .reports-ranking-tools label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.reports-form input[type="date"], .reports-form select, .reports-ranking-tools select, .reports-ranking-tools input, .reports-sort select {
+  min-height: 42px; max-width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: white; color: var(--ink); font: inherit; font-size: 13px;
+}
+.report-comparison-dates { display: flex; gap: 14px; flex-wrap: wrap; border: 0; padding: 0; margin: 0; min-width: 0; }
+.report-comparison-dates[hidden] { display: none; }
+.reports-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.reports-ranking-tools { margin-bottom: 12px; }
+.reports-ranking-tools input { width: 190px; }
+.reports-time-charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.reports-time-charts .sales-trend li { flex-basis: 70px; }
+.reports-board > section > .panel-head h2 { margin: 0; }
+.reports-sort { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+.report-comparison-table th:first-child { min-width: 135px; }
+.report-comparison-table tbody tr:last-child { font-weight: 700; background: var(--green-soft); }
+.report-department-table thead th[scope="colgroup"] { text-align: center; background: var(--green-soft); }
+.report-department-table th[scope="row"] { min-width: 140px; }
+.report-comparison-table th:first-child, .report-department-table th[scope="row"], .report-department-table th[rowspan] { position: sticky; left: 0; background: white; }
+.report-comparison-table tbody tr:last-child th { background: var(--green-soft); }
+.report-store-totals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 0; }
+.report-store-totals div { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.report-store-totals dt { color: var(--muted); font-size: 12px; }
+.report-store-totals dd { margin: 7px 0 0; font-size: 16px; font-weight: 700; }
+@media print {
+  body:has(.year-report-board) { background: white; }
+  body:has(.year-report-board) .shell { width: 100%; padding: 0; }
+  body:has(.year-report-board) :is(.topbar, s-app-nav, .skip-link, .reports-nav, .sales-actions, .year-report-controls, .reports-sort) { display: none; }
+  .year-report-board { gap: 12px; }
+  .year-report-board .panel { padding: 12px; box-shadow: none; }
+  .year-report-board .sales-table-scroll { overflow: visible; }
+  .year-report-board .sales-table th, .year-report-board .sales-table td { padding: 4px; font-size: 9px; white-space: normal; }
+  .year-report-board .report-store-totals { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
 .shell:has(.sales-board.is-focused) { width: min(1600px, calc(100% - 32px)); padding-top: 18px; }
 .shell:has(.sales-board.is-focused) .topbar { display: none; }
 .sales-settings-form { display: grid; gap: 16px; justify-items: start; }
@@ -318,6 +360,8 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
   .empty { padding: 30px 8px; }
   .sales-header { align-items: start; flex-direction: column; }
   .sales-layout { grid-template-columns: 1fr; }
+  .reports-time-charts { grid-template-columns: minmax(0, 1fr); }
+  .report-store-totals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sales-scorecard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sales-leader-labels, .sales-leader-row { gap: 8px; }
 }

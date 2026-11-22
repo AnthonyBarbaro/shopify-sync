@@ -395,6 +395,17 @@ class DatabaseStore:
             self._ensure_column(connection, "sales_board_snapshots", "receipts", "TEXT")
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sales_report_months (
+                    shop_domain TEXT NOT NULL,
+                    month TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (shop_domain, month)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS sales_board_settings (
                     shop_domain TEXT PRIMARY KEY,
                     enabled INTEGER NOT NULL,
@@ -1478,6 +1489,7 @@ class DatabaseStore:
 
     def get_sales_board_receipts(
         self, *, shop_domain: str, employee_id: str, period: str, offset: int, limit: int,
+        include_alterations: bool = False,
     ) -> list[dict[str, Any]] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1486,10 +1498,22 @@ class DatabaseStore:
         if row is None or row["receipts"] is None:
             return None
         snapshot = json.loads(row["payload"])
-        start, end = snapshot["periods"][period]["start"], snapshot["business_date"]
+        periods = snapshot.get("periods_with_alterations") if include_alterations else snapshot["periods"]
+        if periods is None:
+            return None
+        start, end = periods[period]["start"], snapshot["business_date"]
         employee_receipts = json.loads(row["receipts"]).get(employee_id, [])
-        selected = [receipt for receipt in employee_receipts if start <= receipt["date"] <= end]
-        return selected[offset:offset + limit]
+        selected = [
+            receipt for receipt in employee_receipts
+            if start <= receipt["date"] <= end and (receipt["lines"] or include_alterations)
+        ]
+        page = selected[offset:offset + limit]
+        for receipt in page:
+            combined = receipt.pop("with_alterations", None)
+            if include_alterations and combined is not None:
+                combined["lines"] = receipt["lines"] + combined["lines"]
+                receipt.update(combined)
+        return page
 
     def get_sales_board_settings(self, *, shop_domain: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1498,6 +1522,41 @@ class DatabaseStore:
                 (shop_domain,),
             ).fetchone()
         return dict(row) if row is not None else {}
+
+    def save_sales_report_months(
+        self, *, shop_domain: str, observed_at: str, months: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO sales_report_months (shop_domain, month, observed_at, payload)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(shop_domain, month) DO UPDATE SET
+                    observed_at=excluded.observed_at, payload=excluded.payload
+                WHERE excluded.observed_at >= sales_report_months.observed_at
+                """,
+                [(shop_domain, month, observed_at, json.dumps(lines, separators=(",", ":")))
+                 for month, lines in months.items()],
+            )
+
+    def list_sales_report_months(self, *, shop_domain: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT month FROM sales_report_months WHERE shop_domain = ? ORDER BY month", (shop_domain,),
+            ).fetchall()
+        return [row["month"] for row in rows]
+
+    def read_sales_report_lines(self, *, shop_domain: str, first_month: str, last_month: str):
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM sales_report_months
+                WHERE shop_domain = ? AND month BETWEEN ? AND ? ORDER BY month
+                """,
+                (shop_domain, first_month, last_month),
+            )
+            for row in rows:
+                yield from json.loads(row["payload"])
 
     def save_sales_board_settings(self, *, shop_domain: str, enabled: bool, interval_seconds: int, monthly_goal_cents: int | None) -> None:
         with self._connect() as connection:
@@ -1897,6 +1956,7 @@ class DatabaseStore:
                 (shop_domain,),
             )
             connection.execute("DELETE FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,))
+            connection.execute("DELETE FROM sales_report_months WHERE shop_domain = ?", (shop_domain,))
             connection.execute("DELETE FROM sales_board_settings WHERE shop_domain = ?", (shop_domain,))
             connection.execute("DELETE FROM customer_sync_history WHERE shop_domain = ?", (shop_domain,))
             connection.execute(

@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.3"
+CONNECTOR_VERSION = "1.4.4"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -380,6 +380,9 @@ class Connector:
         snapshot = None
         signature = None
         last_sent = None
+        history_built_on = None
+        sent_report_months: dict[str, str] = {}
+        pending_report_months: dict[str, tuple[str, list]] = {}
         with requests.Session() as session:
             session.headers.update(self.session.headers)
             while not stop.is_set():
@@ -395,11 +398,24 @@ class Connector:
                     interval = min(900, max(30, int(remote["interval_seconds"])))
                     today = date.fromisoformat(remote["business_date"])
                     paths = sales_paths(self.dbf_dir)
-                    current = (today, sales_source_signature(paths))
+                    vendor_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "Vendor.dbf", recursive=True)
+                    customers_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "Customer.dbf", recursive=True)
+                    sources = (*paths, *(path for path in (vendor_path, customers_path) if path is not None))
+                    current = (today, sales_source_signature(sources))
                     if current != signature:
-                        report = build_sales_board(paths, today=today)
-                        if sales_source_signature(paths) != current[1]:
+                        report = build_sales_board(
+                            paths, today=today, vendors_path=vendor_path, customers_path=customers_path,
+                            history_start=date.min if history_built_on != today else today.replace(day=1),
+                        )
+                        if sales_source_signature(sources) != current[1]:
                             raise OSError("Sales DBFs changed while reporting; retrying next check.")
+                        for month, lines in report.pop("history").items():
+                            digest = hashlib.sha256(json.dumps(lines, separators=(",", ":")).encode()).hexdigest()
+                            if sent_report_months.get(month) == digest:
+                                pending_report_months.pop(month, None)
+                            else:
+                                pending_report_months[month] = (digest, lines)
+                        history_built_on = today
                         snapshot = report
                         signature = current
                         last_sent = None
@@ -410,6 +426,19 @@ class Connector:
                         if last_sent is None and response.json().get("saved") is True:
                             self.logger.info("sales_board_refreshed department_file=%s", paths[-1].name)
                         last_sent = time.monotonic()
+                    while pending_report_months and not stop.is_set():
+                        months = sorted(pending_report_months, reverse=True)[:6]
+                        response = session.post(
+                            f"{self.base_url}/sync/sales-reports",
+                            json={"observed_at": snapshot["observed_at"],
+                                  "months": {month: pending_report_months[month][1] for month in months}},
+                            timeout=60,
+                        )
+                        response.raise_for_status()
+                        if not response.json().get("accepted"):
+                            break
+                        for month in months:
+                            sent_report_months[month], _ = pending_report_months.pop(month)
                 except Exception:
                     self.logger.exception("sales_board_sync_failed")
                 stop.wait(interval)

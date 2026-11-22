@@ -9,6 +9,7 @@ const context = vm.createContext({
   window: { addEventListener() {} },
 })
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/static/app.js'), 'utf8'), context)
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../app/static/reports.js'), 'utf8'), context)
 
 test('daily bars keep every date, weekday, and bold amount', () => {
   const days = Array.from({ length: 22 }, (_, index) => ({
@@ -48,4 +49,30 @@ test('receipt uses Eastern POS time and escapes merchandise fields', () => {
   assert.match(html, /&lt;Suit&gt;/)
   assert.match(html, /SKU &lt;SKU&gt;/)
   assert.doesNotMatch(html, /<Suit>/)
+})
+
+test('YTD dates compare across years and clamp leap days', () => {
+  const ytd = context.reportYearDates(2025, '2026-11-22')
+  assert.equal(ytd.start, '2025-01-01')
+  assert.equal(ytd.end, '2025-11-22')
+  assert.equal(context.reportYearDates(2023, '2024-02-29').end, '2023-02-28')
+  assert.equal(context.reportYearDates(2026, '2026-11-22', true).end, '2026-11-22')
+  assert.equal(context.reportYearDates(2025, '2026-11-22', true).end, '2025-12-31')
+})
+
+test('three-year comparison keeps missing periods distinct and shows changes', () => {
+  const windows = ['today', 'yesterday', 'week_yesterday', 'week', 'month_yesterday', 'month', 'year_yesterday', 'year']
+  const data = [2026, 2025, 2024].map((year, index) => ({
+    year,
+    through: `${year}-11-22`,
+    periods: Object.fromEntries(windows.map(period => [period, { net_cents: index === 0 ? 15000 : 10000 }])),
+    available: Object.fromEntries(windows.map(period => [period, index !== 2])),
+  }))
+  const html = context.renderThreeYearTable(data, 'net_cents', 'Net sales')
+  assert.match(html, /2026 vs 2025/)
+  assert.match(html, /2025 vs 2024/)
+  assert.match(html, /YTD through previous day/)
+  assert.match(html, /\$150\.00/)
+  assert.match(html, /\+50%/)
+  assert.match(html, /<td>—<\/td>/)
 })

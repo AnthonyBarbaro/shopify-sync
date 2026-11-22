@@ -6,7 +6,7 @@ import json
 import secrets
 import time
 import zipfile
-from datetime import timedelta, timezone
+from datetime import date, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, List, Literal, Tuple, TypeVar
@@ -56,6 +56,7 @@ from app.models import (
     ProductSyncRequest,
     RequestLogsResponse,
     SalesBoardSnapshot,
+    SalesReportUpload,
     SalesBoardSettings,
     ShopifyConnectionResponse,
     SyncActivityResponse,
@@ -63,6 +64,7 @@ from app.models import (
     UiConfigResponse,
 )
 from app import pos_archive
+from app.sales_reports import summarize_sales_report, summarize_year_over_year, trend_dates, year_over_year_ranges
 from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error, normalize_gid
 from app.state import SyncActivityStore
 from app.utils import (
@@ -175,6 +177,7 @@ def _asset_version() -> str:
     asset_paths = [
         INDEX_FILE,
         STATIC_DIR / "app.js",
+        STATIC_DIR / "reports.js",
         STATIC_DIR / "styles.css",
     ]
     try:
@@ -220,8 +223,8 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
 
     content_type = (request.headers.get("content-type") or "").lower()
     body_preview: str | None = None
-    if effective_path.rstrip("/") == "/sync/sales-board" and request_body:
-        body_preview = "[sales board payload omitted]"
+    if effective_path.rstrip("/") in {"/sync/sales-board", "/sync/sales-reports"} and request_body:
+        body_preview = "[sales payload omitted]"
     elif "customer" in effective_path.lower() and request_body:
         body_preview = "[customer payload omitted]"
     elif request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
@@ -251,6 +254,7 @@ def render_ui_shell() -> HTMLResponse:
     html_content = html_content.replace("__SHOPIFY_CLIENT_ID__", settings.shopify_client_id)
     html_content = html_content.replace("/assets/styles.css", _asset_url("styles.css"))
     html_content = html_content.replace("/assets/app.js", _asset_url("app.js"))
+    html_content = html_content.replace("/assets/reports.js", _asset_url("reports.js"))
     return HTMLResponse(content=html_content)
 
 
@@ -1402,7 +1406,7 @@ async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
 @app.exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     errors = exc.errors()
-    if request.url.path.rstrip("/") == "/sync/sales-board":
+    if request.url.path.rstrip("/") in {"/sync/sales-board", "/sync/sales-reports"}:
         errors = [{field: error[field] for field in ("loc", "msg", "type")} for error in errors]
     details = {"errors": errors}
     logger.error("validation_error %s", safe_json_dumps(details))
@@ -1542,6 +1546,8 @@ async def auth_callback(request: Request) -> RedirectResponse:
 @app.get("/app/orders", include_in_schema=False)
 @app.get("/app/customers", include_in_schema=False)
 @app.get("/app/sales", include_in_schema=False)
+@app.get("/app/reports", include_in_schema=False)
+@app.get("/app/reports/year-over-year", include_in_schema=False)
 @app.get("/app/product-sync", include_in_schema=False)
 @app.get("/app/bulk-sync", include_in_schema=False)
 @app.get("/app/pos-archive", include_in_schema=False)
@@ -1644,6 +1650,7 @@ def sales_board_receipts(
     employee_id: str = Query(min_length=1, max_length=80),
     period: Literal["today", "week", "month", "year"] = "month",
     page: int = Query(default=1, ge=1),
+    include_alterations: bool = False,
 ) -> JSONResponse:
     shop, _session = _get_session_context(request)
     board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
@@ -1651,9 +1658,105 @@ def sales_board_receipts(
     rows = db.get_sales_board_receipts(
         shop_domain=shop.shop_domain, employee_id=employee_id, period=period,
         offset=(page - 1) * page_size, limit=page_size + 1,
+        include_alterations=include_alterations,
     ) if board.enabled else None
     return JSONResponse(
         {"available": rows is not None, "items": (rows or [])[:page_size], "has_more": len(rows or []) > page_size},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/sales-reports", response_model=None)
+def sales_reports(
+    request: Request, start: date | None = None, end: date | None = None,
+    compare_start: date | None = None, compare_end: date | None = None,
+    prior_year: bool = False, include_alterations: bool = False,
+) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    business_date = utc_now().astimezone(ZoneInfo("America/New_York")).date()
+    board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+    months = db.list_sales_report_months(shop_domain=shop.shop_domain) if board.enabled else []
+    data: dict[str, Any] = {
+        "business_date": business_date.isoformat(),
+        "enabled": board.enabled,
+        "months": months,
+        "report": None,
+        "comparison": None,
+    }
+    headers = {"Cache-Control": "no-store"}
+    if not months:
+        return JSONResponse(data, headers=headers)
+    imported_months = set(months)
+    if start is None and end is None:
+        start, end = business_date.replace(month=1, day=1), business_date
+    if (prior_year and start is not None and start.year > 1 and end is not None and end.year > 1
+            and compare_start is None and compare_end is None):
+        def previous_year(day: date) -> date:
+            try:
+                return day.replace(year=day.year - 1)
+            except ValueError:
+                return day.replace(year=day.year - 1, day=28)
+
+        compare_start, compare_end = previous_year(start), previous_year(end)
+
+    def report_for(first: date | None, last: date | None, *, breakdowns: bool) -> dict:
+        if first is None or last is None or first > last or last > business_date:
+            raise SyncProcessingError("Choose a start and end date through today in Eastern Time.", code="invalid_report_range")
+        if (last - first).days > 366 * 30:
+            raise SyncProcessingError("Choose a report range of 30 years or less.", code="report_range_too_long")
+        lines = db.read_sales_report_lines(
+            shop_domain=shop.shop_domain, first_month=first.isoformat()[:7], last_month=last.isoformat()[:7],
+        )
+        report = summarize_sales_report(lines, start=first, end=last, include_alterations=include_alterations,
+                                        breakdowns=breakdowns)
+        report["unavailable_months"] = sum(month not in imported_months for month in trend_dates(first, last, False))
+        report["include_alterations"] = include_alterations
+        return report
+
+    data["report"] = report_for(start, end, breakdowns=True)
+    if compare_start is not None or compare_end is not None:
+        data["comparison"] = report_for(compare_start, compare_end, breakdowns=False)
+    return JSONResponse(data, headers=headers)
+
+
+@app.get("/api/sales-reports/year-over-year", response_model=None)
+def sales_year_over_year(
+    request: Request, through: date | None = None, include_alterations: bool = False,
+    department_period: Literal["today", "yesterday", "week", "month", "year"] = "year",
+) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    business_date = utc_now().astimezone(ZoneInfo("America/New_York")).date()
+    through = through or business_date
+    if through > business_date or through.year < 4:
+        raise SyncProcessingError("Choose a comparison date through today in Eastern Time.", code="invalid_report_range")
+    board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+    months = set(db.list_sales_report_months(shop_domain=shop.shop_domain)) if board.enabled else set()
+    snapshot = db.get_sales_board(shop_domain=shop.shop_domain) if board.enabled else None
+    years = []
+    if months:
+        for year in range(through.year, through.year - 3, -1):
+            try:
+                anchor = through.replace(year=year)
+            except ValueError:
+                anchor = through.replace(year=year, day=28)
+            first = min(start for start, _ in year_over_year_ranges(anchor).values())
+            first_month, last_month = first.isoformat()[:7], anchor.isoformat()[:7]
+            lines = db.read_sales_report_lines(
+                shop_domain=shop.shop_domain, first_month=first_month, last_month=last_month,
+            )
+            comparison = summarize_year_over_year(
+                lines, through=anchor, include_alterations=include_alterations, department_period=department_period,
+            )
+            available = {
+                key: first <= last and any(month in months for month in trend_dates(first, last, False))
+                for key, (first, last) in year_over_year_ranges(anchor).items()
+            }
+            years.append({"year": year, "available": available, **comparison})
+    return JSONResponse(
+        {"business_date": business_date.isoformat(), "through": through.isoformat(),
+         "years": years, "department_period": department_period, "include_alterations": include_alterations,
+         "enabled": board.enabled, "store_snapshot": (snapshot or {}).get("store_snapshot"),
+         "snapshot_at": (snapshot or {}).get("observed_at")},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -1718,6 +1821,19 @@ def publish_sales_board(payload: SalesBoardSnapshot, shop: ShopRecord = Depends(
     )
     return JSONResponse({"saved": saved})
 
+
+@app.post("/sync/sales-reports", response_model=None)
+def publish_sales_reports(payload: SalesReportUpload, shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
+    if not SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain)).enabled:
+        return JSONResponse({"accepted": False})
+    if any(line.date.isoformat()[:7] != month for month, rows in payload.months.items() for line in rows):
+        raise SyncProcessingError("A report line is outside its supplied month.", code="invalid_report_month")
+    db.save_sales_report_months(
+        shop_domain=shop.shop_domain,
+        observed_at=payload.observed_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        months=payload.model_dump(mode="json")["months"],
+    )
+    return JSONResponse({"accepted": True})
 
 @app.get("/api/bridge-status", response_model=None)
 async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse:

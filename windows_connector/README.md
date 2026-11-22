@@ -160,8 +160,9 @@ settings from the app. The **Sales Board** tab shows in-store sales and has a ta
 The reporting worker reads completed POS invoice headers and detail lines, the employee roster,
 and item and department codes. It prefers the register's `depart.dbf` and also supports `MDEPT.DBF`
 or `Dept.dbf`. It uses signed POS line extensions in cents, before tax, for net sales.
-It excludes alteration lines even on mixed tickets, and omits gift-card issues, payment-only lines,
-open orders, and unclassified lines. Net units reflect returned quantities. Sales tickets count each
+It excludes alteration lines by default, including on mixed tickets. Use **Include alteration sales**
+to include alteration receipts, returns, and line items in the current view. Gift-card issues,
+payment-only lines, open orders, and unclassified lines are excluded. Net units reflect returned quantities. Sales tickets count each
 receipt with a positive merchandise line once per store or employee. A shared receipt can count for
 more than one employee. The board covers the live POS invoice history available on the computer.
 Gross profit subtracts the unit cost recorded on each sale line and reverses that cost on returns.
@@ -178,6 +179,18 @@ The worker sends a current snapshot with totals and ticket breakdowns. Ticket da
 number, time, register, merchandise, quantities and amounts. It omits customer and payment fields
 and is available on demand in the authenticated Shopify dashboard. Deploy the backend before
 updating the Windows connector so it can save and serve receipt details.
+
+**Reports** supports custom date ranges, year-to-date comparisons, sales trends, and ranked product,
+brand/vendor, category and rep totals with CSV export. The connector reads the completed invoice
+history present in the live POS files and syncs it by month, newest first. Existing month data is
+replaced on a newer import, and changes to the active month are sent as they are detected.
+Reports use signed line amounts and recorded historical unit costs. Brand/vendor names come from
+POS vendor records. Reporting includes no customer, payment, or source invoice identifiers.
+**Year over year** compares three calendar years through the same month and day, with Sunday-starting
+weekly totals and a separate department comparison. Recorded tax is optional for the sales columns.
+Profit continues to use pre-tax sales. The current POS totals show customers, positive balances due,
+and signed cost and retail valuations for stocked merchandise records. The POS snapshot shows current
+data alongside the historical sales comparisons.
 
 ## Shopify order inbox
 

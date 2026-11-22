@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from copy import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -54,6 +55,26 @@ def ticket_key(row: dict, invoice_field: str) -> tuple[str, str, str]:
 
 def cents(value: Decimal) -> int:
     return int((value * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+def current_customer_totals(customers_path: Path | None) -> dict:
+    if customers_path is None:
+        return {"customer_count": None, "positive_balance_cents": None}
+    balances = {}
+    has_balance = False
+    for row in iter_dbf_rows(customers_path, required_fields={"CUST_NUM"}, optional_fields={"DELETED", "BAL_DUE"}):
+        customer = text(row["CUST_NUM"])
+        if not customer or row.get("DELETED"):
+            continue
+        balance = row.get("BAL_DUE")
+        valid_balance = balance if isinstance(balance, Decimal) and balance.is_finite() else None
+        has_balance |= valid_balance is not None
+        balances[customer] = valid_balance
+    return {
+        "customer_count": len(balances),
+        "positive_balance_cents": cents(sum((amount for amount in balances.values() if amount and amount > 0), Decimal(0)))
+        if has_balance else None,
+    }
+
 
 
 def receipt_time(value: object) -> str | None:
@@ -114,6 +135,23 @@ class SalesReceipt(SalesTotals):
     def __init__(self) -> None:
         super().__init__()
         self.lines: list[dict] = []
+        self.alterations: list[tuple[dict, int, Decimal, int | None]] = []
+
+    def export_receipt(self, key: tuple[str, str, str], time: str | None) -> dict:
+        invoice, day, register = key
+        receipt = {
+            "invoice": invoice, "date": day, "register_id": register, "time": time,
+            **self.export(), "lines": self.lines,
+        }
+        if self.alterations:
+            combined = copy(self)
+            combined.tickets = self.tickets.copy()
+            alteration_lines = []
+            for line, amount, units, cost in self.alterations:
+                combined.add(key, amount, units, cost)
+                alteration_lines.append(line)
+            receipt["with_alterations"] = {**combined.export(), "lines": alteration_lines}
+        return receipt
 
 
 def category_rows(categories: dict[str, SalesTotals]) -> list[dict]:
@@ -171,7 +209,10 @@ class SalesPeriod:
         }
 
 
-def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
+def build_sales_board(
+    paths: tuple[Path, ...], *, today: date, history_start: date | None = None,
+    vendors_path: Path | None = None, customers_path: Path | None = None,
+) -> dict:
     headers_path, details_path, employees_path, items_path, departments_path = paths
     departments = {
         text(row["DEPTCODE"]).upper(): re.sub(r"\s+", " ", text(row["DESCRIPT"])).title()
@@ -183,15 +224,49 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
     alteration_groups = ALTERATION_CODES | {code for code, label in departments.items() if ALTERATION.search(label)}
     items: dict[str, set[str]] = defaultdict(set)
     product_names: dict[str, str] = {}
+    product_vendors: dict[str, str] = {}
+    vendors = {}
+    if vendors_path is not None:
+        vendors = {
+            text(row["VENDOR_ID"]).upper(): text(row["COMPANY"])
+            for row in iter_dbf_rows(vendors_path, required_fields={"VENDOR_ID", "COMPANY"})
+            if row["VENDOR_ID"] and row["COMPANY"]
+        }
     alteration_skus = set()
-    for row in iter_dbf_rows(items_path, required_fields={"SKU", "GROUP", "DESC"}):
+    item_count = in_stock = negative_stock = missing_stock_costs = missing_stock_prices = 0
+    inventory_cost = inventory_retail = Decimal(0)
+    for row in iter_dbf_rows(
+        items_path, required_fields={"SKU", "GROUP", "DESC"}, optional_fields={"VENDOR", "QTY", "COST", "PRICE", "TYPE"},
+    ):
         sku, group = text(row["SKU"]).upper(), text(row["GROUP"]).upper()
         if sku and group:
             items[sku].add(group)
         if sku and row["DESC"]:
             product_names[sku] = text(row["DESC"])
-        if sku and (group in alteration_groups or ALTERATION.search(text(row["DESC"]))):
+        if sku and row.get("VENDOR"):
+            product_vendors[sku] = text(row["VENDOR"]).upper()
+        if not sku:
+            continue
+        if group in alteration_groups or ALTERATION.search(text(row["DESC"])):
             alteration_skus.add(sku)
+            continue
+        if group not in departments or group in FINANCIAL_CODES or text(row.get("TYPE")).upper() not in {"P", "M"}:
+            continue
+        item_count += 1
+        qty = row.get("QTY")
+        if not isinstance(qty, Decimal) or not qty.is_finite() or not qty:
+            continue
+        in_stock += qty > 0
+        negative_stock += qty < 0
+        cost, price = row.get("COST"), row.get("PRICE")
+        if isinstance(cost, Decimal) and cost.is_finite() and cost > 0:
+            inventory_cost += qty * cost
+        else:
+            missing_stock_costs += 1
+        if isinstance(price, Decimal) and price.is_finite() and price > 0:
+            inventory_retail += qty * price
+        else:
+            missing_stock_prices += 1
     names = {}
     for row in iter_dbf_rows(employees_path, required_fields={"ID_NO", "FIRST_NAME", "LAST_NAME"}):
         code = text(row["ID_NO"]).upper()
@@ -199,11 +274,15 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
         if code and name:
             names[code] = name
 
-    periods = {period: SalesPeriod(start, today, period) for period, start in (
+    starts = (
         ("today", today), ("week", today - timedelta(days=today.weekday())),
         ("month", today.replace(day=1)), ("year", today.replace(month=1, day=1)),
-    )}
-    cutoff = min(period.start for period in periods.values())
+    )
+    periods = {period: SalesPeriod(start, today, period) for period, start in starts}
+    periods_with_alterations = {period: SalesPeriod(start, today, period) for period, start in starts}
+    board_start = min(period.start for period in periods.values())
+    report_start = history_start.isoformat() if history_start is not None else None
+    cutoff = min(board_start, report_start or board_start)
     latest = today.isoformat()
     dates = set()
     headers = Counter()
@@ -222,9 +301,11 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
             times[key] = receipt_time(row["TIME"])
 
     receipts: dict[str, dict[tuple[str, str, str], SalesReceipt]] = defaultdict(lambda: defaultdict(SalesReceipt))
+    history: dict[str, list[dict]] = defaultdict(list)
+    tickets_by_month: dict[str, dict[tuple, int]] = defaultdict(dict)
     for row in iter_dbf_rows(details_path, required_fields={
         "INVOICE_NO", "DATE", "REG_ID", "CLERK", "GROUP", "SKU", "DESC", "EXTENSION", "QTY",
-    }, optional_fields={"COST"}):
+    }, optional_fields={"COST", "VENDOR", "TAX", "TAX2", "TAX3", "TAX4"}):
         day = text(row["DATE"])
         if not cutoff <= day <= latest:
             continue
@@ -234,14 +315,18 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
         sku, group = text(row["SKU"]).upper(), text(row["GROUP"]).upper()
         matrix = MATRIX_SKU.fullmatch(sku)
         base = matrix.group(1) if matrix else sku
-        if (not sku or sku in alteration_skus or base in alteration_skus
-                or group in alteration_groups or ALTERATION.search(text(row["DESC"]))):
-            continue
         item_groups = items.get(sku) or items.get(base) or set()
         if not group and len(item_groups) == 1:
             group = next(iter(item_groups))
-        if group not in departments or group in FINANCIAL_CODES or item_groups & FINANCIAL_CODES:
+        if group in FINANCIAL_CODES or item_groups & FINANCIAL_CODES:
             continue
+        is_alteration = group in alteration_groups or (
+            bool(sku) and (sku in alteration_skus or base in alteration_skus
+                           or ALTERATION.search(text(row["DESC"])) is not None)
+        )
+        if not is_alteration and (not sku or group not in departments):
+            continue
+        category = "Alterations" if is_alteration else departments[group]
         amount, units = row["EXTENSION"], row["QTY"]
         if not isinstance(amount, Decimal) or not isinstance(units, Decimal) or not amount.is_finite() or not units.is_finite():
             continue
@@ -258,30 +343,74 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
             cost_cents = cents(unit_cost * units)
         else:
             cost_cents = None
+        if report_start is not None and day >= report_start:
+            vendor = text(row.get("VENDOR")).upper() or product_vendors.get(sku) or product_vendors.get(base)
+            month = day[:7]
+            ticket_ids = tickets_by_month[month]
+            tax = sum(
+                (value for field in ("TAX", "TAX2", "TAX3", "TAX4")
+                 if isinstance(value := row.get(field), Decimal) and value.is_finite()),
+                Decimal(0),
+            )
+            history[month].append({
+                "date": day,
+                "hour": int(times[key][:2]) if times[key] else None,
+                "ticket": ticket_ids.setdefault(key, len(ticket_ids) + 1),
+                "rep": names.get(employee, "Unassigned"),
+                "rep_id": employee,
+                "sku": base or None,
+                "product": product_names.get(base) or product_names.get(sku),
+                "brand": vendors.get(vendor) if vendor else None,
+                "category": category,
+                "department_code": group if not is_alteration or group in alteration_groups else "ALTERATIONS",
+                "department": departments.get(group, category) if not is_alteration or group in alteration_groups else category,
+                "net_cents": net_cents,
+                "tax_cents": cents(tax),
+                "units": float(units),
+                "cost_cents": cost_cents,
+                "is_alteration": is_alteration,
+            })
+        if day < board_start:
+            continue
         receipt = receipts[employee][key]
-        receipt.add(key, net_cents, units, cost_cents)
-        receipt.lines.append({
-            "sku": text(row["SKU"]),
-            "name": product_names.get(sku) or product_names.get(base) or departments[group],
+        line = {
+            "sku": text(row["SKU"]) or None,
+            "name": product_names.get(sku) or product_names.get(base) or category,
             "units": float(units),
             "net_cents": net_cents,
             "gross_profit_cents": net_cents - cost_cents if cost_cents is not None else None,
-        })
-        for period in periods.values():
+            "is_alteration": is_alteration,
+        }
+        if is_alteration:
+            receipt.alterations.append((line, net_cents, units, cost_cents))
+        else:
+            receipt.add(key, net_cents, units, cost_cents)
+            receipt.lines.append(line)
+        for name, period in periods_with_alterations.items():
             if day >= period.start:
-                period.add(key, times[key], employee, departments[group], net_cents, units, cost_cents)
-    return {
+                period.add(key, times[key], employee, category, net_cents, units, cost_cents)
+                if not is_alteration:
+                    periods[name].add(key, times[key], employee, category, net_cents, units, cost_cents)
+    report = {
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "business_date": latest,
         "first_invoice_date": min(dates).isoformat() if dates else None,
         "last_invoice_date": max(dates).isoformat() if dates else None,
         "periods": {period: data.export(names) for period, data in periods.items()},
+        "store_snapshot": {
+            **current_customer_totals(customers_path),
+            "inventory_items": item_count,
+            "in_stock": in_stock,
+            "negative_stock": negative_stock,
+            "inventory_cost_cents": cents(inventory_cost),
+            "inventory_retail_cents": cents(inventory_retail),
+            "missing_stock_costs": missing_stock_costs,
+            "missing_stock_prices": missing_stock_prices,
+        },
+        "periods_with_alterations": {period: data.export(names) for period, data in periods_with_alterations.items()},
         "receipts": {
             employee: [
-                {
-                    "invoice": key[0], "date": key[1], "register_id": key[2], "time": times[key],
-                    **receipt.export(), "lines": receipt.lines,
-                }
+                receipt.export_receipt(key, times[key])
                 for key, receipt in sorted(
                     entries.items(), key=lambda item: (
                         item[0][1], times[item[0]] or "", item[0][0], item[0][2],
@@ -291,3 +420,7 @@ def build_sales_board(paths: tuple[Path, ...], *, today: date) -> dict:
             for employee, entries in receipts.items()
         },
     }
+    if report_start is not None:
+        history.setdefault(latest[:7], [])
+        report["history"] = dict(history)
+    return report

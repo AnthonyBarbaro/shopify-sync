@@ -158,7 +158,7 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sales_receipts_require_a_dashboard_session_and_respect_pause(self) -> None:
         path = "/api/sales-board/receipts"
-        query = b"employee_id=A&period=year&page=2"
+        query = b"employee_id=A&period=year&page=2&include_alterations=true"
         status, _ = await self.post(None, path=path, method="GET", query_string=query)
         self.assertEqual(status, 401)
         self.main.db.get_sales_board_receipts.assert_not_called()
@@ -170,11 +170,56 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((status, result), (200, {"available": True, "items": receipts[:30], "has_more": True}))
             self.main.db.get_sales_board_receipts.assert_called_once_with(
                 shop_domain=self.shop.shop_domain, employee_id="A", period="year", offset=30, limit=31,
+                include_alterations=True,
             )
             self.main.db.get_sales_board_settings.return_value = {"enabled": False}
             status, result = await self.post(None, path=path, method="GET", query_string=query)
         self.assertEqual((status, result), (200, {"available": False, "items": [], "has_more": False}))
         self.assertEqual(self.main.db.get_sales_board_receipts.call_count, 1)
+
+    async def test_custom_report_compares_matching_prior_year_dates_and_reads_only_this_shop(self) -> None:
+        path = "/api/sales-reports"
+        query = b"start=2026-01-01&end=2026-11-22&prior_year=true"
+        status, _ = await self.post(None, path=path, method="GET", query_string=query)
+        self.assertEqual(status, 401)
+        self.main.db.read_sales_report_lines.assert_not_called()
+        with (
+            mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})),
+            mock.patch.object(self.main, "utc_now", return_value=datetime(2026, 11, 23, 2, tzinfo=timezone.utc)),
+        ):
+            self.main.db.get_sales_board_settings.return_value = {}
+            self.main.db.list_sales_report_months.return_value = ["2025-01", "2026-11"]
+            line = {"date": "2026-11-22", "hour": 11, "ticket": 1, "rep_id": "A", "rep": "Alex",
+                    "is_alteration": False, "net_cents": 12000, "cost_cents": 5000, "units": 1,
+                    "sku": "SUIT", "product": "Navy suit", "brand": "Tailors", "category": "Suits"}
+            self.main.db.read_sales_report_lines.side_effect = [[line], [{**line, "date": "2025-11-22", "net_cents": 10000}]]
+            status, result = await self.post(None, path=path, method="GET", query_string=query)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["business_date"], "2026-11-22")
+        self.assertEqual(result["report"]["totals"]["gross_profit_cents"], 7000)
+        self.assertEqual(result["report"]["rankings"]["brands"][0]["name"], "Tailors")
+        self.assertEqual(result["comparison"]["end"], "2025-11-22")
+        self.assertEqual(result["comparison"]["totals"]["net_cents"], 10000)
+        self.assertEqual(self.main.db.read_sales_report_lines.call_args_list, [
+            mock.call(shop_domain=self.shop.shop_domain, first_month="2026-01", last_month="2026-11"),
+            mock.call(shop_domain=self.shop.shop_domain, first_month="2025-01", last_month="2025-11"),
+        ])
+
+    async def test_three_year_report_clamps_leap_day_and_marks_unavailable_years(self) -> None:
+        path = "/api/sales-reports/year-over-year"
+        with (
+            mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})),
+            mock.patch.object(self.main, "utc_now", return_value=datetime(2024, 3, 1, 2, tzinfo=timezone.utc)),
+        ):
+            self.main.db.get_sales_board_settings.return_value = {}
+            self.main.db.list_sales_report_months.return_value = ["2024-02", "2023-02"]
+            self.main.db.get_sales_board.return_value = {"store_snapshot": {"inventory_items": 120}}
+            self.main.db.read_sales_report_lines.return_value = []
+            status, result = await self.post(None, path=path, method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual([row["through"] for row in result["years"]], ["2024-02-29", "2023-02-28", "2022-02-28"])
+        self.assertEqual([row["available"]["today"] for row in result["years"]], [True, True, False])
+        self.assertEqual(result["store_snapshot"]["inventory_items"], 120)
 
     async def test_customer_address_review_requires_a_shop_dashboard_session(self) -> None:
         path = "/api/customer-sync-history/17/address"
