@@ -387,10 +387,12 @@ class DatabaseStore:
                 CREATE TABLE IF NOT EXISTS sales_board_snapshots (
                     shop_domain TEXT PRIMARY KEY,
                     observed_at TEXT NOT NULL,
-                    payload TEXT NOT NULL
+                    payload TEXT NOT NULL,
+                    receipts TEXT
                 )
                 """
             )
+            self._ensure_column(connection, "sales_board_snapshots", "receipts", "TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sales_board_settings (
@@ -1449,16 +1451,21 @@ class DatabaseStore:
             ).fetchone()
         return int(row["count"]) if row else 0
 
-    def save_sales_board(self, *, shop_domain: str, observed_at: str, payload: dict[str, Any]) -> bool:
+    def save_sales_board(
+        self, *, shop_domain: str, observed_at: str, payload: dict[str, Any],
+        receipts: dict[str, Any] | None = None,
+    ) -> bool:
         with self._connect() as connection:
             result = connection.execute(
                 """
-                INSERT INTO sales_board_snapshots (shop_domain, observed_at, payload)
-                VALUES (?, ?, ?)
-                ON CONFLICT(shop_domain) DO UPDATE SET observed_at=excluded.observed_at, payload=excluded.payload
+                INSERT INTO sales_board_snapshots (shop_domain, observed_at, payload, receipts)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(shop_domain) DO UPDATE SET observed_at=excluded.observed_at,
+                    payload=excluded.payload, receipts=excluded.receipts
                 WHERE excluded.observed_at >= sales_board_snapshots.observed_at
                 """,
-                (shop_domain, observed_at, json.dumps(payload, separators=(",", ":"))),
+                (shop_domain, observed_at, json.dumps(payload, separators=(",", ":")),
+                 json.dumps(receipts, separators=(",", ":")) if receipts is not None else None),
             )
             return result.rowcount == 1
 
@@ -1468,6 +1475,21 @@ class DatabaseStore:
                 "SELECT payload FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,),
             ).fetchone()
         return json.loads(row["payload"]) if row is not None else None
+
+    def get_sales_board_receipts(
+        self, *, shop_domain: str, employee_id: str, period: str, offset: int, limit: int,
+    ) -> list[dict[str, Any]] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload, receipts FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,),
+            ).fetchone()
+        if row is None or row["receipts"] is None:
+            return None
+        snapshot = json.loads(row["payload"])
+        start, end = snapshot["periods"][period]["start"], snapshot["business_date"]
+        employee_receipts = json.loads(row["receipts"]).get(employee_id, [])
+        selected = [receipt for receipt in employee_receipts if start <= receipt["date"] <= end]
+        return selected[offset:offset + limit]
 
     def get_sales_board_settings(self, *, shop_domain: str) -> dict[str, Any]:
         with self._connect() as connection:

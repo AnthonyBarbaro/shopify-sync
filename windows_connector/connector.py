@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.2"
+CONNECTOR_VERSION = "1.4.3"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -393,7 +393,7 @@ class Connector:
                         stop.wait(interval)
                         continue
                     interval = min(900, max(30, int(remote["interval_seconds"])))
-                    today = datetime.now().date()
+                    today = date.fromisoformat(remote["business_date"])
                     paths = sales_paths(self.dbf_dir)
                     current = (today, sales_source_signature(paths))
                     if current != signature:

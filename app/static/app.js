@@ -22,6 +22,7 @@ const state = {
   salesError: null,
   salesPeriod: "month",
   salesEmployee: null,
+  salesReceiptView: null,
   salesFocus: false,
   salesSettings: null,
   salesSettingsBusy: false,
@@ -64,16 +65,36 @@ document.addEventListener("click", async (event) => {
   const period = event.target.closest("[data-sales-period]")
   if (period) {
     state.salesPeriod = period.dataset.salesPeriod
-    state.salesEmployee = null
+    state.salesReceiptView = null
     render()
+    if (state.sales?.snapshot?.periods[state.salesPeriod].employees.some((person) => person.employee_id === state.salesEmployee)) {
+      loadSalesReceipts()
+    }
     return
   }
 
   const employee = event.target.closest("[data-sales-employee]")
   if (employee) {
     state.salesEmployee = employee.dataset.salesEmployee
-    render()
+    loadSalesReceipts()
     document.getElementById("sales-employee-detail")?.focus()
+    return
+  }
+
+  const receiptPage = event.target.closest("[data-sales-receipt-page]")
+  if (receiptPage) {
+    loadSalesReceipts(Number(receiptPage.dataset.salesReceiptPage))
+    document.getElementById("sales-receipts-heading")?.focus()
+    return
+  }
+
+  if (event.target.closest("[data-sales-employee-close]")) {
+    const selected = state.salesEmployee
+    state.salesEmployee = null
+    state.salesReceiptView = null
+    render()
+    Array.from(document.querySelectorAll("[data-sales-employee]"))
+      .find((button) => button.dataset.salesEmployee === selected)?.focus()
     return
   }
 
@@ -168,8 +189,32 @@ async function refreshSales() {
     state.salesError = error
   } finally {
     state.salesLoading = false
-    if (window.location.pathname === "/app/sales") render()
+    if (window.location.pathname === "/app/sales") {
+      render()
+      const view = state.salesReceiptView
+      const snapshot = state.sales?.snapshot
+      if (snapshot?.periods[state.salesPeriod].employees.some((person) => person.employee_id === state.salesEmployee)
+          && (!view || (view.page === 1 && view.observedAt !== snapshot.observed_at))) {
+        loadSalesReceipts(1, view?.data)
+      }
+    }
   }
+}
+
+async function loadSalesReceipts(page = 1, previousData = null) {
+  const view = {
+    employee: state.salesEmployee, period: state.salesPeriod, page,
+    data: previousData, error: null, observedAt: state.sales?.snapshot?.observed_at,
+  }
+  state.salesReceiptView = view
+  if (!previousData) render()
+  const query = new URLSearchParams({ employee_id: view.employee, period: view.period, page })
+  try {
+    view.data = await fetchJson(`/api/sales-board/receipts?${query}`)
+  } catch (error) {
+    view.error = error
+  }
+  if (state.salesReceiptView === view && window.location.pathname === "/app/sales") render()
 }
 
 async function refreshCustomerLog() {
@@ -352,7 +397,20 @@ function render() {
   }
   if (route === "/app/settings" && !state.salesSettings && !state.salesSettingsBusy && !state.salesSettingsError) ensureSalesSettings()
 
+  const chart = route === "/app/sales" ? app.querySelector("[data-sales-chart]") : null
+  const chartOffset = chart?.scrollLeft
+  const receipts = route === "/app/sales" ? app.querySelector("[data-sales-receipts]") : null
+  const openReceipts = new Set(Array.from(receipts?.querySelectorAll("details[open]") || [], (detail) => detail.dataset.receipt))
   app.innerHTML = routes[route].render()
+  if (chart?.dataset.salesChart === state.salesPeriod && chartOffset) {
+    app.querySelector("[data-sales-chart]")?.scrollTo(chartOffset, 0)
+  }
+  const nextReceipts = route === "/app/sales" ? app.querySelector("[data-sales-receipts]") : null
+  if (receipts && nextReceipts?.dataset.salesReceipts === receipts.dataset.salesReceipts) {
+    nextReceipts.querySelectorAll("details[data-receipt]").forEach((detail) => {
+      detail.open = openReceipts.has(detail.dataset.receipt)
+    })
+  }
 }
 
 function renderOverview() {
@@ -535,11 +593,36 @@ function renderOrders() {
 }
 
 function salesMoney(cents) {
-  return formatMoney(cents / 100, "USD")
+  return cents == null ? "—" : formatMoney(cents / 100, "USD")
+}
+
+function salesMargin(percent) {
+  return percent == null ? "—" : `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(percent)}%`
+}
+
+function salesClock(value, showMinutes = false) {
+  if (!value) return "Time unavailable"
+  const [hour, minute] = value.split(":").map(Number)
+  return `${hour % 12 || 12}${showMinutes ? `:${String(minute).padStart(2, "0")}` : ""} ${hour >= 12 ? "PM" : "AM"}`
+}
+
+function salesCostNote(totals) {
+  if (totals.missing_cost_lines == null) return "Update the Windows connector to see profit and margin."
+  if (!totals.missing_cost_lines) return ""
+  const count = totals.missing_cost_lines
+  return `${formatSalesCount(count)} merchandise line${count === 1 ? "" : "s"} without a recorded cost. Profit and margin cover lines with known costs.`
+}
+
+function salesPartial(totals) {
+  return totals.missing_cost_lines > 0 && totals.gross_profit_cents != null
+    ? ` <span class="sales-partial" title="${escapeHtml(salesCostNote(totals))}">Partial</span>`
+    : ""
 }
 
 function salesDate(value) {
-  return new Date(`${value}T12:00:00`).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })
+  return new Date(`${value}T00:00:00Z`).toLocaleDateString("en-US", {
+    month: "short", day: "numeric", year: "numeric", timeZone: "UTC",
+  })
 }
 
 function renderSalesBoard() {
@@ -578,19 +661,22 @@ function renderSalesBoard() {
     <div class="sales-toolbar">
       <div class="sales-periods" role="group" aria-label="Reporting period">${Object.entries(settings).map(([key, label]) =>
         `<button type="button" data-sales-period="${key}" aria-pressed="${key === state.salesPeriod}">${label}</button>`).join("")}</div>
-      <div class="sales-freshness">${statusBadge(status, stale || state.salesError ? "warning" : "success")} <span title="${escapeHtml(formatDate(snapshot.observed_at))}">Updated ${escapeHtml(relativeTime(snapshot.observed_at))}</span></div>
+      <div class="sales-freshness">${statusBadge(status, stale || state.salesError ? "warning" : "success")} <span>Updated ${escapeHtml(formatDate(snapshot.observed_at))}</span></div>
     </div>
     <div class="sales-scorecard">
       <div class="sales-net"><span>Net sales</span><strong>${salesMoney(totals.net_cents)}</strong><small>${escapeHtml(dates)}</small></div>
+      <div><span>Gross profit${salesPartial(totals)}</span><strong>${salesMoney(totals.gross_profit_cents)}</strong></div>
+      <div><span>Gross margin${salesPartial(totals)}</span><strong>${salesMargin(totals.gross_margin_percent)}</strong></div>
       <div><span>Sales tickets</span><strong>${formatSalesCount(totals.tickets)}</strong></div>
       <div><span>Net units</span><strong>${formatSalesCount(totals.units)}</strong></div>
       <div><span>Average ticket</span><strong>${totals.tickets ? salesMoney(totals.net_cents / totals.tickets) : "—"}</strong></div>
       <div><span>Returns &amp; credits</span><strong>${salesMoney(totals.credits_cents)}</strong></div>
     </div>
+    ${salesCostNote(totals) ? `<p class="sales-muted sales-cost-note">${escapeHtml(salesCostNote(totals))}</p>` : ""}
     <div class="sales-layout">
       <section class="panel sales-leaderboard" aria-labelledby="sales-leaderboard-heading">
         <div class="panel-head"><h2 id="sales-leaderboard-heading">Employee leaderboard</h2><span class="panel-label">${settings[state.salesPeriod]}</span></div>
-        ${ranked.length || unassigned ? `<div class="sales-leader-labels" aria-hidden="true"><span>Employee</span><span>Tickets</span><span>Net sales</span></div>
+        ${ranked.length || unassigned ? `<div class="sales-leader-labels" aria-hidden="true"><span>Employee</span><span class="sales-leader-tickets">Tickets</span><span>Net sales</span><span>Gross profit</span><span>Margin</span></div>
           ${ranked.map((person, index) => renderSalesEmployee(person, index + 1)).join("")}
           ${unassigned ? renderSalesEmployee(unassigned, null) : ""}` : `<div class="empty"><strong>No merchandise sales in this period</strong></div>`}
       </section>
@@ -606,11 +692,16 @@ function renderSalesBoard() {
       </div>
     </div>
     ${selected ? `<section class="panel sales-employee-detail" id="sales-employee-detail" tabindex="-1" aria-labelledby="sales-employee-heading">
-      <div class="panel-head"><h2 id="sales-employee-heading">${escapeHtml(selected.name)}</h2><span class="panel-label">${settings[state.salesPeriod]}</span></div>
-      <div class="sales-employee-stats"><span><strong>${salesMoney(selected.net_cents)}</strong> Net sales</span><span><strong>${formatSalesCount(selected.tickets)}</strong> Tickets</span><span><strong>${formatSalesCount(selected.units)}</strong> Net units</span><span><strong>${selected.tickets ? salesMoney(selected.net_cents / selected.tickets) : "—"}</strong> Average ticket</span></div>
+      <div class="panel-head"><h2 id="sales-employee-heading">${escapeHtml(selected.name)}</h2><button class="button secondary" type="button" data-sales-employee-close>Close</button></div>
+      <div class="sales-employee-stats"><span><strong>${salesMoney(selected.net_cents)}</strong> Net sales</span><span><strong>${salesMoney(selected.gross_profit_cents)}</strong> Gross profit${salesPartial(selected)}</span><span><strong>${salesMargin(selected.gross_margin_percent)}</strong> Gross margin</span><span><strong>${formatSalesCount(selected.tickets)}</strong> Tickets</span><span><strong>${formatSalesCount(selected.units)}</strong> Net units</span><span><strong>${selected.tickets ? salesMoney(selected.net_cents / selected.tickets) : "—"}</strong> Average ticket</span></div>
+      ${renderSalesReceipts(state.salesReceiptView, settings[state.salesPeriod])}
+      <h3 class="sales-subheading">Category mix</h3>
       ${renderSalesCategories(selected.categories)}
     </section>` : ""}
-    <section class="panel"><div class="panel-head"><h2>${state.salesPeriod === "today" ? "Sales by hour" : state.salesPeriod === "year" ? "Sales by month" : "Sales by day"}</h2><span class="panel-label">Net sales</span></div>${renderSalesTrend(period.trend)}</section>
+    <section class="panel"><div class="panel-head"><h2 id="sales-trend-heading">${state.salesPeriod === "today" ? "Sales by hour" : state.salesPeriod === "year" ? "Sales by month" : "Sales by day"}</h2><span class="panel-label">${state.salesPeriod === "today" ? "9 AM–9 PM ET · Net sales" : "Net sales"}</span></div>
+      ${renderSalesTrend(period.trend, state.salesPeriod)}
+      ${state.salesPeriod === "year" ? renderSalesMonths(period.trend) : ""}
+    </section>
     <p class="sales-muted">${snapshot.last_invoice_date ? `Latest completed POS invoice: ${escapeHtml(salesDate(snapshot.last_invoice_date))}. ` : ""}Sales credit follows the clerk on each line. A shared ticket can count for more than one employee.</p>
   </section>`
 }
@@ -623,7 +714,10 @@ function renderSalesEmployee(person, rank) {
   const id = escapeHtml(person.employee_id)
   return `<button type="button" class="sales-leader-row" data-sales-employee="${id}" aria-pressed="${person.employee_id === state.salesEmployee}">
     <span class="sales-person"><span class="sales-rank ${rank && rank <= 3 ? "is-top" : ""}">${rank ?? "—"}</span><strong>${escapeHtml(person.name)}</strong></span>
-    <span>${formatSalesCount(person.tickets)}</span><strong>${salesMoney(person.net_cents)}</strong>
+    <span class="sales-leader-tickets" aria-label="${formatSalesCount(person.tickets)} tickets">${formatSalesCount(person.tickets)}</span>
+    <strong aria-label="${salesMoney(person.net_cents)} net sales">${salesMoney(person.net_cents)}</strong>
+    <span aria-label="${salesMoney(person.gross_profit_cents)} gross profit">${salesMoney(person.gross_profit_cents)}${salesPartial(person)}</span>
+    <span aria-label="${salesMargin(person.gross_margin_percent)} gross margin">${salesMargin(person.gross_margin_percent)}</span>
   </button>`
 }
 
@@ -636,16 +730,68 @@ function renderSalesCategories(categories) {
   </li>`).join("")}</ul>`
 }
 
-function renderSalesTrend(trend) {
-  if (!trend.some(({ net_cents }) => net_cents)) return `<p class="sales-muted">No sales activity to chart in this period.</p>`
-  const scale = Math.max(1, ...trend.map(({ net_cents }) => Math.abs(net_cents)))
-  return `<ul class="sales-trend">${trend.map(({ label, net_cents }, index) => {
-    const text = /^\d{4}-\d{2}-\d{2}$/.test(label) ? label.slice(-2) : /^\d{4}-\d{2}$/.test(label)
-      ? new Date(`${label}-01T12:00:00`).toLocaleDateString([], { month: "short" }) : label
-    return `<li><span class="sales-trend-bar"><i class="${net_cents < 0 ? "is-negative" : ""}" style="--bar:${Math.abs(net_cents) / scale * 100}%"></i></span>
-      <span aria-hidden="true">${index % Math.ceil(trend.length / 12) === 0 ? escapeHtml(text) : ""}</span>
-      <span class="sales-chart-value">${escapeHtml(label)} · ${salesMoney(net_cents)}</span></li>`
-  }).join("")}</ul>`
+function salesMonth(label) {
+  return new Date(`${label}-01T00:00:00Z`).toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })
+}
+
+function renderSalesTrend(trend, period) {
+  const points = period === "today" ? trend.filter(({ label }) => label >= "09:00" && label < "21:00") : trend
+  const scale = Math.max(1, ...points.map(({ net_cents }) => Math.abs(net_cents)))
+  return `<div class="sales-trend-scroll" data-sales-chart="${period}" tabindex="0" role="region" aria-labelledby="sales-trend-heading">
+    <ul class="sales-trend">${points.map(({ label, net_cents }) => {
+      const day = period === "week" || period === "month"
+      const dateText = day ? label.slice(5).split("-").map(Number).join("-") : period === "year" ? salesMonth(label) : salesClock(label)
+      const weekday = day ? new Date(`${label}T00:00:00Z`).toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }) : ""
+      return `<li>
+        <span class="sales-trend-bar ${net_cents < 0 ? "is-negative" : ""}" style="--bar:${Math.abs(net_cents) / scale * 100}%">
+          <i aria-hidden="true"></i><strong>${salesMoney(net_cents)}</strong>
+        </span>
+        <span class="sales-trend-label">${escapeHtml(dateText)}${weekday ? `<small>${escapeHtml(weekday)}</small>` : ""}</span>
+      </li>`
+    }).join("")}</ul>
+  </div>`
+}
+
+function renderSalesMonths(trend) {
+  return `<div class="sales-table-scroll"><table class="sales-table">
+    <thead><tr><th scope="col">Month</th><th scope="col">Net sales</th><th scope="col">Gross profit</th><th scope="col">Gross margin</th></tr></thead>
+    <tbody>${trend.map((month) => `<tr><th scope="row">${salesMonth(month.label)}</th><td>${salesMoney(month.net_cents)}</td><td>${salesMoney(month.gross_profit_cents)}${salesPartial(month)}</td><td>${salesMargin(month.gross_margin_percent)}</td></tr>`).join("")}</tbody>
+  </table></div>`
+}
+
+function renderSalesReceipts(view, periodLabel) {
+  const body = !view || (!view.data && !view.error) ? `<p class="sales-muted">Loading sales…</p>` :
+    view.error ? `<p class="sales-muted" role="status">${escapeHtml(view.error.message)} <button class="button secondary" type="button" data-sales-receipt-page="${view.page}">Retry</button></p>` :
+    !view.data.available ? `<p class="sales-muted">Update the Windows connector to see individual sales.</p>` :
+    !view.data.items.length ? `<p class="sales-muted">No merchandise receipts on this page.</p>` :
+    view.data.items.map(renderSalesReceipt).join("")
+  return `<div class="sales-receipts" data-sales-receipts="${escapeHtml(JSON.stringify([view?.employee, view?.period, view?.page]))}">
+    <div class="panel-head"><h3 id="sales-receipts-heading" tabindex="-1">Sales and returns</h3><span class="panel-label">${escapeHtml(periodLabel)}</span></div>
+    ${body}
+    ${view && (view.page > 1 || view.data?.has_more) ? `<div class="sales-receipt-pages">
+      <button class="button secondary" type="button" data-sales-receipt-page="${view.page - 1}" ${view.page === 1 ? "disabled" : ""}>Previous</button>
+      <span>Page ${view.page}</span>
+      <button class="button secondary" type="button" data-sales-receipt-page="${view.page + 1}" ${view.data?.has_more ? "" : "disabled"}>Next</button>
+    </div>` : ""}
+  </div>`
+}
+
+function renderSalesReceipt(receipt) {
+  const identifier = JSON.stringify([receipt.invoice, receipt.date, receipt.register_id])
+  return `<details class="sales-receipt" data-receipt="${escapeHtml(identifier)}">
+    <summary>
+      <span><strong>Ticket #${escapeHtml(receipt.invoice)}</strong><small>${escapeHtml(salesDate(receipt.date))} · ${salesClock(receipt.time, true)}${receipt.time ? " ET" : ""}${receipt.register_id ? ` · Register ${escapeHtml(receipt.register_id)}` : ""}</small></span>
+      <strong class="sales-receipt-net">${salesMoney(receipt.net_cents)}</strong>
+    </summary>
+    <div class="sales-receipt-detail">
+      <div class="sales-receipt-profit"><span>Gross profit <strong>${salesMoney(receipt.gross_profit_cents)}</strong>${salesPartial(receipt)}</span><span>Gross margin <strong>${salesMargin(receipt.gross_margin_percent)}</strong></span></div>
+      ${receipt.missing_cost_lines ? `<p class="sales-muted">${escapeHtml(salesCostNote(receipt))}</p>` : ""}
+      <div class="sales-table-scroll"><table class="sales-table">
+        <thead><tr><th scope="col">Item</th><th scope="col">Qty</th><th scope="col">Net sales</th><th scope="col">Gross profit</th></tr></thead>
+        <tbody>${receipt.lines.map((line) => `<tr><th scope="row">${escapeHtml(line.name)}<small>SKU ${escapeHtml(line.sku)}</small></th><td>${formatSalesCount(line.units)}</td><td>${salesMoney(line.net_cents)}</td><td>${salesMoney(line.gross_profit_cents)}</td></tr>`).join("")}</tbody>
+      </table></div>
+    </div>
+  </details>`
 }
 
 function renderCustomers() {
@@ -989,7 +1135,10 @@ function formatDate(value) {
   if (!value) return "Time unavailable"
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return String(value)
-  return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+  return date.toLocaleString("en-US", {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    hour12: true, timeZone: "America/New_York", timeZoneName: "short",
+  })
 }
 
 function formatMoney(value, currency) {

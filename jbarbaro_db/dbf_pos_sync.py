@@ -694,6 +694,7 @@ def parse_args() -> argparse.Namespace:
 
 def iter_dbf_rows(
     path: Path, *, encoding: str = "latin1", required_fields: Optional[set[str]] = None,
+    optional_fields: Optional[set[str]] = None,
 ) -> Iterator[Dict[str, Any]]:
     with path.open("rb") as handle:
         header = handle.read(32)
@@ -723,9 +724,10 @@ def iter_dbf_rows(
             )
 
         projection = []
+        selected_fields = None if required_fields is None else required_fields | (optional_fields or set())
         offset = 1
         for field in fields:
-            if required_fields is None or field.name in required_fields:
+            if selected_fields is None or field.name in selected_fields:
                 projection.append((field, offset))
             offset += field.length
         if required_fields is not None:

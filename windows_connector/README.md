@@ -164,10 +164,20 @@ It excludes alteration lines even on mixed tickets, and omits gift-card issues, 
 open orders, and unclassified lines. Net units reflect returned quantities. Sales tickets count each
 receipt with a positive merchandise line once per store or employee. A shared receipt can count for
 more than one employee. The board covers the live POS invoice history available on the computer.
+Gross profit subtracts the unit cost recorded on each sale line and reverses that cost on returns.
+Blank, zero, and invalid unit costs are treated as missing. When costs are missing, the displayed
+profit and margin cover the lines with known costs, and the board labels them as partial.
 
-The worker sends one current aggregate snapshot per store. It sends employee display names and sales
-totals, with no invoice identifiers, customer information, or payments. Deploy the backend before
-updating the Windows connector so the new worker can reach the settings and reporting endpoints.
+Select a rep on the leaderboard to open their merchandise sales and returns for the selected period.
+On shared tickets, each rep sees only their own lines. Reporting periods use Eastern Time, and
+receipt times use the Eastern local clock recorded by the POS. Today's hourly chart covers 9 AM
+through the 9 PM closing boundary. Daily and monthly totals include completed sales at any time.
+The Year view includes a month-by-month profit and margin table.
+
+The worker sends a current snapshot with totals and ticket breakdowns. Ticket data includes invoice
+number, time, register, merchandise, quantities and amounts. It omits customer and payment fields
+and is available on demand in the authenticated Shopify dashboard. Deploy the backend before
+updating the Windows connector so it can save and serve receipt details.
 
 ## Shopify order inbox
 

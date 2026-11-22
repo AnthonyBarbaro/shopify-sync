@@ -3,6 +3,7 @@ import importlib.util
 import json
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from unittest import mock
@@ -65,6 +66,7 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         path: str = "/sync/inventory/status/reconcile",
         method: str = "POST",
         dashboard_header: bool = True,
+        query_string: bytes = b"",
     ) -> tuple[int, dict[str, object]]:
         body = json.dumps(payload).encode("utf-8")
         headers = [(b"content-type", b"application/json")]
@@ -80,7 +82,7 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             "scheme": "http",
             "path": path,
             "raw_path": path.encode("utf-8"),
-            "query_string": b"",
+            "query_string": query_string,
             "root_path": "",
             "headers": headers,
             "client": ("127.0.0.1", 12345),
@@ -150,8 +152,29 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((status, result), (200, options))
         self.main.db.save_sales_board_settings.assert_called_once_with(shop_domain=self.shop.shop_domain, **options)
         self.main.db.get_sales_board_settings.return_value = options
-        status, result = await self.post(None, path="/sync/sales-board/settings", method="GET")
-        self.assertEqual((status, result), (200, {"enabled": False, "interval_seconds": 90}))
+        with mock.patch.object(self.main, "utc_now", return_value=datetime(2026, 11, 23, 2, tzinfo=timezone.utc)):
+            status, result = await self.post(None, path="/sync/sales-board/settings", method="GET")
+        self.assertEqual((status, result), (200, {"enabled": False, "interval_seconds": 90, "business_date": "2026-11-22"}))
+
+    async def test_sales_receipts_require_a_dashboard_session_and_respect_pause(self) -> None:
+        path = "/api/sales-board/receipts"
+        query = b"employee_id=A&period=year&page=2"
+        status, _ = await self.post(None, path=path, method="GET", query_string=query)
+        self.assertEqual(status, 401)
+        self.main.db.get_sales_board_receipts.assert_not_called()
+        with mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})):
+            self.main.db.get_sales_board_settings.return_value = {}
+            receipts = [{"invoice": str(i)} for i in range(31)]
+            self.main.db.get_sales_board_receipts.return_value = receipts
+            status, result = await self.post(None, path=path, method="GET", query_string=query)
+            self.assertEqual((status, result), (200, {"available": True, "items": receipts[:30], "has_more": True}))
+            self.main.db.get_sales_board_receipts.assert_called_once_with(
+                shop_domain=self.shop.shop_domain, employee_id="A", period="year", offset=30, limit=31,
+            )
+            self.main.db.get_sales_board_settings.return_value = {"enabled": False}
+            status, result = await self.post(None, path=path, method="GET", query_string=query)
+        self.assertEqual((status, result), (200, {"available": False, "items": [], "has_more": False}))
+        self.assertEqual(self.main.db.get_sales_board_receipts.call_count, 1)
 
     async def test_customer_address_review_requires_a_shop_dashboard_session(self) -> None:
         path = "/api/customer-sync-history/17/address"

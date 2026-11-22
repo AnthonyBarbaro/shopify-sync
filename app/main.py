@@ -11,6 +11,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, List, Literal, Tuple, TypeVar
 from urllib.parse import parse_qsl, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -1399,8 +1400,11 @@ async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
 
 
 @app.exception_handler(RequestValidationError)
-async def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-    details = {"errors": exc.errors()}
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = exc.errors()
+    if request.url.path.rstrip("/") == "/sync/sales-board":
+        errors = [{field: error[field] for field in ("loc", "msg", "type")} for error in errors]
+    details = {"errors": errors}
     logger.error("validation_error %s", safe_json_dumps(details))
     return JSONResponse(
         status_code=422,
@@ -1634,6 +1638,26 @@ def sales_board(request: Request) -> JSONResponse:
     return JSONResponse({"snapshot": snapshot, "settings": board.model_dump()}, headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/sales-board/receipts", response_model=None)
+def sales_board_receipts(
+    request: Request,
+    employee_id: str = Query(min_length=1, max_length=80),
+    period: Literal["today", "week", "month", "year"] = "month",
+    page: int = Query(default=1, ge=1),
+) -> JSONResponse:
+    shop, _session = _get_session_context(request)
+    board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
+    page_size = 30
+    rows = db.get_sales_board_receipts(
+        shop_domain=shop.shop_domain, employee_id=employee_id, period=period,
+        offset=(page - 1) * page_size, limit=page_size + 1,
+    ) if board.enabled else None
+    return JSONResponse(
+        {"available": rows is not None, "items": (rows or [])[:page_size], "has_more": len(rows or []) > page_size},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/customer-sync-history", response_model=None)
 def customer_sync_history(
     request: Request, outcome: Literal["created", "matched", "failed"] | None = None,
@@ -1673,17 +1697,24 @@ def update_sales_board_settings(request: Request, board: SalesBoardSettings) -> 
 @app.get("/sync/sales-board/settings", response_model=None)
 def connector_sales_board_settings(shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
     board = SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain))
-    return JSONResponse({"enabled": board.enabled, "interval_seconds": board.interval_seconds}, headers={"Cache-Control": "no-store"})
+    business_date = utc_now().astimezone(ZoneInfo("America/New_York")).date()
+    return JSONResponse(
+        {"enabled": board.enabled, "interval_seconds": board.interval_seconds, "business_date": business_date.isoformat()},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/sync/sales-board", response_model=None)
 def publish_sales_board(payload: SalesBoardSnapshot, shop: ShopRecord = Depends(require_pos_shop)) -> JSONResponse:
     if not SalesBoardSettings(**db.get_sales_board_settings(shop_domain=shop.shop_domain)).enabled:
         return JSONResponse({"saved": False})
+    snapshot = payload.model_dump(mode="json")
+    receipts = snapshot.pop("receipts")
     saved = db.save_sales_board(
         shop_domain=shop.shop_domain,
         observed_at=payload.observed_at.astimezone(timezone.utc).isoformat(timespec="microseconds"),
-        payload=payload.model_dump(mode="json"),
+        payload=snapshot,
+        receipts=receipts,
     )
     return JSONResponse({"saved": saved})
 

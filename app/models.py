@@ -89,7 +89,13 @@ class ConnectorHeartbeatRequest(BaseModel):
     customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
 
 
-class SalesBoardTotals(BaseModel):
+class SalesBoardProfit(BaseModel):
+    gross_profit_cents: int | None = None
+    gross_margin_percent: FiniteFloat | None = None
+    missing_cost_lines: int | None = Field(default=None, ge=0)
+
+
+class SalesBoardTotals(SalesBoardProfit):
     net_cents: int
     tickets: int = Field(ge=0)
     units: FiniteFloat
@@ -106,7 +112,7 @@ class SalesBoardEmployee(SalesBoardTotals):
     categories: List[SalesBoardCategory] = Field(max_length=150)
 
 
-class SalesBoardTrendPoint(BaseModel):
+class SalesBoardTrendPoint(SalesBoardProfit):
     label: str = Field(min_length=1, max_length=24)
     net_cents: int
 
@@ -126,12 +132,29 @@ class SalesBoardPeriods(BaseModel):
     year: SalesBoardPeriod
 
 
+class SalesBoardReceiptLine(BaseModel):
+    sku: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    units: FiniteFloat
+    net_cents: int
+    gross_profit_cents: int | None = None
+
+
+class SalesBoardReceipt(SalesBoardTotals):
+    invoice: str = Field(min_length=1, max_length=80)
+    date: date
+    register_id: str = Field(max_length=80)
+    time: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    lines: List[SalesBoardReceiptLine]
+
+
 class SalesBoardSnapshot(BaseModel):
     observed_at: AwareDatetime
     business_date: date
     first_invoice_date: Optional[date] = None
     last_invoice_date: Optional[date] = None
     periods: SalesBoardPeriods
+    receipts: Dict[str, List[SalesBoardReceipt]] | None = None
 
 
 class SalesBoardSettings(BaseModel):
