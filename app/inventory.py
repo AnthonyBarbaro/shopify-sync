@@ -24,6 +24,7 @@ from app.product_weights import estimated_weight_grams, inventory_has_weight, we
 from app.shopify import (
     INVENTORY_QUANTITY_NAMES,
     ShopifyClient,
+    extract_numeric_shopify_id,
     format_price,
     normalize_gid,
 )
@@ -1039,29 +1040,45 @@ class InventorySyncService:
                 "inventoryItem": {"measurement": weight_measurement(grams)},
             })
 
-        if apply:
-            for product_id, variants in updates_by_product.items():
-                updated = self.shopify_client.update_variants_fields(
-                    shop.shop_domain, shop.access_token, product_id=product_id, variants=variants,
-                )
-                confirmed = {variant["id"] for variant in updated if inventory_has_weight(variant["inventoryItem"])}
-                missing = [variant["id"] for variant in variants if variant["id"] not in confirmed]
-                if missing:
-                    raise SyncProcessingError(
-                        "Shopify did not confirm the saved weights.",
-                        {"product_id": product_id, "variant_ids": missing},
-                        status_code=502,
-                        code="weight_update_unconfirmed",
-                    )
+        if apply and updates_by_product:
+            worker_count = min(self.settings.shopify_bulk_max_workers if self.settings else 1, len(updates_by_product))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="shopify-weight") as executor:
+                list(executor.map(
+                    lambda group: self._apply_missing_variant_weights(shop, *group), updates_by_product.items(),
+                ))
 
-        page_info = page["pageInfo"]
+        next_id = None
+        if page["pageInfo"]["hasNextPage"]:
+            next_id = extract_numeric_shopify_id(page["nodes"][-1]["id"])
+            if next_id is None:
+                raise SyncProcessingError(
+                    "Shopify returned an invalid variant ID for the next page.",
+                    status_code=502,
+                    code="invalid_weight_page",
+                )
         return {
             "scanned": len(page["nodes"]),
             "missing": len(candidates),
             "updated": len(candidates) if apply else 0,
             "candidates": candidates,
-            "next_cursor": page_info["endCursor"] if page_info["hasNextPage"] else None,
+            "next_cursor": str(next_id) if next_id is not None else None,
         }
+
+    def _apply_missing_variant_weights(
+        self, shop: ShopRecord, product_id: str, variants: List[Dict[str, Any]],
+    ) -> None:
+        updated = self.shopify_client.update_variants_fields(
+            shop.shop_domain, shop.access_token, product_id=product_id, variants=variants,
+        )
+        confirmed = {variant["id"] for variant in updated if inventory_has_weight(variant["inventoryItem"])}
+        missing = [variant["id"] for variant in variants if variant["id"] not in confirmed]
+        if missing:
+            raise SyncProcessingError(
+                "Shopify did not confirm the saved weights.",
+                {"product_id": product_id, "variant_ids": missing},
+                status_code=502,
+                code="weight_update_unconfirmed",
+            )
 
     def repair_matrix_structure(
         self,

@@ -230,10 +230,12 @@ class ShopifyClient:
     def get_variant_weight_page(
         self, shop_domain: str, access_token: str, *, cursor: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Start a fresh ID range on each page to avoid Shopify's connection pagination limit.
+        numeric_cursor = cursor is not None and cursor.isascii() and cursor.isdecimal()
         query = """
-        query VariantWeightPage($after: String) {
-          productVariants(first: 25, after: $after, sortKey: ID) {
-            pageInfo { hasNextPage endCursor }
+        query VariantWeightPage($after: String, $filter: String) {
+          productVariants(first: 100, after: $after, query: $filter, sortKey: ID) {
+            pageInfo { hasNextPage }
             nodes {
               id
               sku
@@ -244,7 +246,9 @@ class ShopifyClient:
         }
         """
         payload = self.graphql(
-            shop_domain, access_token, query, {"after": cursor}, operation_name="VariantWeightPage",
+            shop_domain, access_token, query,
+            {"after": None if numeric_cursor else cursor, "filter": f"id:>{cursor}" if numeric_cursor else None},
+            operation_name="VariantWeightPage",
         )
         return payload["data"]["productVariants"]
 

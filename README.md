@@ -115,7 +115,7 @@ its own weight or inherit the product's weight. When both are missing or zero, t
 a product-type estimate, with 454 g for unclassified items. Existing positive Shopify weights are preserved.
 
 The POS-authenticated `POST /sync/catalog/weights/backfill` endpoint previews missing or zero
-weights for up to 25 Shopify variants per page. Pass `apply=true` as a query parameter to fill
+weights for up to 100 Shopify variants per page. Pass `apply=true` as a query parameter to fill
 them with the same estimates. Use each response's `next_cursor` as the next request's `after`
 parameter until it is null. Each apply request rereads the page and updates existing shippable
 variants through Shopify's weight field. A second preview can verify that all pages report zero missing.

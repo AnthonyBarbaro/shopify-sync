@@ -4,6 +4,7 @@ from unittest.mock import Mock
 from app.db import ShopRecord
 from app.inventory import InventorySyncService
 from app.models import ProductSyncRequest, ProductVariantSyncInput, VariantMapping
+from app.shopify import ShopifyClient
 from jbarbaro_db.dbf_pos_sync import pos_item_weight_grams
 
 
@@ -54,33 +55,34 @@ class ProductWeightTests(unittest.TestCase):
     def test_backfill_previews_and_updates_only_missing_shippable_variants(self):
         product = {"id": "p1", "title": "Wool", "productType": "Suit"}
         nodes = [
-            {"id": sku, "sku": sku, "product": product, "inventoryItem": {
+            {"id": f"gid://shopify/ProductVariant/{index}", "sku": sku, "product": product, "inventoryItem": {
                 "requiresShipping": ships, "measurement": {"weight": weight},
             }}
-            for sku, ships, weight in [
+            for index, (sku, ships, weight) in enumerate([
                 ("missing", True, None), ("zero", True, {"value": 0, "unit": "OUNCES"}),
                 ("saved", True, {"value": 2, "unit": "POUNDS"}), ("digital", False, None),
-            ]
+            ], start=1)
         ]
         self.shopify.get_variant_weight_page.return_value = {
-            "nodes": nodes, "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+            "nodes": nodes, "pageInfo": {"hasNextPage": True},
         }
         shop = ShopRecord("example.myshopify.com", "token")
         preview = self.service.backfill_catalog_weights(shop, cursor="old")
         self.shopify.update_variants_fields.assert_not_called()
         self.assertEqual((preview["scanned"], preview["missing"], preview["updated"]), (4, 2, 0))
-        self.assertEqual(preview["next_cursor"], "next")
+        self.assertEqual(preview["next_cursor"], "4")
 
         def update(_, __, *, product_id, variants):
-            by_sku = {node["id"]: node for node in nodes}
+            by_id = {node["id"]: node for node in nodes}
             self.assertEqual(product_id, "p1")
-            self.assertEqual([variant["id"] for variant in variants], ["missing", "zero"])
+            self.assertEqual([by_id[variant["id"]]["sku"] for variant in variants], ["missing", "zero"])
             updated = []
             for variant in variants:
                 weight = variant["inventoryItem"]["measurement"]["weight"]
                 self.assertEqual(weight, {"value": 1361, "unit": "GRAMS"})
-                by_sku[variant["id"]]["inventoryItem"].update(variant["inventoryItem"])
-                updated.append(by_sku[variant["id"]])
+                node = by_id[variant["id"]]
+                node["inventoryItem"].update(variant["inventoryItem"])
+                updated.append(node)
             return updated
 
         self.shopify.update_variants_fields.side_effect = update
@@ -88,3 +90,11 @@ class ProductWeightTests(unittest.TestCase):
         self.assertEqual(self.service.backfill_catalog_weights(shop, cursor="old", apply=True)["missing"], 0)
         self.shopify.update_variants_fields.assert_called_once()
         self.shopify.get_variant_weight_page.assert_called_with("example.myshopify.com", "token", cursor="old")
+
+    def test_shopify_weight_pagination_uses_a_fresh_id_range(self):
+        client = ShopifyClient(None)
+        client.graphql = Mock(return_value={"data": {"productVariants": {"nodes": []}}})
+        client.get_variant_weight_page("example.myshopify.com", "token", cursor="1234")
+        self.assertEqual(client.graphql.call_args.args[3], {"after": None, "filter": "id:>1234"})
+        client.get_variant_weight_page("example.myshopify.com", "token", cursor="old-cursor=")
+        self.assertEqual(client.graphql.call_args.args[3], {"after": "old-cursor=", "filter": None})
