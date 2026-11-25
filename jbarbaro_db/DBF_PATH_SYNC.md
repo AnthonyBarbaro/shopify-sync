@@ -27,6 +27,7 @@ The host-side script maps DBF rows like this:
 - `DESC2` -> optional `description` when `--include-desc2-description` is enabled
 - `PRICE` -> `price`
 - `PRICE_R` and other higher price tiers -> optional `compare_at_price` when the value looks sane
+- `SHIPWEIGHT`, then `WEIGHT` -> `weight_grams` from positive POS values in pounds
 - `QTY` and `Itemmqty.dbf` -> best available quantity by default
 - `ALT_SKU` -> `barcode`
 - `Itemmrc.dbf` + `Itemmqty.dbf` -> size/color variants and exact legacy POS barcodes with `--matrix-variants`

@@ -11,6 +11,7 @@ FastAPI backend for syncing products, pricing, images, and inventory from an ext
 - creates new Shopify products as drafts
 - updates existing Shopify products by SKU
 - syncs price and inventory
+- sets shipping weights on imported products and variants
 - preserves legacy POS matrix barcodes on Shopify size/color variants
 - provides CSV exports for catalog and incoming feed activity
 
@@ -108,6 +109,16 @@ sync's own zero-stock auto-archive marker is restored to Draft after positive ch
 confirmed. The connector also probes a known product when its POS type becomes a matrix but its
 cached Shopify mapping still has no children, so future copy-then-finish transitions do not wait for
 the nightly scan. Incomplete matrix definitions are probed again after a 15-minute cooldown.
+
+New shippable variants use `weight_grams` from the import when available. A variant can supply
+its own weight or inherit the product's weight. When both are missing or zero, the importer uses
+a product-type estimate, with 454 g for unclassified items. Existing positive Shopify weights are preserved.
+
+The POS-authenticated `POST /sync/catalog/weights/backfill` endpoint previews missing or zero
+weights for up to 25 Shopify variants per page. Pass `apply=true` as a query parameter to fill
+them with the same estimates. Use each response's `next_cursor` as the next request's `after`
+parameter until it is null. Each apply request rereads the page and updates existing shippable
+variants through Shopify's weight field. A second preview can verify that all pages report zero missing.
 
 The first connector run after an inventory or catalog-structure reconciliation upgrade, and one run
 after local midnight each day, compares POS quantities with a lean Shopify inventory snapshot at one location.

@@ -376,7 +376,7 @@ class MatrixShopifyInputTests(unittest.TestCase):
             def __init__(self):
                 self.product_set_input = None
 
-            def get_variant_by_sku(self, shop_domain, access_token, sku):
+            def get_variant_by_sku(self, shop_domain, access_token, sku, *, force_refresh=False):
                 if sku != "21741":
                     raise AssertionError(f"Unexpected lookup: {sku}")
                 return VariantMapping(

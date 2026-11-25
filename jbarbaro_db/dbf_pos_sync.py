@@ -25,6 +25,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_BATCH_SIZE = 25
 DEFAULT_METAFIELD_NAMESPACE = "pos"
 DEFAULT_DBF_DIR = "ashpsdat"
+GRAMS_PER_POUND = Decimal("453.59237")
 DEFAULT_CUSTOMER_TAGS = ["POS Customer"]
 EXPANDED_CUSTOMER_FILES = ("mcust.DBF", "mcust002.dbf")
 SHOPIFY_CUSTOMER_CSV_MAX_BYTES = 14 * 1024 * 1024
@@ -1815,6 +1816,7 @@ def build_product(
         "price": decimal_to_price(price),
         "compare_at_price": decimal_to_price(compare_at_price),
         "cost": decimal_to_price(cost),
+        "weight_grams": pos_item_weight_grams(row),
         "tracked": True,
         "requires_shipping": True,
         "images": images,
@@ -2490,6 +2492,14 @@ def decimal_or_none(value: Any) -> Optional[Decimal]:
         return Decimal(str(value))
     except InvalidOperation:
         return None
+
+
+def pos_item_weight_grams(row: Dict[str, Any]) -> Optional[float]:
+    for field in ("SHIPWEIGHT", "WEIGHT"):
+        pounds = decimal_or_none(row.get(field))
+        if pounds is not None and pounds.is_finite() and pounds > 0:
+            return float(pounds * GRAMS_PER_POUND)
+    return None
 
 
 def first_nonempty(*values: Optional[str]) -> Optional[str]:

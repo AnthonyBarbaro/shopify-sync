@@ -8,6 +8,7 @@ import requests
 
 from app.config import Settings
 from app.models import InventoryLevelSnapshot, VariantMapping
+from app.product_weights import inventory_has_weight
 from app.utils import (
     AuthenticationError,
     ShopifyAPIError,
@@ -225,6 +226,27 @@ class ShopifyClient:
             if not items_data["pageInfo"]["hasNextPage"]:
                 return rows
             cursor = items_data["pageInfo"]["endCursor"]
+
+    def get_variant_weight_page(
+        self, shop_domain: str, access_token: str, *, cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        query = """
+        query VariantWeightPage($after: String) {
+          productVariants(first: 25, after: $after, sortKey: ID) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              sku
+              product { id title productType }
+              inventoryItem { requiresShipping measurement { weight { value unit } } }
+            }
+          }
+        }
+        """
+        payload = self.graphql(
+            shop_domain, access_token, query, {"after": cursor}, operation_name="VariantWeightPage",
+        )
+        return payload["data"]["productVariants"]
 
     def get_inventory_item_sku(
         self,
@@ -704,6 +726,7 @@ class ShopifyClient:
               product {
                 id
                 title
+                productType
                 status
                 autoArchivedZeroStock: metafield(
                   namespace: "pos",
@@ -714,6 +737,8 @@ class ShopifyClient:
               }
               inventoryItem {
                 id
+                requiresShipping
+                measurement { weight { value unit } }
                 unitCost {
                   amount
                 }
@@ -882,6 +907,8 @@ class ShopifyClient:
                   price
                   inventoryItem {
                     id
+                    requiresShipping
+                    measurement { weight { value unit } }
                     unitCost {
                       amount
                     }
@@ -970,6 +997,8 @@ class ShopifyClient:
                   compareAtPrice
                   inventoryItem {
                     id
+                    requiresShipping
+                    measurement { weight { value unit } }
                     unitCost {
                       amount
                     }
@@ -1342,6 +1371,19 @@ class ShopifyClient:
         product_id: str,
         variant: Dict[str, Any],
     ) -> Dict[str, Any]:
+        updated = self.update_variants_fields(
+            shop_domain, access_token, product_id=product_id, variants=[variant],
+        )
+        return updated[0] if updated else {}
+
+    def update_variants_fields(
+        self,
+        shop_domain: str,
+        access_token: str,
+        *,
+        product_id: str,
+        variants: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         mutation = """
         mutation UpdateVariantFields($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
           productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -1353,6 +1395,7 @@ class ShopifyClient:
               compareAtPrice
               inventoryItem {
                 id
+                measurement { weight { value unit } }
                 unitCost {
                   amount
                 }
@@ -1371,19 +1414,19 @@ class ShopifyClient:
             mutation,
             {
                 "productId": normalize_gid("Product", product_id),
-                "variants": [variant],
+                "variants": variants,
             },
             operation_name="UpdateVariantFields",
         )
         result = payload["data"]["productVariantsBulkUpdate"]
         user_errors = result.get("userErrors") or []
         if user_errors:
+            variant_details = {"variant": variants[0]} if len(variants) == 1 else {"variants": variants}
             raise ShopifyAPIError(
                 "Shopify rejected the variant update.",
-                {"product_id": product_id, "variant": variant, "user_errors": user_errors},
+                {"product_id": product_id, **variant_details, "user_errors": user_errors},
             )
-        updated_variants = result.get("productVariants") or []
-        return updated_variants[0] if updated_variants else {}
+        return result.get("productVariants") or []
 
     def set_product_metafields(
         self,
@@ -2163,6 +2206,7 @@ def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
         product_id=product["id"],
         inventory_item_id=inventory_item["id"],
         product_title=product.get("title"),
+        product_type=product.get("productType"),
         variant_title=node.get("title"),
         product_status=product.get("status"),
         auto_archived_zero_stock=(
@@ -2170,6 +2214,8 @@ def _parse_variant_mapping(node: Dict[str, Any]) -> VariantMapping:
         ),
         current_price=float(node["price"]) if node.get("price") is not None else None,
         current_cost=_extract_unit_cost(inventory_item),
+        has_weight=inventory_has_weight(inventory_item),
+        requires_shipping=inventory_item.get("requiresShipping"),
         inventory_levels=levels,
     )
 

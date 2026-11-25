@@ -32,6 +32,7 @@ class ProductVariantSyncInput(BaseModel):
     compare_at_price: Optional[float] = Field(default=None, ge=0)
     cost: Optional[float] = Field(default=None, ge=0)
     quantity: Optional[int] = Field(default=None, ge=0)
+    weight_grams: Optional[FiniteFloat] = Field(default=None, ge=0)
     tracked: Optional[bool] = True
     requires_shipping: Optional[bool] = True
     pos_cell: Optional[str] = None
@@ -226,6 +227,7 @@ class ProductSyncRequest(BaseModel):
     compare_at_price: Optional[float] = Field(default=None, ge=0)
     cost: Optional[float] = Field(default=None, ge=0)
     quantity: Optional[int] = Field(default=None, ge=0)
+    weight_grams: Optional[FiniteFloat] = Field(default=None, ge=0)
     tracked: Optional[bool] = True
     requires_shipping: Optional[bool] = True
     image_url: Optional[str] = None
@@ -249,11 +251,14 @@ class VariantMapping(BaseModel):
     product_id: str
     inventory_item_id: str
     product_title: Optional[str] = None
+    product_type: Optional[str] = None
     variant_title: Optional[str] = None
     product_status: Optional[str] = None
     auto_archived_zero_stock: bool = False
     current_price: Optional[float] = None
     current_cost: Optional[float] = None
+    has_weight: bool = False
+    requires_shipping: Optional[bool] = None
     inventory_levels: List[InventoryLevelSnapshot] = Field(default_factory=list)
 
 

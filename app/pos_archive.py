@@ -13,6 +13,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+from jbarbaro_db.dbf_pos_sync import pos_item_weight_grams
+
 
 MAX_SAMPLE_ROWS = 25
 MAX_TABLES_IN_SUMMARY = 250
@@ -520,6 +522,7 @@ def build_product_payload(
         "price": decimal_to_price(price),
         "compare_at_price": decimal_to_price(compare_at),
         "cost": decimal_to_price(cost),
+        "weight_grams": pos_item_weight_grams(row),
         "quantity": quantity,
         "qty": quantity,
         "stock_quantity": quantity,

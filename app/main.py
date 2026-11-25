@@ -64,6 +64,7 @@ from app.models import (
     UiConfigResponse,
 )
 from app import pos_archive
+from app.product_weights import positive_weight
 from app.sales_reports import summarize_sales_report, summarize_year_over_year, trend_dates, year_over_year_ranges
 from app.shopify import ShopifyClient, extract_numeric_shopify_id, is_auth_error, normalize_gid
 from app.state import SyncActivityStore
@@ -816,6 +817,7 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
             )
         ),
         "quantity": quantity,
+        "weight_grams": _external_weight_grams(raw_payload, key_lookup),
         "tracked": _as_bool(_get_external_value(raw_payload, key_lookup, "tracked"))
         if _get_external_value(raw_payload, key_lookup, "tracked") not in (None, "")
         else _as_bool(_get_external_value(raw_payload, key_lookup, "manage_stock", "manage stock")),
@@ -824,7 +826,11 @@ def normalize_external_product_payload(raw_payload: Any) -> ProductSyncRequest:
         "image_urls": [item["src"] for item in image_inputs],
         "images": image_inputs,
         "metafields": metafields,
-        "variants": raw_payload.get("variants") if isinstance(raw_payload.get("variants"), list) else [],
+        "variants": [
+            {**variant, "weight_grams": _external_weight_grams(variant, _build_external_key_lookup(variant))}
+            if isinstance(variant, dict) else variant
+            for variant in raw_payload["variants"]
+        ] if isinstance(raw_payload.get("variants"), list) else [],
     }
     return ProductSyncRequest.model_validate(normalized)
 
@@ -993,6 +999,10 @@ def _get_external_value(raw_payload: dict[str, Any], key_lookup: dict[str, Any],
         if value not in (None, ""):
             return value
     return None
+
+
+def _external_weight_grams(raw_payload: dict[str, Any], key_lookup: dict[str, Any]) -> float | None:
+    return positive_weight(_get_external_value(raw_payload, key_lookup, "weight_grams", "grams", "variant grams"))
 
 
 def _collect_external_named_values(raw_payload: dict[str, Any], key_lookup: dict[str, Any], *names: str) -> List[str]:
@@ -2467,6 +2477,7 @@ def _looks_like_product_mutation(raw_payload: Any) -> bool:
         "unit_cost",
         "quantity",
         "stock_quantity",
+        "weight_grams",
         "barcode",
         "images",
         "image_url",
@@ -3051,6 +3062,18 @@ async def reconcile_catalog_products(
             active_shop,
             apply=apply_changes,
         ),
+    )
+    return JSONResponse(result)
+
+
+@app.post("/sync/catalog/weights/backfill", response_model=None)
+def backfill_catalog_weights(
+    after: str | None = None,
+    apply: bool = False,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    result = run_with_shop_retry(
+        shop, lambda active_shop: inventory_service.backfill_catalog_weights(active_shop, cursor=after, apply=apply),
     )
     return JSONResponse(result)
 

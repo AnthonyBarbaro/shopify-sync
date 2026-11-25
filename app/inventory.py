@@ -20,6 +20,7 @@ from app.models import (
     SyncResult,
     VariantMapping,
 )
+from app.product_weights import estimated_weight_grams, inventory_has_weight, weight_measurement
 from app.shopify import (
     INVENTORY_QUANTITY_NAMES,
     ShopifyClient,
@@ -1020,6 +1021,48 @@ class InventorySyncService:
             },
         )
 
+    def backfill_catalog_weights(
+        self, shop: ShopRecord, *, cursor: Optional[str] = None, apply: bool = False,
+    ) -> Dict[str, Any]:
+        page = self.shopify_client.get_variant_weight_page(shop.shop_domain, shop.access_token, cursor=cursor)
+        updates_by_product: Dict[str, List[Dict[str, Any]]] = {}
+        candidates = []
+        for variant in page["nodes"]:
+            item = variant["inventoryItem"]
+            if not item["requiresShipping"] or inventory_has_weight(item):
+                continue
+            product = variant["product"]
+            grams = estimated_weight_grams(product.get("productType"), product.get("title"))
+            candidates.append({"variant_id": variant["id"], "sku": variant.get("sku"), "weight_grams": grams})
+            updates_by_product.setdefault(product["id"], []).append({
+                "id": variant["id"],
+                "inventoryItem": {"measurement": weight_measurement(grams)},
+            })
+
+        if apply:
+            for product_id, variants in updates_by_product.items():
+                updated = self.shopify_client.update_variants_fields(
+                    shop.shop_domain, shop.access_token, product_id=product_id, variants=variants,
+                )
+                confirmed = {variant["id"] for variant in updated if inventory_has_weight(variant["inventoryItem"])}
+                missing = [variant["id"] for variant in variants if variant["id"] not in confirmed]
+                if missing:
+                    raise SyncProcessingError(
+                        "Shopify did not confirm the saved weights.",
+                        {"product_id": product_id, "variant_ids": missing},
+                        status_code=502,
+                        code="weight_update_unconfirmed",
+                    )
+
+        page_info = page["pageInfo"]
+        return {
+            "scanned": len(page["nodes"]),
+            "missing": len(candidates),
+            "updated": len(candidates) if apply else 0,
+            "candidates": candidates,
+            "next_cursor": page_info["endCursor"] if page_info["hasNextPage"] else None,
+        }
+
     def repair_matrix_structure(
         self,
         payload: ProductSyncRequest,
@@ -1456,6 +1499,7 @@ class InventorySyncService:
                     shop.shop_domain,
                     shop.access_token,
                     payload.sku,
+                    force_refresh=not payload.variants,
                 )
             except SyncProcessingError as exc:
                 if exc.code != "sku_not_found":
@@ -1660,7 +1704,23 @@ class InventorySyncService:
 
         used_variant_ids: set[str] = set()
         variant_inputs: List[Dict[str, Any]] = []
+        estimated_weight = estimated_weight_grams(
+            payload.product_type or (existing_product or {}).get("productType"),
+            payload.title or (existing_product or {}).get("title"),
+        )
         for index, variant in enumerate(payload.variants):
+            existing_variant = existing_by_sku.get(variant.sku)
+            if existing_variant is None and index == 0:
+                existing_variant = fallback_variant
+            existing_variant_id = str((existing_variant or {}).get("id") or "")
+            reuse_variant = bool(existing_variant_id) and existing_variant_id not in used_variant_ids
+            existing_item = ((existing_variant or {}).get("inventoryItem") or {}) if reuse_variant else {}
+            requires_shipping = variant.requires_shipping if "requires_shipping" in variant.model_fields_set else None
+            if requires_shipping is None:
+                requires_shipping = (
+                    payload.requires_shipping is not False and existing_item.get("requiresShipping") is not False
+                )
+
             variant_input: Dict[str, Any] = {
                 "sku": variant.sku,
                 "barcode": variant.barcode,
@@ -1671,11 +1731,12 @@ class InventorySyncService:
                 "inventoryItem": {
                     "sku": variant.sku,
                     "tracked": True if variant.tracked is None else bool(variant.tracked),
-                    "requiresShipping": (
-                        True if variant.requires_shipping is None else bool(variant.requires_shipping)
-                    ),
+                    "requiresShipping": requires_shipping,
                 },
             }
+            if requires_shipping and not inventory_has_weight(existing_item):
+                grams = variant.weight_grams or payload.weight_grams or estimated_weight
+                variant_input["inventoryItem"]["measurement"] = weight_measurement(grams)
             if variant.price is not None:
                 variant_input["price"] = float(format_price(variant.price))
             if variant.compare_at_price is not None:
@@ -1691,11 +1752,7 @@ class InventorySyncService:
                     }
                 ]
 
-            existing_variant = existing_by_sku.get(variant.sku)
-            if existing_variant is None and index == 0:
-                existing_variant = fallback_variant
-            existing_variant_id = str((existing_variant or {}).get("id") or "")
-            if existing_variant_id and existing_variant_id not in used_variant_ids:
+            if reuse_variant:
                 variant_input["id"] = normalize_gid("ProductVariant", existing_variant_id)
                 used_variant_ids.add(existing_variant_id)
             variant_inputs.append(variant_input)
@@ -1733,14 +1790,15 @@ class InventorySyncService:
             variant_input["compareAtPrice"] = float(format_price(payload.compare_at_price))
         if payload.barcode:
             variant_input["barcode"] = payload.barcode
-        if payload.sku or payload.tracked is not None:
-            inventory_item: Dict[str, Any] = {}
-            if payload.sku:
-                inventory_item["sku"] = payload.sku
-            if payload.tracked is not None:
-                inventory_item["tracked"] = bool(payload.tracked)
-            if inventory_item:
-                variant_input["inventoryItem"] = inventory_item
+        inventory_item: Dict[str, Any] = {"requiresShipping": payload.requires_shipping is not False}
+        if payload.sku:
+            inventory_item["sku"] = payload.sku
+        if payload.tracked is not None:
+            inventory_item["tracked"] = bool(payload.tracked)
+        if inventory_item["requiresShipping"]:
+            grams = payload.weight_grams or estimated_weight_grams(payload.product_type, title)
+            inventory_item["measurement"] = weight_measurement(grams)
+        variant_input["inventoryItem"] = inventory_item
         if media_inputs:
             variant_input["file"] = dict(media_inputs[0])
 
@@ -1813,6 +1871,16 @@ class InventorySyncService:
             inventory_item["sku"] = payload.sku
         if payload.tracked is not None:
             inventory_item["tracked"] = bool(payload.tracked)
+        if (
+            not mapping.has_weight
+            and mapping.requires_shipping is not False
+            and payload.requires_shipping is not False
+        ):
+            grams = payload.weight_grams or estimated_weight_grams(
+                payload.product_type or mapping.product_type,
+                payload.title or mapping.product_title,
+            )
+            inventory_item["measurement"] = weight_measurement(grams)
         if inventory_item:
             variant_update["inventoryItem"] = inventory_item
         return variant_update
@@ -2194,6 +2262,7 @@ class InventorySyncService:
             product_id=product["id"],
             inventory_item_id=inventory_item["id"],
             product_title=product.get("title"),
+            product_type=product.get("productType"),
             variant_title=target_variant.get("title"),
             product_status=product.get("status"),
             auto_archived_zero_stock=(
@@ -2201,6 +2270,8 @@ class InventorySyncService:
             ),
             current_price=_safe_float(target_variant.get("price")),
             current_cost=_extract_unit_cost(inventory_item),
+            has_weight=inventory_has_weight(inventory_item),
+            requires_shipping=inventory_item.get("requiresShipping"),
             inventory_levels=levels,
         )
 
