@@ -349,6 +349,56 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.connector._sync_request_id)
         self.assertIsNone(self.connector._sync_progress_stage)
 
+    def test_failed_full_scan_lets_the_regular_inventory_cycle_run_before_retrying(self) -> None:
+        self.connector.customer_sync_enabled = False
+        self.connector.dry_run = True
+        self.connector._sync_request_id = "request1"
+        with (
+            mock.patch.object(self.connector, "_heartbeat_loop"),
+            mock.patch.object(self.connector._sync_wakeup, "wait"),
+            mock.patch.object(self.connector, "run_cycle", side_effect=[requests.ReadTimeout(), None, KeyboardInterrupt()]) as scan,
+            mock.patch.object(self.connector, "_complete_sync_request") as complete,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.connector.run_forever()
+        self.assertEqual(scan.call_args_list, [
+            mock.call(force_full=True, sync_request_id="request1"),
+            mock.call(scheduled=True),
+            mock.call(force_full=True, sync_request_id="request1"),
+        ])
+        complete.assert_not_called()
+
+    def test_inventory_snapshot_assembles_pages_and_rejects_an_inconsistent_location(self) -> None:
+        connector = self.connector
+        connector.session = self.session
+        first_item, next_item = {"sku": "FIRST"}, {"sku": "NEXT"}
+        pages = [
+            {"schema_version": 2, "location_id": "loc1", "items": [first_item], "next_id": 25000},
+            {"schema_version": 2, "location_id": "loc1", "items": [next_item], "next_id": None},
+        ]
+        for compatible in (True, False):
+            with self.subTest(compatible=compatible):
+                self.session.get.reset_mock()
+                payloads = [pages[0], pages[1] if compatible else {**pages[1], "location_id": "loc2"}]
+                self.session.get.side_effect = [mock.Mock(status_code=200, **{"json.return_value": page}) for page in payloads]
+                if compatible:
+                    self.assertEqual(connector._fetch_inventory_snapshot(), {"location_id": "loc1", "items": [first_item, next_item]})
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "location changed"):
+                        connector._fetch_inventory_snapshot()
+                self.assertEqual(self.session.get.call_args_list, [
+                    mock.call("https://sync.example/sync/inventory/page", timeout=connector.timeout),
+                    mock.call("https://sync.example/sync/inventory/page", params={"after_id": 25000}, timeout=connector.timeout),
+                ])
+
+    def test_inventory_snapshot_works_with_the_previous_server_route(self) -> None:
+        self.connector.session = self.session
+        payload = {"schema_version": 2, "location_id": "loc1", "items": [{"sku": "FIRST"}]}
+        self.session.get.side_effect = [
+            mock.Mock(status_code=404), mock.Mock(status_code=200, **{"json.return_value": payload}),
+        ]
+        self.assertEqual(self.connector._fetch_inventory_snapshot(), {"location_id": "loc1", "items": payload["items"]})
+
 
 if __name__ == "__main__":
     unittest.main()

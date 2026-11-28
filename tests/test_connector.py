@@ -35,6 +35,7 @@ from windows_connector.connector import (
     MATRIX_OPTION_SCHEMA_VERSION,
     MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
     POS_INVENTORY_QUIET_SECONDS,
+    POS_QUANTITY_SCAN_MAX_WAIT_SECONDS,
     Connector,
     adjustment_key,
     base_sku,
@@ -918,6 +919,42 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             self.assertEqual(connector._apply_shopify_adjustments.call_args.args[1][0]["delta"], 1)
             self.assertEqual([call.args[1] for call in read.call_args_list], [{"22392"}, {"22392"}, set()])
             self.assertEqual(json.loads(path.read_text())["pos_quantity_source_stamp"], ["new", "matrix"])
+
+    def test_quantity_scan_catches_other_stock_changes_during_continuous_sales(self):
+        for files_changed in (False, True):
+            with self.subTest(files_changed=files_changed), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                connector, state = self._scheduled_connector(path)
+                state["catalog_products"].append("OTHER")
+                state["quantities"]["OTHER"] = {"canonical": 5, "pos_seen": 5, "shop_seen": 5}
+                save_state(path, state)
+                connector._collect_pos_event_skus.return_value = ({"22392"}, False)
+                connector._pos_quantity_source_stamp.side_effect = [
+                    ["old", "matrix"], ["new", "matrix"], ["changed" if files_changed else "new", "matrix"],
+                ]
+                module = sys.modules["windows_connector.connector"]
+                scans = [{"22392": 5}, {"22392": 4, "OTHER": 8}]
+                if files_changed:
+                    scans.append({"22392": 4})
+                with (
+                    mock.patch.object(module.time, "time", return_value=1800000000) as clock,
+                    mock.patch.object(module, "read_targeted_pos_quantities", side_effect=scans) as read,
+                ):
+                    connector.run_cycle(scheduled=True)
+                    connector._apply_shopify_adjustments.assert_not_called()
+                    clock.return_value += POS_QUANTITY_SCAN_MAX_WAIT_SECONDS
+                    connector.run_cycle(scheduled=True)
+
+                targets = [{"22392"}, {"22392", "OTHER"}]
+                if files_changed:
+                    targets.append({"22392"})
+                self.assertEqual([call.args[1] for call in read.call_args_list], targets)
+                connector._fetch_inventory_snapshot.assert_not_called()
+                actions = connector._apply_shopify_adjustments.call_args.args[1]
+                self.assertEqual({action["sku"]: action["delta"] for action in actions},
+                                 {"22392": -1} if files_changed else {"22392": -1, "OTHER": 3})
+                persisted = json.loads(path.read_text())
+                self.assertEqual(persisted.get("pos_quantity_source_stamp"), None if files_changed else ["new", "matrix"])
 
     def test_matrix_probe_cooldown_only_starts_after_a_full_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2820,8 +2857,8 @@ class ShopifyScopeTests(unittest.TestCase):
         self.assertIsNone(rows[1]["quantity"])
         self.assertFalse(rows[1]["available_at_location"])
         self.assertEqual(rows[2]["duplicate_sku_count"], 1)
-        self.assertIsNone(graphql.call_args_list[0].args[3]["after"])
-        self.assertEqual(graphql.call_args_list[1].args[3]["after"], "next")
+        self.assertIsNone(graphql.call_args_list[0].args[3]["filter"])
+        self.assertEqual(graphql.call_args_list[1].args[3]["filter"], "id:>2")
 
     def test_primary_location_query_is_cached(self):
         client = ShopifyClient(SimpleNamespace(shopify_location_id=None))

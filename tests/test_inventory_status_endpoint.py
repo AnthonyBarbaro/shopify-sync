@@ -352,6 +352,18 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             shop_domain=self.shop.shop_domain, request_id="request1",
         )
 
+    async def test_inventory_snapshot_page_is_authenticated_and_passes_its_continuation(self) -> None:
+        path = "/sync/inventory/page"
+        with mock.patch.object(self.main.inventory_service, "get_inventory_snapshot_page") as read:
+            status, _ = await self.post(None, path=path, method="GET", authenticated=False)
+            self.assertEqual(status, 401)
+            self.assertEqual(read.call_count, 0)
+            page = {"location_id": "gid://shopify/Location/4", "items": [], "next_id": 25001}
+            read.return_value = page
+            status, result = await self.post(None, path=path, method="GET", query_string=b"after_id=25000")
+            self.assertEqual((status, result), (200, {"schema_version": 2, **page}))
+            read.assert_called_once_with(self.shop, after_id=25000)
+
     async def test_customer_batch_omits_contact_data_from_request_and_feed_logs(self) -> None:
         with (
             mock.patch.object(self.main.shopify_client, "ensure_customer_custom_id_definition"),

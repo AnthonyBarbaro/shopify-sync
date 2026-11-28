@@ -303,6 +303,13 @@ class InventorySyncService:
     def list_inventory_snapshot(self, shop: ShopRecord) -> List[Dict[str, Any]]:
         return list(self.get_inventory_snapshot(shop)["items"])
 
+    def get_inventory_snapshot_page(self, shop: ShopRecord, *, after_id: Optional[int]) -> Dict[str, Any]:
+        location_id = self.shopify_client.get_primary_location_id(shop.shop_domain, shop.access_token)
+        items, next_id = self.shopify_client.get_inventory_snapshot_page(
+            shop.shop_domain, shop.access_token, location_id, after_id=after_id,
+        )
+        return {"location_id": normalize_gid("Location", location_id), "items": items, "next_id": next_id}
+
     def adjust_inventory_quantity(
         self,
         *,

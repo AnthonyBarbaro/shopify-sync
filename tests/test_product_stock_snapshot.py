@@ -3,9 +3,43 @@ from types import SimpleNamespace
 from unittest import mock
 
 from app.shopify import ShopifyClient
+from app.utils import ShopifyAPIError
 
 
 class ProductStockSnapshotTests(unittest.TestCase):
+    def test_inventory_snapshot_starts_a_new_id_range_for_each_page(self) -> None:
+        client = ShopifyClient(SimpleNamespace())
+        location = "gid://shopify/Location/4"
+
+        def page(rows, *, has_next):
+            return {"data": {"inventoryItems": {
+                "pageInfo": {"hasNextPage": has_next}, "nodes": rows,
+            }}}
+
+        first = {"id": "gid://shopify/InventoryItem/24999", "sku": "FIRST", "inventoryLevel": {
+            "updatedAt": "2026-11-28T20:00:00Z", "quantities": [{"name": "available", "quantity": 0}],
+        }}
+        unnamed = {"id": "gid://shopify/InventoryItem/25000", "sku": ""}
+        next_row = {"id": "gid://shopify/InventoryItem/25001", "sku": "NEXT", "duplicateSkuCount": 1}
+        with mock.patch.object(client, "graphql", side_effect=[
+            page([first, unnamed], has_next=True), page([next_row], has_next=False),
+        ]) as graphql:
+            rows = client.get_inventory_snapshot("example.myshopify.com", "token", location)
+
+        self.assertEqual([call.args[3] for call in graphql.call_args_list], [
+            {"filter": None, "locationId": location}, {"filter": "id:>25000", "locationId": location},
+        ])
+        self.assertEqual([(row["sku"], row["quantity"], row["available_at_location"], row["duplicate_sku_count"])
+                          for row in rows], [("FIRST", 0, True, 0), ("NEXT", None, False, 1)])
+
+    def test_inventory_page_rejects_an_id_that_would_repeat_the_previous_page(self) -> None:
+        client = ShopifyClient(SimpleNamespace())
+        with mock.patch.object(client, "graphql", return_value={"data": {"inventoryItems": {
+            "pageInfo": {"hasNextPage": True}, "nodes": [{"id": "gid://shopify/InventoryItem/10", "sku": "REPEATED"}],
+        }}}):
+            with self.assertRaisesRegex(ShopifyAPIError, "ascending ID"):
+                client.get_inventory_snapshot_page("example.myshopify.com", "token", "4", after_id=10)
+
     def test_snapshot_preserves_variant_stock_at_each_location(self) -> None:
         client = ShopifyClient(SimpleNamespace())
         product = {

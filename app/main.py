@@ -1041,7 +1041,7 @@ def _looks_like_cre_inventory_payload(raw_payload: dict[str, Any], key_lookup: d
 
 
 def _should_log_incoming_request(path: str) -> bool:
-    if path.rstrip("/") == "/sync/sales-board/settings":
+    if path.rstrip("/") in {"/sync/sales-board/settings", "/sync/inventory/page"}:
         return False
     return path.startswith("/sync/") or path.startswith("/wc-api/") or path.startswith("/wp-json/wc/")
 
@@ -3387,6 +3387,19 @@ async def connector_inventory_snapshot(
             "timestamp": utc_now_iso(),
         }
     )
+
+
+@app.get("/sync/inventory/page", response_model=None)
+async def connector_inventory_snapshot_page(
+    after_id: int | None = Query(default=None, ge=1),
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    page = await run_in_threadpool(
+        run_with_shop_retry,
+        shop,
+        lambda active_shop: inventory_service.get_inventory_snapshot_page(active_shop, after_id=after_id),
+    )
+    return JSONResponse({"schema_version": 2, **page})
 
 
 @app.post("/sync/inventory/status/reconcile", response_model=None)

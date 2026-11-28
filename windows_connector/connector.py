@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.7"
+CONNECTOR_VERSION = "1.4.8"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -61,6 +61,7 @@ INVENTORY_RECONCILE_SCHEMA_VERSION = 2
 INVENTORY_SNAPSHOT_SCHEMA_VERSION = 2
 POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
 POS_INVENTORY_QUIET_SECONDS = 300
+POS_QUANTITY_SCAN_MAX_WAIT_SECONDS = 300
 INVENTORY_MAINTENANCE_MAX_WAIT_SECONDS = 1800
 PENDING_INVENTORY_ISSUE_LIMIT = 200
 INVENTORY_ISSUE_BATCH_SIZE = 50
@@ -355,6 +356,7 @@ class Connector:
             for worker in workers:
                 worker.start()
         try:
+            deferred_force_request_id = None
             while True:
                 self._sync_wakeup.clear()
                 started = time.monotonic()
@@ -368,16 +370,21 @@ class Connector:
                 failed = False
                 with self._sync_request_lock:
                     request_id = self._sync_request_id
+                force_scan = request_id is not None and request_id != deferred_force_request_id
+                deferred_force_request_id = None
                 try:
-                    if request_id:
+                    if force_scan:
                         self.run_cycle(force_full=True, sync_request_id=request_id)
                         self._complete_sync_request(request_id)
                     else:
                         self.run_cycle(scheduled=not once)
                 except Exception as exc:
                     self._log_sync_failure("connector_cycle_failed", exc)
-                    if request_id:
+                    if force_scan:
                         self._set_sync_progress(request_id, "retrying")
+                        # Give queued sales a regular cycle before trying another full scan.
+                        deferred_force_request_id = request_id
+                        self._automatic_inventory_retry_at = time.monotonic() + POS_INVENTORY_QUIET_SECONDS
                     failed = True
                 if once:
                     if self.customer_sync_enabled:
@@ -818,13 +825,20 @@ class Connector:
 
         quantity_source_stamp = None
         completed_quantity_scan_stamp = None
-        if (
-            scheduled and not full_reconcile and not prioritize_inventory and pos_quiet
-            and not structure_schema_outdated
-        ):
+        quantity_scan_targets: set[str] = set()
+        if scheduled and not full_reconcile and not structure_schema_outdated:
             quantity_source_stamp = self._pos_quantity_source_stamp()
             if quantity_source_stamp and quantity_source_stamp != state.get("pos_quantity_source_stamp"):
-                read_mode = "idle-quantities"
+                due_since = min(now_epoch, int(state.get("pos_quantity_scan_due_since") or now_epoch))
+                state["pos_quantity_scan_due_since"] = due_since
+                overdue = now_epoch - due_since >= POS_QUANTITY_SCAN_MAX_WAIT_SECONDS
+                if overdue or (pos_quiet and not prioritize_inventory):
+                    quantity_scan_targets = known_products | affected_base_skus
+                    if quantity_scan_targets:
+                        read_mode = "idle-quantities" if not prioritize_inventory else "pos-quantities"
+                        state.pop("pos_quantity_scan_due_since", None)
+            elif quantity_source_stamp:
+                state.pop("pos_quantity_scan_due_since", None)
 
         payloads: List[Dict[str, Any]] = []
         skipped_non_sellable = 0
@@ -870,18 +884,20 @@ class Connector:
             sku_bases.update(discovered_sku_bases)
         if full_reconcile:
             local_quantities = flatten_quantities(payloads)
-        elif read_mode == "idle-quantities":
+        elif quantity_scan_targets:
             local_quantities = read_targeted_pos_quantities(
                 self.dbf_dir,
-                known_products,
+                quantity_scan_targets,
                 sku_bases=sku_bases,
                 include_missing_matrix_rows=False,
             )
             if quantity_source_stamp == self._pos_quantity_source_stamp():
                 completed_quantity_scan_stamp = quantity_source_stamp
             else:
-                local_quantities = {}
-                self.logger.info("pos_idle_quantity_scan_deferred reason=files_changed_during_read")
+                self.logger.info("pos_quantity_scan_deferred reason=files_changed_during_read")
+                local_quantities = read_targeted_pos_quantities(
+                    self.dbf_dir, affected_base_skus, sku_bases=sku_bases, include_missing_matrix_rows=False,
+                ) if affected_base_skus else {}
         else:
             local_quantities = read_targeted_pos_quantities(
                 self.dbf_dir,
@@ -892,7 +908,7 @@ class Connector:
         self.logger.info(
             "pos_read mode=%s requested_skus=%s products=%s quantities=%s skipped_non_sellable=%s",
             read_mode,
-            len(known_products) if read_mode == "idle-quantities" else len(affected_base_skus),
+            len(quantity_scan_targets or affected_base_skus),
             len(payloads) if full_reconcile else len(affected_base_skus),
             len(local_quantities),
             skipped_non_sellable,
@@ -1030,6 +1046,8 @@ class Connector:
             try:
                 inventory_snapshot = self._fetch_inventory_snapshot()
             except Exception as exc:
+                if scheduled_maintenance:
+                    self._automatic_inventory_retry_at = time.monotonic() + POS_INVENTORY_QUIET_SECONDS
                 self._record_inventory_issue(None, "shopify_snapshot_unavailable", code=inventory_failure_code(exc))
                 raise
             # Re-read the versioned queue after the snapshot. A Shopify sale can
@@ -1780,7 +1798,39 @@ class Connector:
         return list(response.json().get("items") or [])
 
     def _fetch_inventory_snapshot(self) -> Dict[str, Any]:
-        response = self.session.get(f"{self.base_url}/sync/inventory", timeout=self.timeout)
+        endpoint = f"{self.base_url}/sync/inventory"
+        response = self.session.get(f"{endpoint}/page", timeout=self.timeout)
+        if response.status_code in {404, 405}:
+            response = self.session.get(endpoint, timeout=self.timeout)
+            snapshot = self._parse_inventory_snapshot_response(response)
+            return {"location_id": snapshot["location_id"], "items": snapshot["items"]}
+
+        location_id = None
+        items: List[Dict[str, Any]] = []
+        after_id = 0
+        pages = 0
+        while True:
+            page = self._parse_inventory_snapshot_response(response)
+            page_location = page["location_id"]
+            if location_id is not None and page_location != location_id:
+                raise RuntimeError("Shopify inventory location changed during the snapshot.")
+            location_id = page_location
+            items.extend(page["items"])
+            pages += 1
+            if "next_id" not in page:
+                raise RuntimeError("Inventory snapshot page is missing its continuation.")
+            next_id = page["next_id"]
+            if next_id is None:
+                return {"location_id": location_id, "items": items}
+            if type(next_id) is not int or next_id <= after_id:
+                raise RuntimeError("Inventory snapshot page did not advance to a new inventory ID.")
+            if pages % 25 == 0:
+                self.logger.info("shopify_inventory_snapshot_progress pages=%s items=%s", pages, len(items))
+            after_id = next_id
+            response = self.session.get(f"{endpoint}/page", params={"after_id": after_id}, timeout=self.timeout)
+
+    @staticmethod
+    def _parse_inventory_snapshot_response(response: requests.Response) -> Dict[str, Any]:
         response.raise_for_status()
         body = response.json()
         if not isinstance(body, dict):
@@ -1795,7 +1845,7 @@ class Connector:
             raise RuntimeError("Inventory snapshot response is missing its location or items.")
         if any(not isinstance(item, dict) for item in items):
             raise RuntimeError("Inventory snapshot contains an invalid item row.")
-        return {"location_id": location_id, "items": items}
+        return {**body, "location_id": location_id}
 
     def _overlay_inventory_changes_on_snapshot(
         self,

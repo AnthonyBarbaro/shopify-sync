@@ -31,10 +31,12 @@ reaching the server. The Customers tab shows recent import outcomes by POS custo
    retry. The first updated
    run establishes a baseline without replaying historical price changes; later changes update only
    the exact Shopify variant price. A base matrix SKU updates all of its matrix variants.
-5. After five minutes without a POS inventory event, a changed `Item.dbf` or `Itemmqty.dbf`
-   triggers a local quantity check for known SKUs. This catches manual adjustments and receiving
-   activity that bypass the event tables. The check uses cached Shopify quantities and any queued
-   changes. It retries if either source file changes during the read.
+5. A changed `Item.dbf` or `Itemmqty.dbf` triggers a local quantity check for known SKUs. The
+   connector prefers a quiet cycle and attempts the check on the next poll after five minutes of
+   waiting even if the register stays busy. This catches manual adjustments and receiving activity
+   that bypass the event tables. The check uses cached Shopify quantities and any queued changes.
+   If either source file changes during the read, the connector reads the event SKUs separately and
+   retries the wider check later.
 6. The nightly full reconciliation compares POS quantities with Shopify's inventory snapshot at the
    pinned location. It becomes due at local midnight by default and normally waits for the same
    quiet window. It can start after 30 minutes of waiting during sustained store activity.
@@ -54,8 +56,9 @@ reaching the server. The Customers tab shows recent import outcomes by POS custo
    Shopify's confirmed mutation quantities as the new baseline, so a stale post-repair snapshot
    cannot write zero back to either system.
 7. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector checks for those
-   changed quantities. It downloads the location-specific Shopify inventory snapshot during a full
-   reconciliation. A webhook with the same timestamp and quantity as an observation already used
+   changed quantities. During a full reconciliation, connector 1.4.8 reads the location-specific
+   Shopify snapshot in separate requests and continues by inventory item ID. A webhook with the same
+   timestamp and quantity as an observation already used
    by the connector is skipped. Different quantities with the same timestamp are checked against a
    fresh Shopify snapshot. Changes for tracked SKUs stay queued if the live POS row cannot be read.
 8. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are
@@ -325,7 +328,8 @@ The Overview's **Force sync** button saves a request on Railway. The next heartb
 connector for a full inventory comparison and a customer scan, without clearing quantity baselines
 or resending unchanged customers. A running inventory cycle finishes first. Offline requests remain
 queued until the connector reconnects; the dashboard reports completion of the inventory scan only
-after acknowledgment. Individual failed adjustments continue through the existing retry mechanism.
+after acknowledgment. A failed full scan gives regular inventory events a cycle before retrying.
+Individual failed adjustments continue through the existing retry mechanism.
 Connector 1.4.6 or later reports the current inventory stage on each heartbeat. The Overview displays
 an animated bar during the scan and pauses it while the connector is waiting to start or retry.
 

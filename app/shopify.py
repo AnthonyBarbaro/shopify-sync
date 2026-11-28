@@ -159,12 +159,30 @@ class ShopifyClient:
         location_id: str,
     ) -> List[Dict[str, Any]]:
         """Load every variant's available quantity at one Shopify location."""
+        rows: List[Dict[str, Any]] = []
+        after_id = None
+        while True:
+            page, after_id = self.get_inventory_snapshot_page(
+                shop_domain, access_token, location_id, after_id=after_id,
+            )
+            rows.extend(page)
+            if after_id is None:
+                return rows
+
+    def get_inventory_snapshot_page(
+        self,
+        shop_domain: str,
+        access_token: str,
+        location_id: str,
+        *,
+        after_id: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], Optional[int]]:
+        # Restart pagination with an ID filter to stay below Shopify's connection limit.
         query = """
-        query InventorySnapshot($first: Int!, $after: String, $locationId: ID!) {
-          inventoryItems(first: $first, after: $after) {
+        query InventorySnapshot($filter: String, $locationId: ID!) {
+          inventoryItems(first: 250, query: $filter) {
             pageInfo {
               hasNextPage
-              endCursor
             }
             nodes {
               id
@@ -182,50 +200,44 @@ class ShopifyClient:
         }
         """
         normalized_location_id = normalize_gid("Location", location_id)
+        payload = self.graphql(
+            shop_domain,
+            access_token,
+            query,
+            {"filter": f"id:>{after_id}" if after_id is not None else None, "locationId": normalized_location_id},
+            operation_name="InventorySnapshot",
+        )
+        items_data = payload["data"]["inventoryItems"]
         rows: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
-
-        while True:
-            payload = self.graphql(
-                shop_domain,
-                access_token,
-                query,
-                {
-                    "first": 250,
-                    "after": cursor,
-                    "locationId": normalized_location_id,
-                },
-                operation_name="InventorySnapshot",
+        last_item_id = after_id or 0
+        for node in items_data["nodes"]:
+            item_id = extract_numeric_shopify_id(node.get("id"))
+            if item_id is None or item_id <= last_item_id:
+                raise ShopifyAPIError("Shopify inventory items were not returned in ascending ID order.")
+            last_item_id = item_id
+            sku = str(node.get("sku") or "").strip()
+            if not sku:
+                continue
+            inventory_level = node.get("inventoryLevel")
+            quantities = (inventory_level or {}).get("quantities") or []
+            available = next(
+                (quantity.get("quantity") for quantity in quantities if quantity.get("name") == "available"),
+                None,
             )
-            items_data = payload["data"]["inventoryItems"]
-            for node in items_data["nodes"]:
-                sku = str(node.get("sku") or "").strip()
-                if not sku:
-                    continue
-                inventory_level = node.get("inventoryLevel")
-                quantities = (inventory_level or {}).get("quantities") or []
-                available = next(
-                    (
-                        quantity.get("quantity")
-                        for quantity in quantities
-                        if quantity.get("name") == "available"
-                    ),
-                    None,
-                )
-                rows.append(
-                    {
-                        "sku": sku,
-                        "quantity": int(available) if available is not None else None,
-                        "inventory_item_id": node.get("id"),
-                        "location_id": normalized_location_id,
-                        "inventory_level_updated_at": (inventory_level or {}).get("updatedAt"),
-                        "available_at_location": inventory_level is not None,
-                        "duplicate_sku_count": int(node.get("duplicateSkuCount") or 0),
-                    }
-                )
-            if not items_data["pageInfo"]["hasNextPage"]:
-                return rows
-            cursor = items_data["pageInfo"]["endCursor"]
+            rows.append({
+                "sku": sku,
+                "quantity": int(available) if available is not None else None,
+                "inventory_item_id": node["id"],
+                "location_id": normalized_location_id,
+                "inventory_level_updated_at": (inventory_level or {}).get("updatedAt"),
+                "available_at_location": inventory_level is not None,
+                "duplicate_sku_count": int(node.get("duplicateSkuCount") or 0),
+            })
+        if not items_data["pageInfo"]["hasNextPage"]:
+            return rows, None
+        if not items_data["nodes"]:
+            raise ShopifyAPIError("Shopify indicated another inventory page without any inventory items.")
+        return rows, last_item_id
 
     def get_variant_weight_page(
         self, shop_domain: str, access_token: str, *, cursor: Optional[str] = None,
