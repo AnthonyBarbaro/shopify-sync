@@ -331,7 +331,7 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.connector._sync_request_id = 'request1'
         with (
             mock.patch.object(self.connector, '_send_heartbeat'),
-            mock.patch.object(self.connector, 'run_cycle', side_effect=OSError('POS locked')),
+            mock.patch.object(self.connector, '_force_inventory_sync', side_effect=OSError('POS locked')),
             mock.patch.object(self.connector, '_complete_sync_request') as complete,
         ):
             self.assertEqual(self.connector.run_forever(once=True), 1)
@@ -340,12 +340,14 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.connector.session = self.session
         self.session.post.side_effect = None
         self.session.post.return_value.json.return_value = {'completed': True}
+        summary = {"updated": 2, "already_matched": 3, "skipped": 1}
         with (
             mock.patch.object(self.connector, '_send_heartbeat'),
-            mock.patch.object(self.connector, 'run_cycle') as scan,
+            mock.patch.object(self.connector, '_force_inventory_sync', return_value=summary) as scan,
         ):
             self.assertEqual(self.connector.run_forever(once=True), 0)
-        scan.assert_called_once_with(force_full=True, sync_request_id='request1')
+        scan.assert_called_once_with('request1')
+        self.assertEqual(self.session.post.call_args.kwargs["json"], summary)
         self.assertIsNone(self.connector._sync_request_id)
         self.assertIsNone(self.connector._sync_progress_stage)
 
@@ -353,20 +355,40 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.connector.customer_sync_enabled = False
         self.connector.dry_run = True
         self.connector._sync_request_id = "request1"
+        cycles = mock.Mock()
+        cycles.force.side_effect = [requests.ReadTimeout(), KeyboardInterrupt()]
         with (
             mock.patch.object(self.connector, "_heartbeat_loop"),
             mock.patch.object(self.connector._sync_wakeup, "wait"),
-            mock.patch.object(self.connector, "run_cycle", side_effect=[requests.ReadTimeout(), None, KeyboardInterrupt()]) as scan,
+            mock.patch.object(self.connector, "_force_inventory_sync", cycles.force),
+            mock.patch.object(self.connector, "run_cycle", cycles.regular),
             mock.patch.object(self.connector, "_complete_sync_request") as complete,
             self.assertRaises(KeyboardInterrupt),
         ):
             self.connector.run_forever()
-        self.assertEqual(scan.call_args_list, [
-            mock.call(force_full=True, sync_request_id="request1"),
-            mock.call(scheduled=True),
-            mock.call(force_full=True, sync_request_id="request1"),
+        self.assertEqual(cycles.mock_calls, [
+            mock.call.force("request1"), mock.call.regular(scheduled=True), mock.call.force("request1"),
         ])
         complete.assert_not_called()
+
+    def test_force_sync_retries_lost_acknowledgment_without_recopying_inventory(self) -> None:
+        self.connector.customer_sync_enabled = False
+        self.connector._sync_request_id = "request1"
+        summary = {"updated": 1, "already_matched": 0, "skipped": 0}
+        with (
+            mock.patch.object(self.connector, "_heartbeat_loop"),
+            mock.patch.object(self.connector._sync_wakeup, "wait"),
+            mock.patch.object(self.connector, "_force_inventory_sync", return_value=summary) as scan,
+            mock.patch.object(self.connector, "run_cycle") as regular,
+            mock.patch.object(
+                self.connector, "_complete_sync_request", side_effect=[requests.ReadTimeout(), KeyboardInterrupt()],
+            ) as complete,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.connector.run_forever()
+        scan.assert_called_once_with("request1")
+        regular.assert_called_once_with(scheduled=True)
+        self.assertEqual(complete.call_args_list, [mock.call("request1", summary)] * 2)
 
     def test_inventory_snapshot_assembles_pages_and_rejects_an_inconsistent_location(self) -> None:
         connector = self.connector

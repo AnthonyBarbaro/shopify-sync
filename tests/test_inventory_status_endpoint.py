@@ -345,12 +345,43 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 401)
         self.main.db.complete_connector_sync.assert_not_called()
         self.main.db.complete_connector_sync.return_value = True
-        status, body = await self.post({}, path="/sync/requests/request1/ack")
+        summary = {"updated": 2, "already_matched": 3, "skipped": 1}
+        status, body = await self.post(summary, path="/sync/requests/request1/ack")
         self.assertEqual(status, 200)
         self.assertTrue(body['completed'])
         self.main.db.complete_connector_sync.assert_called_once_with(
-            shop_domain=self.shop.shop_domain, request_id="request1",
+            shop_domain=self.shop.shop_domain, request_id="request1", result=summary,
         )
+        status, body = await self.post(None, path="/sync/requests/request1/ack")
+        self.assertEqual((status, body), (200, {"completed": True}))
+
+    async def test_force_sync_routes_absolute_stock_to_shopify_and_records_its_result(self) -> None:
+        path = "/sync/inventory/adjustments"
+        item_id, location_id = "gid://shopify/InventoryItem/1", "gid://shopify/Location/4"
+        row = {
+            "sku": "22270", "target_quantity": 11, "expected_quantity": 3, "idempotency_key": "force-key",
+            "inventory_item_id": item_id, "location_id": location_id,
+        }
+        with (
+            mock.patch.object(self.main.inventory_service, "set_inventory_quantity") as set_quantity,
+            mock.patch.object(self.main.inventory_service, "adjust_inventory_quantity") as adjust,
+        ):
+            set_quantity.return_value = {
+                "success": True, "sku": "22270", "delta": 8, "quantity_after_change": 11,
+                "inventory_item_id": item_id, "location_id": location_id,
+            }
+            payload = {"mode": "set", "adjustments": [row, {**row, "target_quantity": None}]}
+            self.assertEqual((await self.post(payload, path=path, authenticated=False))[0], 401)
+            status, body = await self.post(payload, path=path)
+
+        self.assertEqual((status, body["succeeded"], body["failed"]), (200, 1, 1))
+        self.assertEqual(body["mode"], "set")
+        set_quantity.assert_called_once_with(
+            sku="22270", quantity=11, expected_quantity=3, idempotency_key="force-key",
+            inventory_item_id=item_id, location_id=location_id, shop=self.shop,
+        )
+        adjust.assert_not_called()
+        self.assertEqual(self.main.db.record_recent_inventory_change.call_args.kwargs["delta"], 8)
 
     async def test_inventory_snapshot_page_is_authenticated_and_passes_its_continuation(self) -> None:
         path = "/sync/inventory/page"

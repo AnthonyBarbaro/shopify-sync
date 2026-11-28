@@ -43,6 +43,7 @@ from app.models import (
     CatalogResponse,
     ConnectionSettingsResponse,
     ConnectorHeartbeatRequest,
+    ConnectorSyncResult,
     ConnectorUpdateReport,
     CustomerBulkSyncResponse,
     CustomerSyncRequest,
@@ -3011,10 +3012,10 @@ def request_connector_force_sync(request: Request) -> JSONResponse:
 
 @app.post("/sync/requests/{request_id}/ack", response_model=None)
 def acknowledge_connector_sync(
-    request_id: str, shop: ShopRecord = Depends(require_pos_shop),
+    request_id: str, result: ConnectorSyncResult | None = None, shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
     return JSONResponse({"completed": db.complete_connector_sync(
-        shop_domain=shop.shop_domain, request_id=request_id,
+        shop_domain=shop.shop_domain, request_id=request_id, result=result.model_dump() if result else None,
     )})
 
 
@@ -3656,6 +3657,7 @@ async def connector_inventory_adjustments(
 ) -> JSONResponse:
     raw_payload = await parse_external_request_payload(request)
     raw_adjustments = raw_payload.get("adjustments") if isinstance(raw_payload, dict) else raw_payload
+    set_quantity = isinstance(raw_payload, dict) and raw_payload.get("mode") == "set"
     if not isinstance(raw_adjustments, list) or not raw_adjustments:
         raise SyncProcessingError(
             "Inventory adjustments require a non-empty adjustments array.",
@@ -3677,18 +3679,36 @@ async def connector_inventory_adjustments(
             continue
         sku = _string_or_none(raw_adjustment.get("sku")) or ""
         try:
-            delta = int(raw_adjustment.get("delta"))
             idempotency_key = _string_or_none(raw_adjustment.get("idempotency_key")) or secrets.token_hex(16)
             if len(idempotency_key) > 128:
                 raise ValueError("idempotency_key must be 128 characters or fewer")
+            if set_quantity:
+                quantity = raw_adjustment.get("target_quantity")
+                expected_quantity = raw_adjustment.get("expected_quantity")
+                inventory_item_id = _string_or_none(raw_adjustment.get("inventory_item_id"))
+                location_id = _string_or_none(raw_adjustment.get("location_id"))
+                if not (
+                    sku and inventory_item_id and location_id
+                    and type(quantity) is int and 0 <= quantity < 2**31
+                    and type(expected_quantity) is int and -(2**31) <= expected_quantity < 2**31
+                ):
+                    raise SyncProcessingError(
+                        "Force Sync needs a SKU, inventory item, location, and whole-number quantities.",
+                        code="invalid_inventory_quantity",
+                    )
+                operation = inventory_service.set_inventory_quantity
+                options = {
+                    "quantity": quantity, "expected_quantity": expected_quantity,
+                    "location_id": location_id, "inventory_item_id": inventory_item_id,
+                }
+            else:
+                operation = inventory_service.adjust_inventory_quantity
+                options = {"delta": int(raw_adjustment.get("delta"))}
             result = await run_in_threadpool(
                 run_with_shop_retry,
                 shop,
-                lambda active_shop: inventory_service.adjust_inventory_quantity(
-                    sku=sku,
-                    delta=delta,
-                    idempotency_key=idempotency_key,
-                    shop=active_shop,
+                lambda active_shop: operation(
+                    sku=sku, idempotency_key=idempotency_key, shop=active_shop, **options,
                 ),
             )
             if result.get("success") and result.get("inventory_item_id") and result.get("sku"):
@@ -3701,7 +3721,7 @@ async def connector_inventory_adjustments(
                     shop_domain=shop.shop_domain,
                     idempotency_key=idempotency_key,
                     sku=result["sku"],
-                    delta=delta,
+                    delta=result["delta"] if set_quantity else options["delta"],
                     quantity_after_change=result.get("quantity_after_change"),
                     product_title=result.get("product_title"),
                     variant_title=result.get("variant_title"),
@@ -3722,6 +3742,7 @@ async def connector_inventory_adjustments(
     succeeded = sum(1 for result in results if result.get("success"))
     return JSONResponse(
         {
+            **({"mode": "set"} if set_quantity else {}),
             "total": len(results),
             "succeeded": succeeded,
             "failed": len(results) - succeeded,

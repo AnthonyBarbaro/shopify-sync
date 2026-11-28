@@ -50,6 +50,7 @@ from windows_connector.connector import (
     matrix_variant_sku_for_row,
     matrix_length_repair_candidates,
     merge_quantity,
+    load_state,
     negative_catalog_money_field,
     nightly_full_sync_due,
     numeric_sku_increases,
@@ -72,9 +73,8 @@ class QuantityMergeTests(unittest.TestCase):
 
         self.assertEqual(plan["target"], 8)
         self.assertEqual(plan["shop_adjustment"], -1)
-        self.assertEqual(plan["pos_adjustment"], -1)
 
-    def test_shopify_sale_only_updates_the_pos(self):
+    def test_shopify_sale_needs_no_shopify_adjustment(self):
         plan = merge_quantity(
             {"canonical": 10, "pos_seen": 10, "shop_seen": 10},
             pos_quantity=10,
@@ -83,7 +83,6 @@ class QuantityMergeTests(unittest.TestCase):
 
         self.assertEqual(plan["target"], 9)
         self.assertEqual(plan["shop_adjustment"], 0)
-        self.assertEqual(plan["pos_adjustment"], -1)
 
     def test_pos_sale_only_updates_shopify(self):
         plan = merge_quantity(
@@ -94,7 +93,6 @@ class QuantityMergeTests(unittest.TestCase):
 
         self.assertEqual(plan["target"], 9)
         self.assertEqual(plan["shop_adjustment"], -1)
-        self.assertEqual(plan["pos_adjustment"], 0)
 
     def test_matrix_payload_flattens_to_variant_skus(self):
         quantities = flatten_quantities(
@@ -376,9 +374,7 @@ class MatrixStructureRepairClientTests(unittest.TestCase):
     def test_pending_retries_exclude_protected_matrix_skus(self):
         connector = Connector.__new__(Connector)
         connector.logger = mock.Mock()
-        connector.writeback_mode = "vfp-oledb"
         connector._apply_shopify_adjustments = mock.Mock(return_value=set())
-        connector._apply_pos_adjustments = mock.Mock()
         protected_shop = {"sku": "22392. 1 1", "delta": 1}
         protected_pos = {"sku": "22392", "delta": -6}
         unrelated_shop = {"sku": "OTHER", "delta": 2}
@@ -400,10 +396,6 @@ class MatrixStructureRepairClientTests(unittest.TestCase):
         connector._apply_shopify_adjustments.assert_called_once_with(
             state,
             [unrelated_shop],
-        )
-        connector._apply_pos_adjustments.assert_called_once_with(
-            state,
-            [unrelated_pos],
         )
 
     def test_successful_structure_response_must_confirm_the_pos_quantities(self):
@@ -710,7 +702,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         connector.price_sync_enabled = False
         connector.initial_catalog_upload = True
         connector.nightly_full_sync_hour = 0
-        connector.writeback_mode = "dry-run"
         connector.base_url = "https://sync.example"
         connector.batch_size = 25
         connector.timeout = 30
@@ -723,7 +714,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         connector._collect_new_numeric_product_skus = mock.Mock(return_value=set())
         connector._reader_args = mock.Mock(return_value=SimpleNamespace())
         connector._apply_shopify_adjustments = mock.Mock(return_value=set())
-        connector._apply_pos_adjustments = mock.Mock()
         connector._acknowledge_inventory_changes = mock.Mock()
         return connector
 
@@ -795,17 +785,49 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             self.assertEqual(connector._apply_shopify_adjustments.call_args.args[1][0]["delta"], -1)
             self.assertEqual(json.loads(path.read_text())["deferred_pos_event_skus"], [])
 
-    def test_forced_scan_reports_its_stage_during_each_inventory_read(self):
+    def test_forced_scan_sets_exact_fresh_pos_count_and_only_acks_confirmed_skus(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             connector, state = self._scheduled_connector(path)
+            state["quantities"]["22392"].update(
+                canonical=3, pos_seen=11, shop_seen=3,
+                pending_pos={"sku": "22392", "target_quantity": 3},
+                pending_shop={"sku": "22392", "target_quantity": 2},
+            )
             save_state(path, state)
             connector._set_sync_progress = mock.Mock()
             snapshot = connector._fetch_inventory_snapshot.return_value
+            location = snapshot["location_id"]
+            observed_at = "2026-11-28T19:53:00Z"
+            snapshot["items"] = [
+                dict(self._snapshot_item(sku, quantity), inventory_item_id=item_id, inventory_level_updated_at=observed_at)
+                for sku, item_id, quantity in (
+                    ("22392", "item-1", 3), ("MATRIX. 1 1", "item-2", 3),
+                    ("MATRIX. 1 2", "item-3", 3), ("MATRIX. 1 3", "item-4", 0),
+                )
+            ]
+            changes = [
+                {"id": index, "version": 1, "sku": row["sku"], "inventory_item_id": row["inventory_item_id"],
+                 "location_id": location, "source_updated_at": observed_at}
+                for index, row in enumerate(snapshot["items"], 1)
+            ]
+            connector._fetch_inventory_changes.return_value = changes
+            connector._record_inventory_issue = mock.Mock()
+            connector.session = mock.Mock()
+            connector.session.post.return_value.json.return_value = {"mode": "set", "results": [
+                {"sku": "22392", "success": True, "quantity_after_change": 11, "delta": 8},
+                {"sku": "MATRIX. 1 1", "success": False, "code": "shopify_quantity_changed"},
+            ]}
 
             def load_products(_args):
                 self.assertEqual(connector._set_sync_progress.call_args, mock.call("sync1", "reading_pos"))
-                return [SimpleNamespace(payload={"sku": "22392", "quantity": 5})], SimpleNamespace(skipped_non_sellable=0)
+                return [
+                    SimpleNamespace(payload={"sku": "22392", "quantity": 5}),
+                    SimpleNamespace(payload={"sku": "MATRIX", "variants": [
+                        {"sku": "MATRIX. 1 1", "quantity": 2}, {"sku": "MATRIX. 1 2", "quantity": 0},
+                        {"sku": "MATRIX. 1 3", "quantity": 0},
+                    ]}),
+                ], None
 
             def fetch_snapshot():
                 self.assertEqual(connector._set_sync_progress.call_args, mock.call("sync1", "reading_shopify"))
@@ -813,15 +835,38 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
             connector._fetch_inventory_snapshot.side_effect = fetch_snapshot
             module = sys.modules["windows_connector.connector"]
-            with mock.patch.object(module.dbf_pos_sync, "load_products", side_effect=load_products):
-                connector.run_cycle(force_full=True, sync_request_id="sync1")
+            with (
+                mock.patch.object(module.dbf_pos_sync, "load_products", side_effect=load_products),
+                mock.patch.object(module, "read_targeted_pos_quantities", return_value={
+                    "22392": 11, "MATRIX. 1 1": 2, "MATRIX. 1 3": 0,
+                }) as read,
+            ):
+                summary = connector._force_inventory_sync("sync1")
 
             self.assertEqual(connector._set_sync_progress.call_args_list, [
                 mock.call("sync1", "reading_pos"), mock.call("sync1", "reading_shopify"),
                 mock.call("sync1", "reconciling"),
             ])
+            self.assertFalse(read.call_args.kwargs["include_missing_matrix_rows"])
+            request = connector.session.post.call_args.kwargs["json"]
+            self.assertEqual(request["mode"], "set")
+            self.assertEqual(
+                [(row["sku"], row["expected_quantity"], row["target_quantity"]) for row in request["adjustments"]],
+                [("22392", 3, 11), ("MATRIX. 1 1", 3, 2)],
+            )
+            self.assertTrue(all("delta" not in row for row in request["adjustments"]))
+            self.assertEqual(summary, {"updated": 1, "already_matched": 1, "skipped": 2})
+            connector._retry_pending.assert_not_called()
+            connector._acknowledge_inventory_changes.assert_called_once_with([changes[0], changes[3]])
+            self.assertEqual(
+                [call.args for call in connector._record_inventory_issue.call_args_list],
+                [("MATRIX. 1 2", "pos_row_unavailable"), ("MATRIX. 1 1", "shopify_adjustment_rejected")],
+            )
+            quantity = load_state(path)["quantities"]["22392"]
+            self.assertEqual((quantity["canonical"], quantity["pos_seen"], quantity["shop_seen"]), (11, 11, 11))
+            self.assertNotIn("pending_shop", quantity)
 
-    def test_full_scan_logs_the_sku_and_counts_when_pos_writeback_is_only_a_preview(self):
+    def test_automatic_full_scan_leaves_an_observed_shopify_sale_in_place(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             connector, state = self._scheduled_connector(path)
@@ -836,11 +881,9 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             with mock.patch.object(module.dbf_pos_sync, "load_products", return_value=(products, stats)):
                 connector.run_cycle(force_full=True)
 
-            connector._record_inventory_issue.assert_called_once_with(
-                "22392", "pos_writeback_preview", pos_quantity=11, shopify_quantity=3, target_quantity=3,
-            )
+            connector._record_inventory_issue.assert_not_called()
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
+            self.assertEqual(load_state(path)["quantities"]["22392"]["pos_seen"], 11)
 
     def test_automatic_reconcile_waits_for_quiet_and_keeps_a_deferred_file_reset(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -990,7 +1033,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             connector, state = self._scheduled_connector(path)
-            connector.writeback_mode = "vfp-oledb"
             save_state(path, state)
             change = {"id": 1, "version": 1, "sku": "22392", "quantity": 4}
             connector._fetch_inventory_changes.return_value = [change]
@@ -1000,13 +1042,14 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             ):
                 connector.run_cycle(scheduled=True)
                 connector._acknowledge_inventory_changes.assert_not_called()
-                connector._apply_pos_adjustments.assert_not_called()
                 connector._collect_new_numeric_product_skus.assert_not_called()
                 connector.run_cycle(scheduled=True)
 
             connector._collect_new_numeric_product_skus.assert_called_once()
             connector._acknowledge_inventory_changes.assert_called_once_with([change])
-            self.assertEqual(connector._apply_pos_adjustments.call_args.args[1][0]["target_quantity"], 4)
+            entry = json.loads(path.read_text())["quantities"]["22392"]
+            self.assertEqual((entry["pos_seen"], entry["shop_seen"], entry["canonical"]), (5, 4, 4))
+            self.assertNotIn("pending_pos", entry)
 
     def test_equal_timestamp_quantity_conflict_uses_shopify_snapshot(self):
         for live_quantity in (4, 5):
@@ -1015,7 +1058,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 connector, state = self._scheduled_connector(path)
                 observed_at = "2026-11-28T19:53:00Z"
                 state["quantities"]["22392"]["shop_seen_at"] = observed_at
-                connector.writeback_mode = "vfp-oledb"
                 save_state(path, state)
                 change = {
                     "id": 1, "version": 1, "sku": "22392", "quantity": 4,
@@ -1036,7 +1078,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                     connector.run_cycle(scheduled=True)
                     connector._fetch_inventory_snapshot.assert_not_called()
                     connector._acknowledge_inventory_changes.assert_not_called()
-                    connector._apply_pos_adjustments.assert_not_called()
 
                     connector.run_cycle(scheduled=True)
 
@@ -1045,10 +1086,9 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 persisted = json.loads(path.read_text())
                 self.assertEqual(persisted["inventory_webhook_verification_skus"], [])
                 self.assertEqual(persisted["quantities"]["22392"]["shop_seen"], live_quantity)
-                if live_quantity == 4:
-                    self.assertEqual(connector._apply_pos_adjustments.call_args.args[1][0]["target_quantity"], 4)
-                else:
-                    connector._apply_pos_adjustments.assert_not_called()
+                self.assertEqual(persisted["quantities"]["22392"]["pos_seen"], 5)
+                self.assertNotIn("pending_pos", persisted["quantities"]["22392"])
+                if live_quantity == 5:
                     connector._acknowledge_inventory_changes.assert_called_once_with([change])
 
     def test_equal_timestamp_webhook_queued_during_snapshot_defers_its_sku(self):
@@ -1117,7 +1157,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                     connector.price_sync_enabled = False
                     connector.initial_catalog_upload = True
                     connector.nightly_full_sync_hour = 0
-                    connector.writeback_mode = "dry-run"
                     connector.state_path = Path(temporary_directory) / "state.json"
                     connector.logger = mock.Mock()
                     connector._retry_pending = mock.Mock()
@@ -1212,7 +1251,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_path = Path(temporary_directory) / "state.json"
             connector = self._matrix_connector(state_path)
-            connector.writeback_mode = "vfp-oledb"
             queued_sale = {
                 "id": 1,
                 "version": 1,
@@ -1271,26 +1309,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
             self.assertEqual(connector._fetch_inventory_changes.call_count, 2)
             shop_actions = connector._apply_shopify_adjustments.call_args.args[1]
-            pos_actions = connector._apply_pos_adjustments.call_args.args[1]
-            self.assertEqual(
-                {
-                    key: shop_actions[0][key]
-                    for key in ("sku", "delta", "target_quantity")
-                },
-                {"sku": "ABC", "delta": 1, "target_quantity": 6},
-            )
-            self.assertEqual(
-                {
-                    key: pos_actions[0][key]
-                    for key in ("sku", "delta", "target_quantity", "expected_quantity")
-                },
-                {
-                    "sku": "ABC",
-                    "delta": -1,
-                    "target_quantity": 6,
-                    "expected_quantity": 7,
-                },
-            )
             connector._acknowledge_inventory_changes.assert_not_called()
 
     def test_full_snapshot_aborts_on_an_unverifiable_queued_quantity(self):
@@ -1354,7 +1372,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 connector.run_cycle()
 
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
             connector._acknowledge_inventory_changes.assert_not_called()
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["inventory_reconcile_schema_version"], 1)
@@ -1427,7 +1444,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
             connector._fetch_inventory_snapshot.assert_called_once()
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
             connector._acknowledge_inventory_changes.assert_called_once_with(
                 [deleted_change]
             )
@@ -1491,7 +1507,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             connector._repair_matrix_structures.assert_called_once_with([payload])
             self.assertEqual(load_products.call_count, 2)
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
 
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -1562,7 +1577,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_path = Path(temporary_directory) / "state.json"
             connector = self._matrix_connector(state_path)
-            connector.writeback_mode = "vfp-oledb"
             queued_sale = {
                 "id": 7,
                 "version": 1,
@@ -1602,19 +1616,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                     variant["sku"]: (variant["quantity"], variant["quantity"])
                     for variant in payload["variants"]
                     if variant["quantity"] and variant["sku"] != racing_sku
-                },
-            )
-            pos_actions = connector._apply_pos_adjustments.call_args.args[1]
-            self.assertEqual(
-                {
-                    key: pos_actions[0][key]
-                    for key in ("sku", "delta", "target_quantity", "expected_quantity")
-                },
-                {
-                    "sku": racing_sku,
-                    "delta": -1,
-                    "target_quantity": 0,
-                    "expected_quantity": 1,
                 },
             )
             connector._acknowledge_inventory_changes.assert_not_called()
@@ -1701,13 +1702,11 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_path = Path(temporary_directory) / "state.json"
             connector = self._matrix_connector(state_path)
-            connector.writeback_mode = "vfp-oledb"
             connector._retry_pending = Connector._retry_pending.__get__(
                 connector,
                 Connector,
             )
             connector._apply_shopify_adjustments = mock.Mock(return_value=set())
-            connector._apply_pos_adjustments = mock.Mock()
             connector._repair_matrix_structures = mock.Mock()
             connector._fetch_inventory_snapshot = mock.Mock(
                 return_value={
@@ -1752,7 +1751,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
             connector._repair_matrix_structures.assert_not_called()
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 persisted["catalog_structure_schema_version"],
@@ -1794,7 +1792,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_path = Path(temporary_directory) / "state.json"
             connector = self._matrix_connector(state_path)
-            connector.writeback_mode = "vfp-oledb"
             connector._retry_pending = Connector._retry_pending.__get__(
                 connector,
                 Connector,
@@ -1806,7 +1803,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 side_effect=inventory_snapshot
             )
             connector._apply_shopify_adjustments = mock.Mock(return_value=set())
-            connector._apply_pos_adjustments = mock.Mock()
             state = self._matrix_state()
             state["quantities"] = {
                 "22392": {
@@ -1854,7 +1850,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             ):
                 connector.run_cycle()
                 connector._apply_shopify_adjustments.assert_not_called()
-                connector._apply_pos_adjustments.assert_not_called()
                 connector.run_cycle()
 
             post_repair_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1879,7 +1874,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             shop_calls = connector._apply_shopify_adjustments.call_args_list
             self.assertEqual(shop_calls[0].args[1], [state["quantities"]["OTHER"]["pending_shop"]])
             self.assertEqual(len(shop_calls), 1)
-            connector._apply_pos_adjustments.assert_not_called()
             connector._acknowledge_inventory_changes.assert_called_once_with(
                 [delayed_base_change]
             )
@@ -2069,7 +2063,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
                 connector._repair_matrix_structures.assert_not_called()
                 connector._apply_shopify_adjustments.assert_not_called()
-                connector._apply_pos_adjustments.assert_not_called()
                 connector._fetch_inventory_snapshot.assert_called_once()
                 self.assertEqual(load_products.call_count, 1)
                 persisted = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2185,7 +2178,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             connector.price_sync_enabled = False
             connector.initial_catalog_upload = True
             connector.nightly_full_sync_hour = 0
-            connector.writeback_mode = "vfp-oledb"
             connector.state_path = Path(temporary_directory) / "state.json"
             connector.logger = mock.Mock()
             connector._retry_pending = mock.Mock()
@@ -2208,7 +2200,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 }
             )
             connector._apply_shopify_adjustments = mock.Mock()
-            connector._apply_pos_adjustments = mock.Mock()
             connector._acknowledge_inventory_changes = mock.Mock()
             save_state(
                 connector.state_path,
@@ -2237,7 +2228,6 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 connector.run_cycle()
 
             connector._apply_shopify_adjustments.assert_not_called()
-            connector._apply_pos_adjustments.assert_not_called()
             persisted = json.loads(connector.state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["blocked_inventory_skus"], ["DUP"])
 
@@ -2255,181 +2245,33 @@ class FullInventoryReconciliationTests(unittest.TestCase):
 
         response.raise_for_status.assert_called_once()
 
-    def test_actual_shopify_result_rebases_a_stale_paired_pos_adjustment(self):
-        connector = Connector.__new__(Connector)
-        connector.base_url = "https://sync.example"
-        connector.timeout = 30
-        connector.batch_size = 25
-        connector.logger = mock.Mock()
-        connector.state_path = Path("unused-state.json")
-        connector.session = mock.Mock()
-        response = mock.Mock()
-        response.json.return_value = {
-            "results": [
-                {
-                    "success": True,
-                    "sku": "ABC",
-                    "quantity_after_change": 9,
+    def test_shopify_adjustments_never_schedule_a_pos_write(self):
+        for actual, observed in ((6, 6), (None, 7)):
+            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                connector = self._matrix_connector(path)
+                connector.session = mock.Mock()
+                connector._apply_shopify_adjustments = Connector._apply_shopify_adjustments.__get__(connector)
+                connector.session.post.return_value.json.return_value = {
+                    "results": [{"success": True, "sku": "ABC", "quantity_after_change": actual}],
                 }
-            ]
-        }
-        connector.session.post.return_value = response
-        shop_action = {
-            "sku": "ABC",
-            "delta": -1,
-            "target_quantity": 8,
-            "idempotency_key": "shop-key",
-        }
-        pos_action = {
-            "sku": "ABC",
-            "delta": -1,
-            "target_quantity": 8,
-            "expected_quantity": 9,
-            "idempotency_key": "pos-key",
-        }
-        state = {
-            "quantities": {
-                "ABC": {
-                    "canonical": 8,
-                    "pos_seen": 9,
-                    "shop_seen": 9,
-                    "pending_shop": shop_action,
-                    "pending_pos": pos_action,
-                }
-            }
-        }
+                action = {"sku": "ABC", "delta": 1, "target_quantity": 7, "idempotency_key": "shop-key"}
+                save_state(path, {
+                    "version": 1,
+                    "quantities": {"ABC": {
+                        "canonical": 7, "pos_seen": 8, "shop_seen": 6,
+                        "pending_shop": action, "pending_pos": {"sku": "ABC", "delta": -1},
+                    }},
+                })
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            connector.state_path = Path(temporary_directory) / "state.json"
-            deferred = connector._apply_shopify_adjustments(state, [shop_action])
+                state = load_state(path)
+                connector._apply_shopify_adjustments(state, [action])
 
-        self.assertEqual(deferred, set())
-        self.assertEqual(state["quantities"]["ABC"]["canonical"], 9)
-        self.assertEqual(state["quantities"]["ABC"]["shop_seen"], 9)
-        self.assertNotIn("pending_shop", state["quantities"]["ABC"])
-        self.assertNotIn("pending_pos", state["quantities"]["ABC"])
-
-    def test_shopify_race_synthesizes_a_guarded_pos_correction(self):
-        connector = Connector.__new__(Connector)
-        connector.base_url = "https://sync.example"
-        connector.timeout = 30
-        connector.batch_size = 25
-        connector.writeback_mode = "vfp-oledb"
-        connector.logger = mock.Mock()
-        connector.session = mock.Mock()
-        response = mock.Mock()
-        response.json.return_value = {
-            "results": [
-                {
-                    "success": True,
-                    "sku": "ABC",
-                    "quantity_after_change": 6,
-                }
-            ]
-        }
-        connector.session.post.return_value = response
-        shop_action = {
-            "sku": "ABC",
-            "delta": 1,
-            "target_quantity": 7,
-            "idempotency_key": "shop-key",
-        }
-        state = {
-            "quantities": {
-                "ABC": {
-                    "canonical": 7,
-                    "pos_seen": 7,
-                    "shop_seen": 6,
-                    "pending_shop": shop_action,
-                    "revision": 1,
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            connector.state_path = Path(temporary_directory) / "state.json"
-            blocked = connector._apply_shopify_adjustments(state, [shop_action])
-
-        self.assertEqual(blocked, set())
-        self.assertEqual(state["quantities"]["ABC"]["canonical"], 6)
-        self.assertEqual(
-            {
-                key: state["quantities"]["ABC"]["pending_pos"][key]
-                for key in ("sku", "delta", "target_quantity", "expected_quantity")
-            },
-            {
-                "sku": "ABC",
-                "delta": -1,
-                "target_quantity": 6,
-                "expected_quantity": 7,
-            },
-        )
-
-    def test_single_pos_write_result_clears_pending_adjustment(self):
-        with tempfile.TemporaryDirectory() as directory:
-            connector = self._matrix_connector(Path(directory) / "state.json")
-            connector.writer_script = Path(directory) / "write_pos_quantity.ps1"
-            connector.writer_script.touch()
-            action = {"sku": "ABC", "expected_quantity": 5, "delta": -1}
-            state = {"quantities": {"ABC": {"pos_seen": 5, "pending_pos": action}}}
-            module = sys.modules["windows_connector.connector"]
-            result = SimpleNamespace(returncode=0, stdout='{"sku":"ABC","success":true}', stderr="")
-            with (
-                mock.patch.object(module, "find_powershell", return_value="powershell"),
-                mock.patch.object(module.subprocess, "run", return_value=result),
-            ):
-                Connector._apply_pos_adjustments(connector, state, [action])
-
-            self.assertEqual(json.loads(connector.state_path.read_text())["quantities"]["ABC"], {"pos_seen": 4})
-
-    def test_unconfirmed_shopify_result_defers_a_paired_pos_adjustment(self):
-        connector = Connector.__new__(Connector)
-        connector.base_url = "https://sync.example"
-        connector.timeout = 30
-        connector.batch_size = 25
-        connector.logger = mock.Mock()
-        connector.session = mock.Mock()
-        response = mock.Mock()
-        response.json.return_value = {
-            "results": [
-                {
-                    "success": True,
-                    "sku": "ABC",
-                    "quantity_after_change": None,
-                }
-            ]
-        }
-        connector.session.post.return_value = response
-        shop_action = {
-            "sku": "ABC",
-            "delta": -1,
-            "target_quantity": 8,
-            "idempotency_key": "shop-key",
-        }
-        state = {
-            "quantities": {
-                "ABC": {
-                    "canonical": 8,
-                    "pos_seen": 9,
-                    "shop_seen": 9,
-                    "pending_shop": shop_action,
-                    "pending_pos": {
-                        "sku": "ABC",
-                        "delta": -1,
-                        "target_quantity": 8,
-                        "expected_quantity": 9,
-                        "idempotency_key": "pos-key",
-                    },
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            connector.state_path = Path(temporary_directory) / "state.json"
-            deferred = connector._apply_shopify_adjustments(state, [shop_action])
-
-        self.assertEqual(deferred, {"ABC"})
-        self.assertNotIn("pending_pos", state["quantities"]["ABC"])
+                entry = json.loads(path.read_text())["quantities"]["ABC"]
+                self.assertEqual(entry["pos_seen"], 8)
+                self.assertEqual(entry["shop_seen"], observed)
+                self.assertNotIn("pending_shop", entry)
+                self.assertNotIn("pending_pos", entry)
 
 
 class DatabaseRetentionTests(unittest.TestCase):
@@ -4090,6 +3932,48 @@ with order_dbf_lock(Path(sys.argv[1]), Path(sys.argv[2])):
 
 
 class InventoryAdjustmentTests(unittest.TestCase):
+    def test_force_sync_sets_available_with_compare_and_swap_and_rejects_a_racing_sale(self):
+        client = ShopifyClient(SimpleNamespace(shopify_api_version="2026-01"))
+        shop = ShopRecord(shop_domain="example.myshopify.com", access_token="token")
+        item, location = "gid://shopify/InventoryItem/3", "gid://shopify/Location/4"
+        service = InventorySyncService(client, SimpleNamespace(shopify_location_id=location), None)
+        mapping = VariantMapping(
+            sku="22270", variant_id="gid://shopify/ProductVariant/1", product_id="gid://shopify/Product/2",
+            inventory_item_id=item, inventory_levels=[
+                InventoryLevelSnapshot(location_id=location, location_name="Store", quantity=3),
+            ],
+        )
+        options = dict(
+            sku="22270", quantity=11, expected_quantity=3, idempotency_key="force-key",
+            inventory_item_id=item, location_id=location, shop=shop,
+        )
+        response = {"data": {"inventorySetQuantities": {
+            "inventoryAdjustmentGroup": {
+                "createdAt": "2026-11-28T20:00:00Z",
+                "changes": [{"name": "available", "quantityAfterChange": 11}],
+            },
+            "userErrors": [],
+        }}}
+        with (
+            mock.patch.object(client, "get_variant_by_sku", return_value=mapping),
+            mock.patch.object(client, "graphql", return_value=response) as graphql,
+        ):
+            result = service.set_inventory_quantity(**options)
+            self.assertEqual(result["quantity_after_change"], 11)
+            self.assertEqual(result["delta"], 8)
+            variables = graphql.call_args.args[3]
+            self.assertEqual(variables["input"]["name"], "available")
+            self.assertEqual(variables["input"]["quantities"], [{
+                "inventoryItemId": item, "locationId": location, "quantity": 11, "changeFromQuantity": 3,
+            }])
+            self.assertEqual(variables["idempotencyKey"], "force-key")
+            graphql.return_value = {"data": {"inventorySetQuantities": {
+                "userErrors": [{"code": "CHANGE_FROM_QUANTITY_STALE", "message": "Quantity changed"}],
+            }}}
+            with self.assertRaises(SyncProcessingError) as rejected:
+                service.set_inventory_quantity(**options)
+            self.assertEqual(rejected.exception.code, "shopify_quantity_changed")
+
     def test_adjustment_uses_the_variant_inventory_item_and_location(self):
         class FakeShopifyClient:
             def __init__(self):

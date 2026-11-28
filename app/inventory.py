@@ -381,6 +381,79 @@ class InventorySyncService:
             "variant_title": mapping.variant_title,
         }
 
+    def set_inventory_quantity(
+        self,
+        *,
+        sku: str,
+        inventory_item_id: str,
+        location_id: str,
+        quantity: int,
+        expected_quantity: int,
+        idempotency_key: str,
+        shop: ShopRecord,
+    ) -> Dict[str, Any]:
+        mapping = self.shopify_client.get_variant_by_sku(
+            shop.shop_domain, shop.access_token, sku, force_refresh=True,
+        )
+        current_location = normalize_gid("Location", self._resolve_location_id(shop, mapping))
+        if mapping.inventory_item_id != inventory_item_id or current_location != location_id:
+            raise SyncProcessingError(
+                "The Shopify inventory item or location changed.", code="shopify_inventory_identity_changed",
+            )
+        actual = self._get_inventory_quantity(mapping, location_id)
+        if actual is None:
+            raise SyncProcessingError(
+                "The SKU has no available quantity at this location.", code="shopify_location_unavailable",
+            )
+        delta = 0
+        inventory_updated_at = None
+        if actual != quantity:
+            if actual != expected_quantity:
+                raise SyncProcessingError(
+                    "Shopify inventory changed during Force Sync.", code="shopify_quantity_changed",
+                )
+            try:
+                adjustment = self.shopify_client.update_inventory(
+                    shop.shop_domain, shop.access_token, inventory_item_id, location_id, quantity,
+                    change_from_quantity=expected_quantity, idempotency_key=idempotency_key, sku=sku,
+                )
+            except ShopifyAPIError as exc:
+                if any(has_user_error_code(exc.details, code) for code in (
+                    "CHANGE_FROM_QUANTITY_STALE", "COMPARE_QUANTITY_STALE",
+                )):
+                    raise SyncProcessingError(
+                        "Shopify inventory changed during Force Sync.", code="shopify_quantity_changed",
+                    ) from exc
+                raise
+            actual = adjustment["quantity_after_change"]
+            inventory_updated_at = adjustment["updated_at"]
+            if actual is None:
+                mapping = self.shopify_client.get_variant_by_sku(
+                    shop.shop_domain, shop.access_token, sku, force_refresh=True,
+                )
+                actual = self._get_inventory_quantity(mapping, location_id)
+            if actual != quantity or mapping.inventory_item_id != inventory_item_id:
+                raise SyncProcessingError(
+                    "Shopify did not confirm the requested quantity.", code="shopify_quantity_unconfirmed",
+                )
+            delta = quantity - expected_quantity
+        if quantity > expected_quantity and mapping.auto_archived_zero_stock:
+            try:
+                self._restore_auto_archived_product(shop=shop, mapping=mapping, resulting_quantity=quantity)
+            except ShopifyAPIError:
+                self.logger.warning("force_sync_product_status_restore_failed sku=%s", sku)
+        return {
+            "sku": sku,
+            "success": True,
+            "delta": delta,
+            "quantity_after_change": actual,
+            "inventory_updated_at": inventory_updated_at,
+            "inventory_item_id": mapping.inventory_item_id,
+            "location_id": location_id,
+            "product_title": mapping.product_title,
+            "variant_title": mapping.variant_title,
+        }
+
     def update_price_by_sku(
         self,
         *,

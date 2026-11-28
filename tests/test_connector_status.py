@@ -21,7 +21,6 @@ class NightlyProductStatusTests(unittest.TestCase):
         self.connector.price_sync_enabled = False
         self.connector.initial_catalog_upload = True
         self.connector.nightly_full_sync_hour = 0
-        self.connector.writeback_mode = "dry-run"
         self.connector.base_url = "https://sync.example"
         self.connector.batch_size = 25
         self.connector.timeout = 30
@@ -310,11 +309,11 @@ class NightlyProductStatusTests(unittest.TestCase):
                     dict.fromkeys(children, 0),
                     observed_skus=observed,
                 )
-                if unsafe is None:
+                if unsafe in {None, "pending_pos"}:
                     self.assertEqual(self.connector.session.post.call_args.kwargs["json"], {"skus": [children[0]]})
                 else:
                     self.connector.session.post.assert_not_called()
-                self.assertEqual(complete, unsafe not in {"pending_shop", "pending_pos"})
+                self.assertEqual(complete, unsafe != "pending_shop")
 
     def test_missing_or_mismatched_response_does_not_complete_pass(self) -> None:
         self.state["quantities"]["ABC"] = {"canonical": 0, "pos_seen": 0, "shop_seen": 0}

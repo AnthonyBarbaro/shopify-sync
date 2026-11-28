@@ -243,14 +243,13 @@ The POS developer handoff, field list, and import queries are in
 
 1. Copy `connector.env.example` to `connector.env`.
 2. Enter the local `ashpsdat` path, sync URL, POS key, and POS secret.
-3. Keep `POS_WRITEBACK_MODE=dry-run` initially.
-4. In PowerShell, test one read-only cycle:
+3. In PowerShell, test one read-only cycle:
 
    ```powershell
    py windows_connector\connector.py --config windows_connector\connector.env --once --dry-run
    ```
 
-5. Open PowerShell as Administrator and install the startup task:
+4. Open PowerShell as Administrator and install the startup task:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File windows_connector\install.ps1
@@ -263,32 +262,11 @@ normally available to `SYSTEM`.
 A recurring recovery trigger also starts a stopped connector within one minute while Windows is
 awake. It ignores the trigger when the connector is already running, so only one instance runs.
 
-## POS quantity write-back
+## Inventory direction
 
-`POS_WRITEBACK_MODE=dry-run` detects Shopify-to-POS changes but does not edit DBFs. Review the log and
-test against a copied POS data directory first.
-
-The live mode is:
-
-```env
-POS_WRITEBACK_MODE=vfp-oledb
-```
-
-It requires the Microsoft Visual FoxPro OLE DB provider (`VFPOLEDB.1`) on the POS computer. The writer
-uses the 32-bit Windows PowerShell host, FoxPro transactions, relative quantity adjustments, and an
-expected-quantity condition. Matrix adjustments update both the exact `Itemmqty` cell and the
-aggregate `Item` quantity.
-
-Before enabling live write-back:
-
-1. Make a POS backup.
-2. Point the connector at a copied DBF folder.
-3. Verify non-matrix and size/color/length matrix test SKUs.
-4. Confirm quantities and indexes in Cash Register Express.
-5. Then switch the production config to `vfp-oledb`.
-
-Direct DBF write-back updates inventory quantities only. It does not create a POS sales invoice or
-financial transaction for an online Shopify order.
+The connector reads POS inventory and updates quantities in Shopify only. Older
+`POS_WRITEBACK_MODE` and `POS_WRITEBACK_SCRIPT` settings are ignored. Shopify orders still reach
+the POS order inbox, and staff process those sales in Cash Register Express.
 
 ## Operations
 
@@ -324,14 +302,16 @@ Use the updated installer or updater to register the recovery trigger on an exis
 The updater temporarily disables the task while replacing files and preserves an explicitly
 disabled task's state after updating.
 
-The Overview's **Force sync** button saves a request on Railway. The next heartbeat wakes the
-connector for a full inventory comparison and a customer scan, without clearing quantity baselines
-or resending unchanged customers. A running inventory cycle finishes first. Offline requests remain
-queued until the connector reconnects; the dashboard reports completion of the inventory scan only
-after acknowledgment. A failed full scan gives regular inventory events a cycle before retrying.
-Individual failed adjustments continue through the existing retry mechanism.
-Connector 1.4.6 or later reports the current inventory stage on each heartbeat. The Overview displays
-an animated bar during the scan and pauses it while the connector is waiting to start or retry.
+With Connector 1.4.9 or later, **Force sync** sets Shopify's Available quantity for each matching
+SKU at the connected location to its POS count. Process pending POS sales first so the count
+reflects them. Matrix products are matched size by size using their exact variant SKUs. The
+dashboard reports how many SKUs were updated, already matched, or skipped, and lists recent
+inventory issues for skipped SKUs. If Shopify inventory changes between the read and the write,
+the connector skips that SKU. Run Force Sync again to compare fresh counts if needed.
+
+The next heartbeat starts the inventory copy and requests a customer scan. A running inventory
+cycle finishes first. The Overview displays an animated bar while the copy runs and pauses it
+while the Windows connector is offline or waiting to retry after a failed scan.
 
 Start or pause the task (disable recovery before stopping for maintenance):
 

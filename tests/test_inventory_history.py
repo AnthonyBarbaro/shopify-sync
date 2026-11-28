@@ -90,13 +90,18 @@ class InventoryHistoryTests(unittest.TestCase):
         self.assertIsNone(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['progress_stage'])
         self.store.record_connector_sync_progress(shop_domain='one.myshopify.com', request_id=first['request_id'], stage='reading_shopify')
         self.assertEqual(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['progress_stage'], 'reading_shopify')
+        counts = {'updated': 2, 'already_matched': 3, 'skipped': 1}
+        self.assertTrue(self.store.complete_connector_sync(
+            shop_domain='one.myshopify.com', request_id=first['request_id'], result=counts,
+        ))
         self.assertTrue(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
-        self.assertTrue(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
+        self.assertEqual(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['result'], counts)
         self.store.record_connector_sync_progress(shop_domain='one.myshopify.com', request_id=first['request_id'], stage='retrying')
         self.assertEqual(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['progress_stage'], 'reading_shopify')
         newer = self.store.request_connector_sync(shop_domain='one.myshopify.com')
         self.assertNotEqual(newer['request_id'], first['request_id'])
         self.assertIsNone(newer['progress_stage'])
+        self.assertIsNone(newer['result'])
         self.assertFalse(self.store.complete_connector_sync(shop_domain='one.myshopify.com', request_id=first['request_id']))
         self.assertIsNone(self.store.get_connector_sync_request(shop_domain='one.myshopify.com')['completed_at'])
         self.store.mark_shop_uninstalled('one.myshopify.com')

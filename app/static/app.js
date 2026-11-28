@@ -588,7 +588,7 @@ function renderOverview() {
         </div>
         <div class="welcome-actions">
           ${statusBadge(bridgeActive ? "Connected" : "No check-in", bridgeActive ? "success" : "danger", true)}
-          <button class="button" type="button" data-force-sync ${state.forcing || forcePending ? "disabled" : ""}>
+          <button class="button" type="button" aria-describedby="force-sync-description" data-force-sync ${state.forcing || forcePending ? "disabled" : ""}>
             ${icon("refresh", state.forcing ? "is-spinning" : "")} ${state.forcing ? "Requesting…" : "Force sync"}
           </button>
           <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>
@@ -599,6 +599,7 @@ function renderOverview() {
       </div>
 
       ${state.error ? `<div class="notice danger">Status could not be loaded. ${escapeHtml(state.error.message)}</div>` : ""}
+      <p id="force-sync-description">Force Sync copies POS counts to Shopify’s Available inventory. Process pending POS sales before running it.</p>
       ${renderForceSyncStatus(forceRequest, bridgeActive, !state.error)}
       ${setupNeeded ? `<div class="notice warning"><strong>Order access needs approval.</strong> Reopen or reinstall the Shopify app once so Shopify can approve the read_orders permission.</div>` : ""}
       ${customers.enabled && customers.authorized === false ? `<div class="notice warning"><strong>Customer access needs approval.</strong> Add read_customers and write_customers to APP_SCOPES and reopen the Shopify install flow to grant access.</div>` : ""}
@@ -698,13 +699,18 @@ function renderOverview() {
 function renderForceSyncStatus(request, connectorActive, statusAvailable) {
   if (!request.request_id) return ""
   if (request.completed_at) {
-    return `<div class="notice neutral" role="status">Last forced inventory scan finished ${escapeHtml(relativeTime(request.completed_at))}. Failed adjustments continue to retry.</div>`
+    const counts = request.result
+    return `<div class="notice ${counts?.skipped ? "warning" : "neutral"}" role="status">
+      Last forced inventory scan finished ${escapeHtml(relativeTime(request.completed_at))}.
+      ${counts ? `${number(counts.updated).toLocaleString()} updated, ${number(counts.already_matched).toLocaleString()} already matched, ${number(counts.skipped).toLocaleString()} skipped.
+        ${counts.skipped ? "See recent inventory issues below for details." : ""}` : ""}
+    </div>`
   }
 
   const activeStages = {
     reading_pos: "Reading inventory from the POS…",
     reading_shopify: "Reading inventory from Shopify…",
-    reconciling: "Reconciling inventory quantities…",
+    reconciling: "Matching Shopify quantities to the POS…",
   }
   const stage = statusAvailable && connectorActive ? activeStages[request.progress_stage] : null
   const message = !statusAvailable ? "Waiting for a fresh status from the app."
@@ -1167,6 +1173,8 @@ function renderInventoryIssueList(items) {
   const codes = {
     sku_not_found: "SKU not found",
     duplicate_shopify_sku: "Duplicate SKU",
+    shopify_quantity_changed: "Shopify inventory changed during Force Sync",
+    pos_quantity_source_changed: "POS files changed during the inventory read",
     pos_quantity_changed: "POS quantity changed before the write",
     pos_row_missing: "POS quantity row missing",
     ConnectionError: "Connection interrupted",

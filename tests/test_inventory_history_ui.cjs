@@ -110,6 +110,16 @@ test('force sync bar animates only during a reported stage', () => {
   assert.doesNotMatch(retry, /role="progressbar"/)
 })
 
+test('force sync displays confirmed matches and separately counts skipped SKUs', () => {
+  const html = context.renderForceSyncStatus({
+    request_id: 'request1', completed_at: '2026-11-17T12:00:00Z',
+    result: { updated: 1, already_matched: 2, skipped: 3 },
+  }, true, true)
+  assert.match(html, /1 updated, 2 already matched, 3 skipped/)
+  assert.match(html, /notice warning/)
+  assert.match(html, /See recent inventory issues/)
+})
+
 test('overview shows the affected inventory SKU, the reason and the observed quantities', () => {
   vm.runInContext(`state.bridge = { inventory: { issues: [{
     sku: '22270. 1 4', reason: 'pos_writeback_preview', pos_quantity: 2, shopify_quantity: 0, target_quantity: 0,

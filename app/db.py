@@ -458,6 +458,7 @@ class DatabaseStore:
             self._ensure_column(connection, "connector_heartbeats", "last_customer_poll_at", "TEXT")
             self._ensure_column(connection, "connector_heartbeats", "connector_settings", "TEXT")
             self._ensure_column(connection, "connector_sync_requests", "progress_stage", "TEXT")
+            self._ensure_column(connection, "connector_sync_requests", "result", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "product_title", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "variant_title", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "details_checked_at", "TEXT")
@@ -1711,7 +1712,7 @@ class DatabaseStore:
             ).fetchall()
         return [json.loads(row["issue"]) for row in rows]
 
-    def request_connector_sync(self, *, shop_domain: str) -> dict[str, Optional[str]]:
+    def request_connector_sync(self, *, shop_domain: str) -> dict[str, Any]:
         with self._connect() as connection:
             connection.execute(
                 """
@@ -1719,7 +1720,7 @@ class DatabaseStore:
                 VALUES (?, ?, ?)
                 ON CONFLICT(shop_domain) DO UPDATE SET
                     request_id=excluded.request_id, requested_at=excluded.requested_at,
-                    completed_at=NULL, progress_stage=NULL
+                    completed_at=NULL, progress_stage=NULL, result=NULL
                 WHERE connector_sync_requests.completed_at IS NOT NULL
                 """,
                 (shop_domain, secrets.token_hex(16), utc_now_iso()),
@@ -1727,16 +1728,18 @@ class DatabaseStore:
             connection.commit()
         return self.get_connector_sync_request(shop_domain=shop_domain)
 
-    def get_connector_sync_request(self, *, shop_domain: str) -> dict[str, Optional[str]]:
+    def get_connector_sync_request(self, *, shop_domain: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT request_id, requested_at, completed_at, progress_stage "
+                "SELECT request_id, requested_at, completed_at, progress_stage, result "
                 "FROM connector_sync_requests WHERE shop_domain = ?",
                 (shop_domain,),
             ).fetchone()
-        return dict(row) if row else {
-            "request_id": None, "requested_at": None, "completed_at": None, "progress_stage": None,
-        }
+        if row:
+            values = dict(row)
+            values["result"] = json.loads(row["result"]) if row["result"] else None
+            return values
+        return {field: None for field in ("request_id", "requested_at", "completed_at", "progress_stage", "result")}
 
     def record_connector_sync_progress(self, *, shop_domain: str, request_id: str, stage: str) -> None:
         with self._connect() as connection:
@@ -1747,12 +1750,15 @@ class DatabaseStore:
             )
             connection.commit()
 
-    def complete_connector_sync(self, *, shop_domain: str, request_id: str) -> bool:
+    def complete_connector_sync(
+        self, *, shop_domain: str, request_id: str, result: Optional[dict[str, int]] = None,
+    ) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE connector_sync_requests SET completed_at = COALESCE(completed_at, ?) "
+                "UPDATE connector_sync_requests SET completed_at = COALESCE(completed_at, ?), "
+                "result = CASE WHEN completed_at IS NULL THEN ? ELSE result END "
                 "WHERE shop_domain = ? AND request_id = ?",
-                (utc_now_iso(), shop_domain, request_id),
+                (utc_now_iso(), json.dumps(result) if result is not None else None, shop_domain, request_id),
             )
             connection.commit()
         return cursor.rowcount == 1

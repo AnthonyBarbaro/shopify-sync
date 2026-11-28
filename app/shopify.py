@@ -1633,13 +1633,14 @@ class ShopifyClient:
         *,
         change_from_quantity: Optional[int] = None,
         sku: Optional[str] = None,
-    ) -> None:
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         normalized_inventory_item_id = normalize_gid("InventoryItem", inventory_item_id)
         normalized_location_id = normalize_gid("Location", location_id)
         inventory_input = {
             "name": "available",
             "reason": "correction",
-            "referenceDocumentUri": f"gid://inventory-sync-shopify/SyncJob/{uuid.uuid4()}",
+            "referenceDocumentUri": f"gid://inventory-sync-shopify/SyncJob/{idempotency_key or uuid.uuid4()}",
             "quantities": [
                 {
                     "inventoryItemId": normalized_inventory_item_id,
@@ -1655,7 +1656,8 @@ class ShopifyClient:
               inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
                 inventoryAdjustmentGroup {
                   id
-                  reason
+                  createdAt
+                  changes { name quantityAfterChange }
                 }
                 userErrors {
                   code
@@ -1668,7 +1670,7 @@ class ShopifyClient:
             inventory_input["quantities"][0]["changeFromQuantity"] = change_from_quantity
             variables = {
                 "input": inventory_input,
-                "idempotencyKey": str(uuid.uuid4()),
+                "idempotencyKey": idempotency_key or str(uuid.uuid4()),
             }
         else:
             mutation = """
@@ -1676,7 +1678,8 @@ class ShopifyClient:
               inventorySetQuantities(input: $input) {
                 inventoryAdjustmentGroup {
                   id
-                  reason
+                  createdAt
+                  changes { name quantityAfterChange }
                 }
                 userErrors {
                   code
@@ -1711,6 +1714,15 @@ class ShopifyClient:
                     "user_errors": user_errors,
                 },
             )
+        adjustment = result.get("inventoryAdjustmentGroup") or {}
+        return {
+            "quantity_after_change": next(
+                (change.get("quantityAfterChange") for change in adjustment.get("changes") or []
+                 if change.get("name") == "available"),
+                None,
+            ),
+            "updated_at": adjustment.get("createdAt"),
+        }
 
     def adjust_inventory(
         self,

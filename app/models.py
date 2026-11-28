@@ -88,6 +88,12 @@ class ConnectorSyncProgress(BaseModel):
     stage: Literal["reading_pos", "reading_shopify", "reconciling", "retrying"]
 
 
+class ConnectorSyncResult(BaseModel):
+    updated: int = Field(ge=0)
+    already_matched: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+
+
 class ConnectorInventoryIssue(BaseModel):
     sku: str | None = Field(default=None, min_length=1, max_length=160)
     reason: Literal[

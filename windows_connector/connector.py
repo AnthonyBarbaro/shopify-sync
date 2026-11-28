@@ -9,7 +9,6 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import sys
 import time
 from collections import Counter
@@ -52,7 +51,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.8"
+CONNECTOR_VERSION = "1.4.9"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -96,7 +95,7 @@ def sync_failure_summary(error: Exception, *, include_detail: bool = True) -> tu
         return level, f"http_status={status}"
     if isinstance(error, requests.exceptions.SSLError):
         return logging.ERROR, "reason=tls_error"
-    if isinstance(error, (requests.Timeout, subprocess.TimeoutExpired)):
+    if isinstance(error, requests.Timeout):
         return logging.WARNING, "reason=timeout"
     if isinstance(error, requests.ConnectionError):
         return logging.WARNING, "reason=connection_interrupted"
@@ -257,9 +256,6 @@ class Connector:
         self.order_retention_rows = env_int("ORDER_DB_RETENTION_ROWS", 250, minimum=100, maximum=500)
         self.order_dbfs_initialized = False
         self.order_bridge_status_checked = False
-        self.writeback_mode = (os.getenv("POS_WRITEBACK_MODE") or "disabled").strip().lower()
-        if self.writeback_mode not in {"disabled", "dry-run", "vfp-oledb"}:
-            raise ValueError("POS_WRITEBACK_MODE must be disabled, dry-run, or vfp-oledb")
         self.dry_run = dry_run
 
         data_dir = Path(os.getenv("CONNECTOR_DATA_DIR") or (CONNECTOR_DIR / "data")).expanduser().resolve()
@@ -267,9 +263,6 @@ class Connector:
         self.state_path = data_dir / "state.json"
         self.customer_state_path = data_dir / "customers.json"
         self.log_path = data_dir / "connector.log"
-        self.writer_script = Path(
-            os.getenv("POS_WRITEBACK_SCRIPT") or (CONNECTOR_DIR / "write_pos_quantity.ps1")
-        ).expanduser().resolve()
         self.logger = configure_logging(
             self.log_path,
             max_bytes=env_int("CONNECTOR_LOG_MAX_BYTES", 5 * 1024 * 1024, minimum=100000, maximum=50000000),
@@ -335,11 +328,10 @@ class Connector:
 
     def run_forever(self, *, once: bool = False) -> int:
         self.logger.info(
-            "connector_started version=%s dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
+            "connector_started version=%s dbf_dir=%s interval=%ss inventory=pos-to-shopify price_sync=%s dry_run=%s",
             CONNECTOR_VERSION,
             self.dbf_dir,
             self.interval_seconds,
-            self.writeback_mode,
             self.price_sync_enabled,
             self.dry_run,
         )
@@ -357,6 +349,7 @@ class Connector:
                 worker.start()
         try:
             deferred_force_request_id = None
+            force_result = None
             while True:
                 self._sync_wakeup.clear()
                 started = time.monotonic()
@@ -374,8 +367,10 @@ class Connector:
                 deferred_force_request_id = None
                 try:
                     if force_scan:
-                        self.run_cycle(force_full=True, sync_request_id=request_id)
-                        self._complete_sync_request(request_id)
+                        if force_result is None or force_result[0] != request_id:
+                            force_result = (request_id, self._force_inventory_sync(request_id))
+                        if not self.dry_run:
+                            self._complete_sync_request(request_id, force_result[1])
                     else:
                         self.run_cycle(scheduled=not once)
                 except Exception as exc:
@@ -439,6 +434,10 @@ class Connector:
                     self._sync_progress_stage = None
                     self._sync_wakeup.set()
                     self._customer_wakeup.set()
+        elif "sync_request_id" in result and request_id is None:
+            with self._sync_request_lock:
+                self._sync_request_id = None
+                self._sync_progress_stage = None
         self._flush_updater_reports(session)
 
     def _flush_updater_reports(self, session: requests.Session) -> None:
@@ -469,9 +468,9 @@ class Connector:
                 self.logger.warning("updater_report_delivery_pending")
                 break
 
-    def _complete_sync_request(self, request_id: str) -> None:
+    def _complete_sync_request(self, request_id: str, result: Dict[str, int]) -> None:
         response = self.session.post(
-            f"{self.base_url}/sync/requests/{request_id}/ack", timeout=30,
+            f"{self.base_url}/sync/requests/{request_id}/ack", json=result, timeout=30,
         )
         response.raise_for_status()
         if response.json().get("completed") is True:
@@ -679,11 +678,159 @@ class Connector:
         if failure_reasons:
             self.logger.warning("customer_sync_failures %s", dict(failure_reasons))
 
-    def run_cycle(
-        self, *, force_full: bool = False, scheduled: bool = False, sync_request_id: Optional[str] = None,
-    ) -> None:
-        if sync_request_id:
-            self._set_sync_progress(sync_request_id, "reading_pos")
+    def _force_inventory_sync(self, request_id: str) -> Dict[str, int]:
+        self._set_sync_progress(request_id, "reading_pos")
+        state = load_state(self.state_path)
+        try:
+            products, _ = dbf_pos_sync.load_products(self._reader_args())
+        except (OSError, ValueError) as exc:
+            self._record_inventory_issue(None, "pos_row_unavailable", code=inventory_failure_code(exc))
+            raise
+        payloads = [product.payload for product in products]
+        sku_bases = sku_base_mapping(payloads)
+        changes = self._fetch_inventory_changes()
+        self._set_sync_progress(request_id, "reading_shopify")
+        try:
+            snapshot = self._fetch_inventory_snapshot()
+        except Exception as exc:
+            self._record_inventory_issue(None, "shopify_snapshot_unavailable", code=inventory_failure_code(exc))
+            raise
+        location_id = snapshot["location_id"]
+        if state.get("inventory_location_id") not in (None, "", location_id):
+            raise RuntimeError("Shopify inventory location changed; review SHOPIFY_LOCATION_ID before Force Sync.")
+        self._set_sync_progress(request_id, "reconciling")
+        # A paginated Shopify scan can take minutes. Read the actual quantity
+        # rows again so the copy uses fresh POS stock and excludes missing cells.
+        source_stamp = self._pos_quantity_source_stamp()
+        try:
+            quantities = read_targeted_pos_quantities(
+                self.dbf_dir, set(sku_bases.values()), sku_bases=sku_bases, include_missing_matrix_rows=False,
+            )
+        except (OSError, ValueError) as exc:
+            self._record_inventory_issue(None, "pos_row_unavailable", code=inventory_failure_code(exc))
+            raise
+        if not source_stamp or source_stamp != self._pos_quantity_source_stamp():
+            self._record_inventory_issue(None, "pos_row_unavailable", code="pos_quantity_source_changed")
+            raise RuntimeError("POS quantity files changed during the Force Sync read.")
+        summary = {"updated": 0, "already_matched": 0, "skipped": 0}
+        entries = state["quantities"]
+        known_products = set(state.get("catalog_products") or [])
+        protected = pending_matrix_structure_skus(state)
+        remote = {item["sku"]: item for item in snapshot["items"]}
+        duplicate_skus = {sku for sku, count in Counter(item["sku"] for item in snapshot["items"]).items() if count > 1}
+        confirmed: set[str] = set()
+        actions: List[Dict[str, Any]] = []
+
+        def skip(sku: str, reason: str, item: Dict[str, Any], *, code: Any = None) -> None:
+            summary["skipped"] += 1
+            self._record_inventory_issue(
+                sku, reason, pos_quantity=quantities.get(sku), shopify_quantity=item.get("quantity"),
+                target_quantity=quantities.get(sku), code=code,
+            )
+
+        for sku in flatten_quantities(payloads):
+            base = sku_bases[sku]
+            item = remote.get(sku)
+            if item is None:
+                if base in known_products:
+                    skip(sku, "shopify_sku_missing", {})
+                continue
+            if sku not in quantities:
+                skip(sku, "pos_row_unavailable", item)
+                continue
+            if sku in duplicate_skus or item.get("duplicate_sku_count"):
+                skip(sku, "shopify_duplicate_sku", item)
+                continue
+            if sku in protected:
+                skip(sku, "matrix_structure_unverified", item)
+                continue
+            if not (
+                item.get("available_at_location") and type(item.get("quantity")) is int
+                and item.get("inventory_item_id") and item.get("location_id") == location_id
+            ):
+                skip(sku, "shopify_location_unavailable", item)
+                continue
+            before = item["quantity"]
+            target = quantities[sku]
+            entry = entries.get(sku) or {}
+            observed_at = str(item.get("inventory_level_updated_at") or "")
+            previous_at = str(entry.get("shop_seen_at") or "")
+            if inventory_observation_is_older(observed_at, previous_at):
+                if before != entry.get("shop_seen"):
+                    skip(sku, "shopify_quantity_conflict", item)
+                    continue
+                observed_at = previous_at
+            # A forced copy supersedes old queued writes. Use the actual read
+            # as the baseline while any unconfirmed copy is being handled.
+            entry.update(canonical=before, pos_seen=target, shop_seen=before, shop_seen_at=observed_at)
+            entry.pop("pending_shop", None)
+            entries[sku] = entry
+            if before == target:
+                summary["already_matched"] += 1
+                confirmed.add(sku)
+                continue
+            revision = int(entry.get("revision") or 0) + 1
+            entry["revision"] = revision
+            actions.append({
+                "sku": sku, "expected_quantity": before, "target_quantity": target,
+                "location_id": location_id, "inventory_item_id": item["inventory_item_id"],
+                "idempotency_key": adjustment_key(f"force:{request_id}", sku, revision, before, target),
+            })
+        if self.dry_run:
+            self.logger.info("force_inventory_dry_run changes=%s", len(actions))
+            summary["skipped"] += len(actions)
+            return summary
+        state["sku_bases"].update(sku_bases)
+        state["inventory_location_id"] = location_id
+        save_state(self.state_path, state)
+        endpoint = f"{self.base_url}/sync/inventory/adjustments"
+        for chunk in chunks(actions, min(self.batch_size, 25)):
+            try:
+                response = self.session.post(endpoint, json={"mode": "set", "adjustments": chunk}, timeout=self.timeout)
+                response.raise_for_status()
+                body = response.json()
+                if body.get("mode") != "set":
+                    raise RuntimeError("The backend has not confirmed support for absolute inventory updates.")
+                results = body.get("results")
+            except Exception as exc:
+                for action in chunk:
+                    self._record_adjustment_issue(entries, action, "shopify_adjustment_unconfirmed", code=inventory_failure_code(exc))
+                raise
+            for index, action in enumerate(chunk):
+                sku = action["sku"]
+                result = adjustment_result_for_sku(results, index, sku)
+                target = action["target_quantity"]
+                if result is None or result.get("sku") != sku:
+                    skip(sku, "shopify_adjustment_unconfirmed", remote[sku])
+                elif result.get("success") is not True:
+                    skip(sku, "shopify_adjustment_rejected", remote[sku], code=result.get("code"))
+                elif result.get("quantity_after_change") != target:
+                    skip(sku, "shopify_quantity_unconfirmed", remote[sku])
+                else:
+                    entry = entries[sku]
+                    entry.update(canonical=target, shop_seen=target)
+                    if result.get("inventory_updated_at"):
+                        entry["shop_seen_at"] = result["inventory_updated_at"]
+                    summary["updated" if result.get("delta") else "already_matched"] += 1
+                    confirmed.add(sku)
+            save_state(self.state_path, state)
+        processed_changes = [
+            change for change in changes
+            if (sku := change.get("sku")) in confirmed and change.get("location_id") == location_id
+            and change.get("inventory_item_id") == remote[sku]["inventory_item_id"]
+            and not inventory_observation_is_newer(
+                str(change.get("source_updated_at") or ""), entries[sku]["shop_seen_at"],
+            )
+        ]
+        if processed_changes:
+            self._acknowledge_inventory_changes(processed_changes)
+        self.logger.info(
+            "force_inventory_complete updated=%s already_matched=%s skipped=%s",
+            summary["updated"], summary["already_matched"], summary["skipped"],
+        )
+        return summary
+
+    def run_cycle(self, *, force_full: bool = False, scheduled: bool = False) -> None:
         state = load_state(self.state_path)
         now = datetime.now()
         now_epoch = int(time.time())
@@ -1041,8 +1188,6 @@ class Connector:
             and bool(state.get("catalog_complete"))
         ):
             versions_before_snapshot = {(change["id"], change["version"]) for change in inventory_changes}
-            if sync_request_id:
-                self._set_sync_progress(sync_request_id, "reading_shopify")
             try:
                 inventory_snapshot = self._fetch_inventory_snapshot()
             except Exception as exc:
@@ -1055,8 +1200,6 @@ class Connector:
             # observation must take precedence over an older snapshot row.
             inventory_changes = self._fetch_inventory_changes()
 
-        if sync_request_id:
-            self._set_sync_progress(sync_request_id, "reconciling")
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
         remote_quantities = (
             {}
@@ -1289,7 +1432,6 @@ class Connector:
             initialized += 1
 
         planned_shop: List[Dict[str, Any]] = []
-        planned_pos: List[Dict[str, Any]] = []
         # Check a fresh POS event once more on the next cycle in case its stock
         # row was still being written when the receipt became visible.
         deferred_pos_event_skus = set(new_event_skus) if scheduled else set()
@@ -1300,7 +1442,7 @@ class Connector:
                 # this post-mutation snapshot as the new baseline and let queued
                 # versioned webhooks (or the next snapshot) carry any racing sale.
                 continue
-            if entry.get("pending_shop") or entry.get("pending_pos"):
+            if entry.get("pending_shop"):
                 deferred_webhook_skus.add(sku)
                 base = sku_bases.get(sku, base_sku(sku))
                 if base in event_skus:
@@ -1320,9 +1462,8 @@ class Connector:
             if remote_updated_at.get(sku):
                 entry["shop_seen_at"] = remote_updated_at[sku]
             shop_adjustment = plan["shop_adjustment"]
-            pos_adjustment = plan["pos_adjustment"]
             revision = int(entry.get("revision") or 0)
-            if shop_adjustment or pos_adjustment:
+            if shop_adjustment:
                 revision += 1
                 entry["revision"] = revision
 
@@ -1337,26 +1478,11 @@ class Connector:
                 }
                 entry["pending_shop"] = action
                 planned_shop.append(action)
-            if pos_adjustment:
-                action = {
-                    "sku": sku,
-                    "delta": pos_adjustment,
-                    "target_quantity": target,
-                    "expected_quantity": pos_quantity,
-                    "idempotency_key": adjustment_key(
-                        "pos", sku, revision, previous_pos, pos_quantity, previous_shop, shop_quantity, target
-                    ),
-                }
-                if self.writeback_mode == "vfp-oledb":
-                    entry["pending_pos"] = action
-                planned_pos.append(action)
-
         if self.dry_run:
             self.logger.info(
-                "reconcile_dry_run initialized=%s shopify_adjustments=%s pos_adjustments=%s",
+                "reconcile_dry_run initialized=%s shopify_adjustments=%s",
                 initialized,
                 len(planned_shop),
-                len(planned_pos),
             )
             return
 
@@ -1395,31 +1521,8 @@ class Connector:
         if completed_quantity_scan_stamp is not None:
             state["pos_quantity_source_stamp"] = completed_quantity_scan_stamp
         save_state(self.state_path, state)
-        blocked_pos_skus: set[str] = set()
         if planned_shop:
-            blocked_pos_skus = self._apply_shopify_adjustments(state, planned_shop) or set()
-        if planned_pos or planned_shop:
-            if self.writeback_mode == "vfp-oledb":
-                pos_candidate_skus = {
-                    action["sku"]
-                    for action in [*planned_pos, *planned_shop]
-                }
-                current_pos_actions = [
-                    state["quantities"][sku]["pending_pos"]
-                    for sku in sorted(pos_candidate_skus, key=str.casefold)
-                    if sku not in blocked_pos_skus
-                    and (state["quantities"].get(sku) or {}).get("pending_pos")
-                ]
-                if current_pos_actions:
-                    self._apply_pos_adjustments(state, current_pos_actions)
-            elif planned_pos:
-                reason = "pos_writeback_preview" if self.writeback_mode == "dry-run" else "pos_writeback_disabled"
-                for action in planned_pos:
-                    sku = action["sku"]
-                    self._record_inventory_issue(
-                        sku, reason, pos_quantity=local_quantities[sku],
-                        shopify_quantity=entries[sku].get("shop_seen"), target_quantity=action["target_quantity"],
-                    )
+            self._apply_shopify_adjustments(state, planned_shop)
         if inventory_snapshot is not None and status_reconcile_due:
             if self._reconcile_zero_stock_product_statuses(
                 state,
@@ -1446,12 +1549,11 @@ class Connector:
                     len(inventory_changes) - len(processed_changes),
                 )
         self.logger.info(
-            "connector_cycle_complete mode=%s initialized=%s webhook_changes=%s shopify_adjustments=%s pos_adjustments=%s",
+            "connector_cycle_complete mode=%s initialized=%s webhook_changes=%s shopify_adjustments=%s",
             read_mode,
             initialized,
             len(inventory_changes),
             len(planned_shop),
-            len(planned_pos),
         )
         if scheduled_maintenance and inventory_snapshot is not None and not verification_skus:
             self._automatic_inventory_retry_at = 0.0
@@ -1486,7 +1588,7 @@ class Connector:
         pending_bases = {
             sku_bases.get(sku, base_sku(sku))
             for sku, entry in entries.items()
-            if entry.get("pending_shop") or entry.get("pending_pos")
+            if entry.get("pending_shop")
         }
         product_skus: Dict[str, List[str]] = {}
         for sku in local_quantities:
@@ -2394,23 +2496,17 @@ class Connector:
         remote_quantities: Dict[str, int],
     ) -> None:
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
-        local_quantities = flatten_quantities([payload])
         cleared: List[str] = []
         for sku in matrix_variant_skus(payload):
             entry = entries.get(sku)
             if not isinstance(entry, dict):
                 continue
             pending_shop = entry.pop("pending_shop", None)
-            pending_pos = entry.pop("pending_pos", None)
             if isinstance(pending_shop, dict):
                 target = pending_shop.get("target_quantity")
                 if target is not None and remote_quantities.get(sku) == int(target):
                     entry["shop_seen"] = int(target)
-            if isinstance(pending_pos, dict):
-                target = pending_pos.get("target_quantity")
-                if target is not None and local_quantities.get(sku) == int(target):
-                    entry["pos_seen"] = int(target)
-            if pending_shop is not None or pending_pos is not None:
+            if pending_shop is not None:
                 cleared.append(sku)
         if cleared:
             self.logger.warning(
@@ -2663,26 +2759,14 @@ class Connector:
         if shop_actions:
             self.logger.warning("retrying_pending_shopify_adjustments count=%s", len(shop_actions))
             self._apply_shopify_adjustments(state, shop_actions)
-        pos_actions = [
-            entry["pending_pos"]
-            for sku, entry in entries.items()
-            if sku not in excluded
-            and str((entry.get("pending_pos") or {}).get("sku") or "").strip()
-            not in excluded
-            and entry.get("pending_pos")
-        ]
-        if pos_actions and self.writeback_mode == "vfp-oledb":
-            self.logger.warning("retrying_pending_pos_adjustments count=%s", len(pos_actions))
-            self._apply_pos_adjustments(state, pos_actions)
 
     def _apply_shopify_adjustments(
         self,
         state: Dict[str, Any],
         actions: List[Dict[str, Any]],
-    ) -> set[str]:
+    ) -> None:
         endpoint = f"{self.base_url}/sync/inventory/adjustments"
         entries = state["quantities"]
-        blocked_pos_skus = {str(action["sku"]) for action in actions}
         for chunk in chunks(actions, min(self.batch_size, 250)):
             try:
                 response = self.session.post(endpoint, json={"adjustments": chunk}, timeout=self.timeout)
@@ -2711,50 +2795,12 @@ class Connector:
                 if quantity_after_change is None:
                     self._record_adjustment_issue(entries, action, "shopify_quantity_unconfirmed")
                     entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
-                    entry.pop("pending_pos", None)
                 else:
                     actual_quantity = int(quantity_after_change)
                     entry["shop_seen"] = actual_quantity
                     entry["canonical"] = actual_quantity
-                    target_quantity = action.get("target_quantity")
-                    if (
-                        target_quantity is not None
-                        and actual_quantity != int(target_quantity)
-                    ):
-                        entry.pop("pending_pos", None)
-                        pos_quantity = int(entry.get("pos_seen") or 0)
-                        if (
-                            getattr(self, "writeback_mode", "disabled") == "vfp-oledb"
-                            and pos_quantity != actual_quantity
-                        ):
-                            revision = int(entry.get("revision") or 0) + 1
-                            entry["revision"] = revision
-                            entry["pending_pos"] = {
-                                "sku": action["sku"],
-                                "delta": actual_quantity - pos_quantity,
-                                "target_quantity": actual_quantity,
-                                "expected_quantity": pos_quantity,
-                                "idempotency_key": adjustment_key(
-                                    "pos",
-                                    action["sku"],
-                                    revision,
-                                    pos_quantity,
-                                    actual_quantity,
-                                    int(target_quantity),
-                                ),
-                            }
-                        blocked_pos_skus.discard(action["sku"])
-                        self.logger.warning(
-                            "pos_adjustment_replanned_after_shopify_race sku=%s planned=%s actual=%s",
-                            action["sku"],
-                            target_quantity,
-                            actual_quantity,
-                        )
-                    elif target_quantity is not None:
-                        blocked_pos_skus.discard(action["sku"])
                 entry.pop("pending_shop", None)
             save_state(self.state_path, state)
-        return blocked_pos_skus
 
     def _record_adjustment_issue(
         self, entries: Dict[str, Any], action: Dict[str, Any], reason: str, *, code: Any = None, detail: Any = None,
@@ -2765,64 +2811,6 @@ class Connector:
             sku, reason, pos_quantity=entry.get("pos_seen"), shopify_quantity=entry.get("shop_seen"),
             target_quantity=action.get("target_quantity"), code=code, detail=detail,
         )
-
-    def _run_pos_writer(self, actions: List[Dict[str, Any]]) -> Any:
-        if not self.writer_script.exists():
-            raise FileNotFoundError(f"POS write-back script not found: {self.writer_script}")
-        powershell = find_powershell()
-        process = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(self.writer_script),
-                "-DbfDirectory",
-                str(self.dbf_dir),
-                "-AdjustmentsJson",
-                json.dumps(actions, separators=(",", ":")),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-        )
-        if process.returncode != 0:
-            raise RuntimeError(f"POS write-back failed: {(process.stderr or process.stdout).strip()}")
-        results = json.loads(process.stdout or "[]")
-        if isinstance(results, dict):
-            # PowerShell's JSON pipeline emits a single object for one SKU.
-            results = [results]
-        return results
-
-    def _apply_pos_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
-        entries = state["quantities"]
-        try:
-            results = self._run_pos_writer(actions)
-        except Exception as exc:
-            for action in actions:
-                self._record_adjustment_issue(entries, action, "pos_adjustment_unconfirmed", code=inventory_failure_code(exc))
-            raise
-        for index, action in enumerate(actions):
-            result = adjustment_result_for_sku(results, index, action["sku"])
-            if result is None:
-                self._record_adjustment_issue(entries, action, "pos_adjustment_unconfirmed")
-                continue
-            if not result.get("success"):
-                message = str(result.get("message") or "")
-                code = None
-                if message.startswith("POS quantity changed concurrently"):
-                    code = "pos_quantity_changed"
-                elif message.startswith("No POS quantity row found"):
-                    code = "pos_row_missing"
-                self._record_adjustment_issue(entries, action, "pos_adjustment_rejected", code=code, detail=message)
-                continue
-            entry = entries[action["sku"]]
-            entry["pos_seen"] = int(action["expected_quantity"]) + int(action["delta"])
-            entry.pop("pending_pos", None)
-        save_state(self.state_path, state)
 
 
 def base_sku(sku: str) -> str:
@@ -3280,7 +3268,6 @@ def merge_quantity(
         "shop_delta": shop_delta,
         "target": target,
         "shop_adjustment": target - int(shop_quantity),
-        "pos_adjustment": target - int(pos_quantity),
     }
 
 
@@ -3439,6 +3426,9 @@ def load_state(path: Path) -> Dict[str, Any]:
             if isinstance(data, dict) and int(data.get("version") or 0) == STATE_VERSION:
                 data.setdefault("catalog_products", [])
                 data.setdefault("quantities", {})
+                for entry in data["quantities"].values():
+                    if isinstance(entry, dict):
+                        entry.pop("pending_pos", None)
                 data.setdefault("event_cursors", {})
                 data.setdefault("sku_bases", {})
                 data.setdefault("pending_catalog_products", {})
@@ -3490,18 +3480,6 @@ def configure_logging(path: Path, *, max_bytes: int, backup_count: int) -> loggi
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     return logger
-
-
-def find_powershell() -> str:
-    system_root = Path(os.getenv("SystemRoot") or r"C:\Windows")
-    candidates = [
-        system_root / "SysWOW64" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
-        system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return "powershell.exe"
 
 
 def main() -> int:
