@@ -68,6 +68,29 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.addCleanup(configured.session.close)
         self.assertEqual(configured.interval_seconds, 90)
 
+    def test_updater_report_is_retained_until_the_dashboard_accepts_it(self) -> None:
+        reports = self.connector.state_path.parent / "updater-reports"
+        reports.mkdir()
+        spool = reports / "update.json"
+        report = {"run_id": "test-run", "status": "failed", "stage": "download"}
+        spool.write_text(json.dumps(report), encoding="utf-8-sig")
+        self.session.post.side_effect = requests.Timeout()
+        self.connector._flush_updater_reports(self.session)
+        self.assertTrue(spool.exists())
+
+        self.session.post.side_effect = None
+        self.session.post.return_value.json.return_value = {"accepted": False}
+        self.connector._flush_updater_reports(self.session)
+        self.assertTrue(spool.exists())
+
+        self.session.post.return_value.json.return_value = {"accepted": True}
+        self.connector._flush_updater_reports(self.session)
+        self.assertFalse(spool.exists())
+        self.session.post.assert_called_with(
+            "https://sync.example/sync/connector/update-report", json=report, timeout=5,
+            allow_redirects=False,
+        )
+
     def test_customers_import_once_then_only_changed_records_across_restarts(self) -> None:
         self.connector._sync_customers(self.session)
         self.assertEqual(self.session.post.call_count, 1)

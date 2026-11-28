@@ -43,6 +43,7 @@ from app.models import (
     CatalogResponse,
     ConnectionSettingsResponse,
     ConnectorHeartbeatRequest,
+    ConnectorUpdateReport,
     CustomerBulkSyncResponse,
     CustomerSyncRequest,
     CustomerSyncResult,
@@ -226,6 +227,8 @@ async def capture_incoming_request_logs(request: Request, call_next: Callable) -
     body_preview: str | None = None
     if effective_path.rstrip("/") in {"/sync/sales-board", "/sync/sales-reports"} and request_body:
         body_preview = "[sales payload omitted]"
+    elif effective_path.rstrip("/") == "/sync/connector/update-report" and request_body:
+        body_preview = "[updater payload omitted]"
     elif "customer" in effective_path.lower() and request_body:
         body_preview = "[customer payload omitted]"
     elif request.method.upper() in {"POST", "PUT", "PATCH"} and request_body:
@@ -1416,7 +1419,9 @@ async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
 @app.exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     errors = exc.errors()
-    if request.url.path.rstrip("/") in {"/sync/sales-board", "/sync/sales-reports"}:
+    if request.url.path.rstrip("/") in {
+        "/sync/sales-board", "/sync/sales-reports", "/sync/connector/update-report",
+    }:
         errors = [{field: error[field] for field in ("loc", "msg", "type")} for error in errors]
     details = {"errors": errors}
     logger.error("validation_error %s", safe_json_dumps(details))
@@ -1901,6 +1906,7 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
         {
             "shop": shop.shop_domain,
             "force_sync": db.get_connector_sync_request(shop_domain=shop.shop_domain),
+            "connector_updates": db.list_connector_update_reports(shop_domain=shop.shop_domain),
             "connector": {
                 "active": is_active(heartbeat["last_seen_at"]),
                 "last_seen_at": heartbeat["last_seen_at"],
@@ -2963,6 +2969,17 @@ def connector_heartbeat(
         "timestamp": utc_now_iso(),
         "sync_request_id": sync_request["request_id"] if not sync_request["completed_at"] else None,
     })
+
+
+@app.post("/sync/connector/update-report", response_model=None)
+def connector_update_report(
+    payload: ConnectorUpdateReport,
+    shop: ShopRecord = Depends(require_pos_shop),
+) -> JSONResponse:
+    report = payload.model_dump(mode="json", exclude_none=True)
+    report["occurred_at"] = payload.occurred_at.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    db.save_connector_update_report(shop_domain=shop.shop_domain, report=report)
+    return JSONResponse({"accepted": True})
 
 
 @app.post("/api/connector/force-sync", response_model=None)

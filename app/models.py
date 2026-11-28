@@ -1,5 +1,6 @@
 from datetime import date
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat
 
@@ -88,6 +89,19 @@ class ConnectorHeartbeatRequest(BaseModel):
     order_sync_enabled: Optional[bool] = None
     customer_sync_enabled: bool = False
     customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
+
+
+class ConnectorUpdateReport(BaseModel):
+    run_id: UUID
+    occurred_at: AwareDatetime
+    status: Literal["succeeded", "failed"]
+    stage: Literal[
+        "refresh_updater", "preflight", "download", "validate_download", "stop",
+        "install", "validate_install", "configure_task", "start", "complete",
+    ]
+    file: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]{1,80}$")
+    files_updated: int | None = Field(default=None, ge=0, le=100)
+    error_code: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9-]{1,80}$")
 
 
 class SalesBoardProfit(BaseModel):

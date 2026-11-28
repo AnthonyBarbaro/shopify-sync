@@ -288,6 +288,17 @@ class DatabaseStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS connector_update_reports (
+                    shop_domain TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    report TEXT NOT NULL,
+                    PRIMARY KEY(shop_domain, run_id)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS recent_price_changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shop_domain TEXT NOT NULL,
@@ -1621,6 +1632,37 @@ class DatabaseStore:
             "connector_settings": row["connector_settings"],
         }
 
+    def save_connector_update_report(self, *, shop_domain: str, report: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO connector_update_reports (shop_domain, run_id, occurred_at, report)
+                VALUES (?, ?, ?, ?)
+                """,
+                (shop_domain, report["run_id"], report["occurred_at"], json.dumps(report)),
+            )
+            connection.execute(
+                """
+                DELETE FROM connector_update_reports WHERE shop_domain = ? AND run_id IN (
+                    SELECT run_id FROM connector_update_reports WHERE shop_domain = ?
+                    ORDER BY occurred_at DESC, run_id DESC LIMIT -1 OFFSET 30
+                )
+                """,
+                (shop_domain, shop_domain),
+            )
+            connection.commit()
+
+    def list_connector_update_reports(self, *, shop_domain: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT report FROM connector_update_reports WHERE shop_domain = ?
+                ORDER BY occurred_at DESC, run_id DESC LIMIT 10
+                """,
+                (shop_domain,),
+            ).fetchall()
+        return [json.loads(row["report"]) for row in rows]
+
     def request_connector_sync(self, *, shop_domain: str) -> dict[str, Optional[str]]:
         with self._connect() as connection:
             connection.execute(
@@ -1955,6 +1997,7 @@ class DatabaseStore:
                 "DELETE FROM connector_sync_requests WHERE shop_domain = ?",
                 (shop_domain,),
             )
+            connection.execute("DELETE FROM connector_update_reports WHERE shop_domain = ?", (shop_domain,))
             connection.execute("DELETE FROM sales_board_snapshots WHERE shop_domain = ?", (shop_domain,))
             connection.execute("DELETE FROM sales_report_months WHERE shop_domain = ?", (shop_domain,))
             connection.execute("DELETE FROM sales_board_settings WHERE shop_domain = ?", (shop_domain,))

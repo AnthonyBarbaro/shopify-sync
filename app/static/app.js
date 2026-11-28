@@ -639,6 +639,11 @@ function renderOverview() {
         })}
       </div>
 
+      <section class="panel" aria-labelledby="connector-updates-heading">
+        <div class="panel-head"><h2 id="connector-updates-heading">Windows connector updates</h2></div>
+        ${renderConnectorUpdateList(state.bridge?.connector_updates || [])}
+      </section>
+
       <section class="panel" aria-labelledby="inventory-changes-heading">
         <div class="panel-head">
           <div>
@@ -1107,6 +1112,36 @@ function renderInventoryChangeList(items) {
       `).join("")}
     </div>
   `
+}
+
+function renderConnectorUpdateList(items) {
+  if (!items.length) return `<div class="empty"><p>No updater runs received yet.</p></div>`
+  const stages = {
+    refresh_updater: "Download or validate the updater",
+    preflight: "Check the Windows connector installation",
+    download: "Download connector files",
+    validate_download: "Validate downloaded files",
+    stop: "Stop the connector task",
+    install: "Back up or install connector files",
+    validate_install: "Validate the installed connector",
+    configure_task: "Configure the scheduled task",
+    start: "Start the connector task",
+  }
+  return `<div class="order-list compact">
+    ${items.map((report) => {
+      const succeeded = report.status === "succeeded"
+      const detail = succeeded
+        ? `${number(report.files_updated)} runtime files updated`
+        : [stages[report.stage] || "Updater error", report.file, report.error_code].filter(Boolean).join(" · ")
+      return `<article class="order-row">
+        <div class="order-main"><div>
+          <strong>${escapeHtml(detail)}</strong>
+          <small>${escapeHtml(formatDate(report.occurred_at))}</small>
+        </div></div>
+        ${statusBadge(succeeded ? "Succeeded" : "Failed", succeeded ? "success" : "danger")}
+      </article>`
+    }).join("")}
+  </div>`
 }
 
 function renderPriceChangeList(items) {

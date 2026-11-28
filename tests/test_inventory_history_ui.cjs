@@ -91,3 +91,17 @@ test('force sync shows queued work honestly when the connector is unavailable', 
   assert.match(context.renderOverview(), /Force sync\s*<\/button>/)
   assert.match(context.renderOverview(), /data-force-sync\s*>/)
 })
+
+test('overview displays updater successes and failed stages without rendering filename markup', () => {
+  vm.runInContext(`state.bridge = { connector_updates: [
+    { status: 'failed', stage: 'validate_download', file: '<b>connector.py</b>', occurred_at: '2026-11-28T12:00:00Z' },
+    { status: 'succeeded', stage: 'complete', files_updated: 10, occurred_at: '2026-11-27T20:00:00Z' }
+  ] }`, context)
+  const html = context.renderOverview()
+  assert.match(html, /Windows connector updates/)
+  assert.match(html, /Validate downloaded files · &lt;b&gt;connector.py&lt;\/b&gt;/)
+  assert.match(html, /Failed/)
+  assert.match(html, /10 runtime files updated/)
+  assert.match(html, /Succeeded/)
+  assert.doesNotMatch(html, /<b>connector.py/)
+})

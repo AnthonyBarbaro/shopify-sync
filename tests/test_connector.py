@@ -33,6 +33,7 @@ from windows_connector.connector import (
     CATALOG_STRUCTURE_SCHEMA_VERSION,
     INVENTORY_RECONCILE_SCHEMA_VERSION,
     MATRIX_OPTION_SCHEMA_VERSION,
+    MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
     POS_INVENTORY_QUIET_SECONDS,
     Connector,
     adjustment_key,
@@ -870,6 +871,127 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             self.assertEqual(connector._apply_shopify_adjustments.call_args.args[1][0]["delta"], 1)
             self.assertEqual([call.args[1] for call in read.call_args_list], [{"22392"}, {"22392"}, set()])
             self.assertEqual(json.loads(path.read_text())["pos_quantity_source_stamp"], ["new", "matrix"])
+
+    def test_matrix_probe_cooldown_only_starts_after_a_full_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            connector, state = self._scheduled_connector(path)
+            state["matrix_structure_probe_skus"] = ["22392"]
+            save_state(path, state)
+            now = 1800000000
+            connector._collect_pos_event_skus.side_effect = [({"22392"}, False), (set(), False)]
+            module = sys.modules["windows_connector.connector"]
+            products = [SimpleNamespace(payload={"sku": "22392", "quantity": 5})]
+            stats = SimpleNamespace(skipped_non_sellable=0)
+            with (
+                mock.patch.object(module.time, "time", return_value=now) as clock,
+                mock.patch.object(module, "read_targeted_pos_quantities", return_value={"22392": 5}),
+                mock.patch.object(module.dbf_pos_sync, "load_products", return_value=(products, stats)) as load,
+            ):
+                connector.run_cycle(scheduled=True)
+                load.assert_not_called()
+                self.assertEqual(json.loads(path.read_text())["matrix_structure_probe_not_before"], {})
+
+                clock.return_value += POS_INVENTORY_QUIET_SECONDS
+                connector.run_cycle(force_full=True)
+
+            load.assert_called_once()
+            persisted = json.loads(path.read_text())
+            self.assertEqual(persisted["matrix_structure_probe_skus"], [])
+            self.assertEqual(persisted["matrix_structure_probe_not_before"], {
+                "22392": now + POS_INVENTORY_QUIET_SECONDS + MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
+            })
+
+    def test_webhook_for_tracked_sku_stays_queued_until_the_pos_row_can_be_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            connector, state = self._scheduled_connector(path)
+            connector.writeback_mode = "vfp-oledb"
+            save_state(path, state)
+            change = {"id": 1, "version": 1, "sku": "22392", "quantity": 4}
+            connector._fetch_inventory_changes.return_value = [change]
+            module = sys.modules["windows_connector.connector"]
+            with mock.patch.object(
+                module, "read_targeted_pos_quantities", side_effect=[{}, {"22392": 5}],
+            ):
+                connector.run_cycle(scheduled=True)
+                connector._acknowledge_inventory_changes.assert_not_called()
+                connector._apply_pos_adjustments.assert_not_called()
+                connector._collect_new_numeric_product_skus.assert_not_called()
+                connector.run_cycle(scheduled=True)
+
+            connector._collect_new_numeric_product_skus.assert_called_once()
+            connector._acknowledge_inventory_changes.assert_called_once_with([change])
+            self.assertEqual(connector._apply_pos_adjustments.call_args.args[1][0]["target_quantity"], 4)
+
+    def test_equal_timestamp_quantity_conflict_uses_shopify_snapshot(self):
+        for live_quantity in (4, 5):
+            with self.subTest(live_quantity=live_quantity), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                connector, state = self._scheduled_connector(path)
+                observed_at = "2026-11-28T19:53:00Z"
+                state["quantities"]["22392"]["shop_seen_at"] = observed_at
+                connector.writeback_mode = "vfp-oledb"
+                save_state(path, state)
+                change = {
+                    "id": 1, "version": 1, "sku": "22392", "quantity": 4,
+                    "source_updated_at": "2026-11-28T19:53:00+00:00",
+                    "inventory_item_id": "inventory-1", "location_id": "gid://shopify/Location/4",
+                }
+                connector._fetch_inventory_changes.return_value = [change]
+                snapshot_item = connector._fetch_inventory_snapshot.return_value["items"][0]
+                snapshot_item.update(quantity=live_quantity, inventory_item_id="inventory-1",
+                                     inventory_level_updated_at=observed_at)
+                module = sys.modules["windows_connector.connector"]
+                products = [SimpleNamespace(payload={"sku": "22392", "quantity": 5})]
+                stats = SimpleNamespace(skipped_non_sellable=0)
+                with (
+                    mock.patch.object(module, "read_targeted_pos_quantities", return_value={"22392": 5}),
+                    mock.patch.object(module.dbf_pos_sync, "load_products", return_value=(products, stats)),
+                ):
+                    connector.run_cycle(scheduled=True)
+                    connector._fetch_inventory_snapshot.assert_not_called()
+                    connector._acknowledge_inventory_changes.assert_not_called()
+                    connector._apply_pos_adjustments.assert_not_called()
+
+                    connector.run_cycle(scheduled=True)
+
+                connector._fetch_inventory_snapshot.assert_called_once()
+                connector._apply_shopify_adjustments.assert_not_called()
+                persisted = json.loads(path.read_text())
+                self.assertEqual(persisted["inventory_webhook_verification_skus"], [])
+                self.assertEqual(persisted["quantities"]["22392"]["shop_seen"], live_quantity)
+                if live_quantity == 4:
+                    self.assertEqual(connector._apply_pos_adjustments.call_args.args[1][0]["target_quantity"], 4)
+                else:
+                    connector._apply_pos_adjustments.assert_not_called()
+                    connector._acknowledge_inventory_changes.assert_called_once_with([change])
+
+    def test_equal_timestamp_webhook_queued_during_snapshot_defers_its_sku(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            connector, state = self._scheduled_connector(path)
+            save_state(path, state)
+            observed_at = "2026-11-28T19:53:00Z"
+            change = {
+                "id": 1, "version": 2, "sku": "22392", "quantity": 4,
+                "source_updated_at": observed_at, "inventory_item_id": "inventory-1",
+                "location_id": "gid://shopify/Location/4",
+            }
+            connector._fetch_inventory_changes.side_effect = [[{**change, "version": 1}], [change]]
+            snapshot_item = connector._fetch_inventory_snapshot.return_value["items"][0]
+            snapshot_item.update(inventory_item_id="inventory-1", inventory_level_updated_at=observed_at)
+            module = sys.modules["windows_connector.connector"]
+            products = [SimpleNamespace(payload={"sku": "22392", "quantity": 6})]
+            stats = SimpleNamespace(skipped_non_sellable=0)
+            with mock.patch.object(module.dbf_pos_sync, "load_products", return_value=(products, stats)):
+                connector.run_cycle(force_full=True)
+
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._acknowledge_inventory_changes.assert_not_called()
+            persisted = json.loads(path.read_text())
+            self.assertEqual(persisted["inventory_webhook_verification_skus"], ["22392"])
+            self.assertEqual(persisted["quantities"]["22392"]["pos_seen"], 5)
 
     def test_failed_full_scan_does_not_save_pos_event_cursor_without_adjustments(self):
         with tempfile.TemporaryDirectory() as directory:

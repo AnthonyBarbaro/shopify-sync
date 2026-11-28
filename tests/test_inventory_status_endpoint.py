@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import tempfile
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timezone
@@ -134,6 +135,46 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             shop_domain=self.shop.shop_domain, channel="connector",
             metadata={**payload, "customer_sync_interval_seconds": 60},
         )
+
+    async def test_updater_report_is_authenticated_persisted_once_and_returned_to_the_shop(self) -> None:
+        path = "/sync/connector/update-report"
+        report = {
+            "run_id": "fb0045fb-602f-4dd1-bfec-215cae6154b4",
+            "occurred_at": "2026-11-28T19:53:00.1234567Z",
+            "status": "failed", "stage": "download", "file": "connector.py", "error_code": "HTTP-404",
+        }
+        status, _ = await self.post(report, path=path, authenticated=False)
+        self.assertEqual(status, 401)
+        status, _ = await self.post({**report, "file": "C:/private/key"}, path=path)
+        self.assertEqual(status, 422)
+        self.main.db.save_connector_update_report.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatabaseStore(str(Path(directory) / "updater.sqlite3"), "fake-encryption-key")
+            self.main.db.save_connector_update_report.side_effect = store.save_connector_update_report
+            self.main.db.list_connector_update_reports.side_effect = store.list_connector_update_reports
+            self.main.db.get_connector_heartbeat.side_effect = store.get_connector_heartbeat
+            self.main.db.get_connector_sync_request.side_effect = store.get_connector_sync_request
+            for name in ("list_recent_order_summaries", "list_recent_price_changes",
+                         "list_recent_inventory_changes", "list_recent_customer_sync_events"):
+                getattr(self.main.db, name).return_value = []
+            self.main.db.inventory_change_count.return_value = 0
+            self.main.db.order_change_count.return_value = 0
+
+            for _ in range(2):
+                self.assertEqual(await self.post(report, path=path), (200, {"accepted": True}))
+            self.main.db.record_connector_heartbeat.assert_not_called()
+
+            with (
+                mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})),
+                mock.patch.object(self.main, "get_granted_access_scopes", return_value=set()),
+            ):
+                status, dashboard = await self.post(None, path="/api/bridge-status", method="GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(dashboard["connector_updates"], [
+                {**report, "occurred_at": "2026-11-28T19:53:00.123456+00:00"},
+            ])
+            self.assertEqual(store.list_connector_update_reports(shop_domain="other.myshopify.com"), [])
 
     async def test_customer_status_requires_credentials(self) -> None:
         status, _body = await self.post(None, path="/sync/customers/status", method="GET", authenticated=False)

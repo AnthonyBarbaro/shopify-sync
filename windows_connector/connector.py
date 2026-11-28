@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.4"
+CONNECTOR_VERSION = "1.4.5"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -332,6 +332,35 @@ class Connector:
                     self._sync_request_id = request_id
                     self._sync_wakeup.set()
                     self._customer_wakeup.set()
+        self._flush_updater_reports(session)
+
+    def _flush_updater_reports(self, session: requests.Session) -> None:
+        directory = self.state_path.parent / "updater-reports"
+        try:
+            reports = sorted(directory.glob("*.json"))[:3]
+        except OSError:
+            self.logger.warning("updater_report_delivery_pending")
+            return
+        for path in reports:
+            try:
+                report = json.loads(path.read_text(encoding="utf-8-sig"))
+                response = session.post(
+                    f"{self.base_url}/sync/connector/update-report",
+                    json=report,
+                    timeout=5,
+                    allow_redirects=False,
+                )
+                response.raise_for_status()
+                result = response.json()
+                if not isinstance(result, dict) or result.get("accepted") is not True:
+                    raise ValueError("Updater report was not accepted")
+                path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                # The updater may have sent and removed this report concurrently.
+                continue
+            except (OSError, ValueError, requests.RequestException):
+                self.logger.warning("updater_report_delivery_pending")
+                break
 
     def _complete_sync_request(self, request_id: str) -> None:
         response = self.session.post(
@@ -569,12 +598,16 @@ class Connector:
             state["last_pos_inventory_activity_epoch"] = now_epoch
         known_products = set(state.get("catalog_products") or [])
         new_numeric_skus: set[str] = set()
-        shopify_skus = {
-            sku_bases.get(sku, base_sku(sku))
+        verification_skus = set(state.get("inventory_webhook_verification_skus") or [])
+        waiting_for_pos_skus = set(state.get("inventory_webhook_waiting_pos_skus") or [])
+        queued_shopify_skus = {
+            sku
             for change in inventory_changes
             if (sku := str(change.get("sku") or "").strip())
         }
-        prioritize_inventory = scheduled and bool(event_skus or shopify_skus)
+        shopify_skus = {sku_bases.get(sku, base_sku(sku)) for sku in queued_shopify_skus}
+        fresh_shopify_skus = queued_shopify_skus - verification_skus - waiting_for_pos_skus
+        prioritize_inventory = scheduled and bool(event_skus or fresh_shopify_skus)
         if state.get("catalog_complete") and not prioritize_inventory:
             new_numeric_skus = self._collect_new_numeric_product_skus(
                 state,
@@ -620,6 +653,7 @@ class Connector:
             or catalog_incomplete
             or nightly_due
             or bool(state.get("pos_event_reconcile_pending"))
+            or bool(verification_skus)
             or matrix_option_repair_due
             or inventory_reconcile_upgrade_due
             or catalog_structure_upgrade_due
@@ -657,6 +691,8 @@ class Connector:
                 read_mode = "matrix-option-repair"
             elif inventory_reconcile_upgrade_due:
                 read_mode = "inventory-reconcile-upgrade"
+            elif verification_skus:
+                read_mode = "webhook-verification"
             else:
                 read_mode = "nightly"
         elif affected_base_skus:
@@ -710,24 +746,6 @@ class Connector:
             payloads.sort(key=catalog_upload_priority)
 
         payload_by_base = {str(payload["sku"]): payload for payload in payloads}
-        if structure_probe_skus:
-            probe_not_before: Dict[str, int] = state.setdefault(
-                "matrix_structure_probe_not_before",
-                {},
-            )
-            for sku in structure_probe_skus:
-                payload = payload_by_base.get(sku)
-                if payload is not None and payload.get("variants"):
-                    probe_not_before.pop(sku, None)
-                else:
-                    probe_not_before[sku] = (
-                        int(time.time()) + MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS
-                    )
-                    self.logger.info(
-                        "matrix_structure_probe_waiting sku=%s retry_seconds=%s",
-                        sku,
-                        MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
-                    )
         discovered_sku_bases = sku_base_mapping(payloads)
         if full_reconcile:
             state["sku_bases"] = discovered_sku_bases
@@ -753,7 +771,7 @@ class Connector:
                 self.dbf_dir,
                 affected_base_skus,
                 sku_bases=sku_bases,
-                include_missing_matrix_rows=not scheduled,
+                include_missing_matrix_rows=False,
             )
         self.logger.info(
             "pos_read mode=%s requested_skus=%s products=%s quantities=%s skipped_non_sellable=%s",
@@ -883,11 +901,14 @@ class Connector:
                     )
 
         inventory_snapshot: Optional[Dict[str, Any]] = None
+        verified_webhook_skus: set[str] = set()
+        deferred_webhook_skus: set[str] = set()
         if (
             full_reconcile
             and not catalog_incomplete
             and bool(state.get("catalog_complete"))
         ):
+            versions_before_snapshot = {(change["id"], change["version"]) for change in inventory_changes}
             inventory_snapshot = self._fetch_inventory_snapshot()
             # Re-read the versioned queue after the snapshot. A Shopify sale can
             # arrive while the paginated snapshot is loading, and the later
@@ -910,6 +931,8 @@ class Connector:
         catalog_structure_scan_complete = False
         structure_rebased_skus: set[str] = set()
         if inventory_snapshot is None:
+            waiting_for_pos_skus = (queued_shopify_skus & entries.keys()) - local_quantities.keys()
+            deferred_webhook_skus.update(waiting_for_pos_skus)
             blocked_inventory_skus.update(protected_pending_skus)
             inventory_items_by_sku: Dict[str, set[str]] = {}
             for change in inventory_changes:
@@ -936,6 +959,14 @@ class Connector:
                 sku = str(change.get("sku") or "").strip()
                 if not sku or sku in blocked_inventory_skus:
                     continue
+                if sku in verification_skus:
+                    deferred_webhook_skus.add(sku)
+                    remote_quantities.pop(sku, None)
+                    continue
+                if sku in waiting_for_pos_skus:
+                    self.logger.debug("inventory_webhook_pos_row_unavailable sku=%s", sku)
+                    continue
+                quantity = int(change.get("quantity") or 0)
                 source_updated_at = str(change.get("source_updated_at") or "").strip()
                 previous_updated_at = remote_updated_at.get(sku) or str(
                     (entries.get(sku) or {}).get("shop_seen_at") or ""
@@ -944,17 +975,27 @@ class Connector:
                     source_updated_at,
                     previous_updated_at,
                 ):
-                    self.logger.warning(
+                    if (
+                        not inventory_observation_is_older(source_updated_at, previous_updated_at)
+                        and quantity != remote_quantities.get(sku)
+                    ):
+                        self.logger.info("inventory_webhook_verification_queued sku=%s", sku)
+                        verification_skus.add(sku)
+                        deferred_webhook_skus.add(sku)
+                        remote_quantities.pop(sku, None)
+                        continue
+                    self.logger.debug(
                         "inventory_webhook_stale sku=%s source_updated_at=%s current_updated_at=%s",
                         sku,
                         source_updated_at,
                         previous_updated_at,
                     )
                     continue
-                remote_quantities[sku] = int(change.get("quantity") or 0)
+                remote_quantities[sku] = quantity
                 if source_updated_at:
                     remote_updated_at[sku] = source_updated_at
         if inventory_snapshot is not None:
+            waiting_for_pos_skus.difference_update(local_quantities)
             snapshot_items = inventory_snapshot["items"]
             snapshot_location_id = str(inventory_snapshot["location_id"])
             previous_location_id = str(state.get("inventory_location_id") or "")
@@ -1025,10 +1066,13 @@ class Connector:
                     remote_quantities[sku] = int(item["quantity"])
                     if snapshot_updated_at:
                         remote_updated_at[sku] = snapshot_updated_at
-            snapshot_overlay_deltas = self._overlay_inventory_changes_on_snapshot(
+            (
+                snapshot_overlay_deltas, verified_webhook_skus, verification_skus,
+            ) = self._overlay_inventory_changes_on_snapshot(
                 inventory_changes,
                 snapshot_items_by_sku=snapshot_items_by_sku,
                 location_id=snapshot_location_id,
+                versions_before_snapshot=versions_before_snapshot,
                 remote_quantities=remote_quantities,
                 remote_updated_at=remote_updated_at,
                 already_blocked=blocked_snapshot_skus,
@@ -1038,6 +1082,7 @@ class Connector:
                     | snapshot_overlay_ignored_matrix_skus(state)
                 ),
             )
+            deferred_webhook_skus.update(verification_skus)
             expected_snapshot_skus = {
                 sku
                 for sku in local_quantities
@@ -1070,6 +1115,8 @@ class Connector:
                 remote_quantities=remote_quantities,
             )
         initialized = 0
+        verified_webhook_skus.intersection_update(local_quantities, remote_quantities)
+        verified_webhook_skus.difference_update(structure_rebased_skus)
         for sku in sorted(local_quantities.keys() & remote_quantities.keys(), key=str.casefold):
             if sku in entries:
                 continue
@@ -1094,7 +1141,6 @@ class Connector:
 
         planned_shop: List[Dict[str, Any]] = []
         planned_pos: List[Dict[str, Any]] = []
-        deferred_webhook_skus: set[str] = set()
         # Check a fresh POS event once more on the next cycle in case its stock
         # row was still being written when the receipt became visible.
         deferred_pos_event_skus = set(new_event_skus) if scheduled else set()
@@ -1168,7 +1214,7 @@ class Connector:
         if inventory_snapshot is not None:
             state["last_full_reconcile_date"] = now.date().isoformat()
             state.pop("pos_event_reconcile_pending", None)
-            if not has_active_matrix_structure_repairs(state):
+            if not has_active_matrix_structure_repairs(state) and not verification_skus:
                 state.pop("inventory_maintenance_due_since", None)
             state["inventory_reconcile_schema_version"] = INVENTORY_RECONCILE_SCHEMA_VERSION
             if catalog_structure_scan_complete:
@@ -1177,6 +1223,24 @@ class Connector:
                 # Save the unfinished pass before adjustments; failures must retry
                 # even though the quantity reconciliation is already dated today.
                 state["pending_product_status_reconcile_date"] = now.date().isoformat()
+        if full_reconcile and structure_probe_skus:
+            probe_not_before = state.setdefault("matrix_structure_probe_not_before", {})
+            waiting = sorted(
+                (sku for sku in structure_probe_skus if not payload_by_base.get(sku, {}).get("variants")),
+                key=str.casefold,
+            )
+            retry_at = int(time.time()) + MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS
+            for sku in structure_probe_skus:
+                probe_not_before.pop(sku, None)
+            probe_not_before.update(dict.fromkeys(waiting, retry_at))
+            state["matrix_structure_probe_skus"] = []
+            if waiting:
+                self.logger.info(
+                    "matrix_structure_probe_waiting skus=%s retry_seconds=%s",
+                    ",".join(waiting), MATRIX_STRUCTURE_PROBE_COOLDOWN_SECONDS,
+                )
+        state["inventory_webhook_verification_skus"] = sorted(verification_skus, key=str.casefold)
+        state["inventory_webhook_waiting_pos_skus"] = sorted(waiting_for_pos_skus, key=str.casefold)
         state["event_cursors"] = event_scan_state["event_cursors"]
         state["deferred_pos_event_skus"] = sorted(deferred_pos_event_skus, key=str.casefold)
         if completed_quantity_scan_stamp is not None:
@@ -1215,21 +1279,21 @@ class Connector:
                 state.pop("pending_product_status_reconcile_date", None)
         state["last_cycle_epoch"] = int(time.time())
         save_state(self.state_path, state)
-        if inventory_changes and inventory_snapshot is None:
-            processed_changes = [
-                change for change in inventory_changes
-                if str(change.get("sku") or "").strip() not in deferred_webhook_skus
-            ]
+        if inventory_changes:
+            processed_changes = []
+            for change in inventory_changes:
+                sku = str(change.get("sku") or "").strip()
+                if sku not in deferred_webhook_skus and (inventory_snapshot is None or sku in verified_webhook_skus):
+                    processed_changes.append(change)
             if processed_changes:
                 self._acknowledge_inventory_changes(processed_changes)
-        elif inventory_changes:
-            # A full snapshot can race a newer queued webhook. Leave versioned
-            # changes queued so the next incremental cycle can compare and merge
-            # them instead of acknowledging an update the snapshot may not contain.
-            self.logger.info(
-                "inventory_webhook_ack_deferred_after_snapshot changes=%s",
-                len(inventory_changes),
-            )
+            if inventory_snapshot is not None and len(processed_changes) < len(inventory_changes):
+                # A full snapshot can race a newer queued webhook. Acknowledge only
+                # the conflicting versions explicitly verified by the later read.
+                self.logger.info(
+                    "inventory_webhook_ack_deferred_after_snapshot changes=%s",
+                    len(inventory_changes) - len(processed_changes),
+                )
         self.logger.info(
             "connector_cycle_complete mode=%s initialized=%s webhook_changes=%s shopify_adjustments=%s pos_adjustments=%s",
             read_mode,
@@ -1238,7 +1302,7 @@ class Connector:
             len(planned_shop),
             len(planned_pos),
         )
-        if scheduled_maintenance and inventory_snapshot is not None:
+        if scheduled_maintenance and inventory_snapshot is not None and not verification_skus:
             self._automatic_inventory_retry_at = 0.0
         if self.price_sync_enabled and prioritize_inventory and not full_reconcile:
             self._sync_pos_price_changes(state, force_scan=False)
@@ -1606,19 +1670,22 @@ class Connector:
         *,
         snapshot_items_by_sku: Dict[str, Dict[str, Any]],
         location_id: str,
+        versions_before_snapshot: set[tuple[int, int]],
         remote_quantities: Dict[str, int],
         remote_updated_at: Dict[str, str],
         already_blocked: set[str],
         relevant_skus: set[str],
         ignored_skus: set[str],
-    ) -> Dict[str, int]:
-        """Overlay queued observations that are provably newer than a full snapshot."""
+    ) -> tuple[Dict[str, int], set[str], set[str]]:
+        """Overlay newer changes and verify timestamp ties against the live snapshot."""
         changes_by_sku: Dict[str, List[Dict[str, Any]]] = {}
         for change in changes:
             sku = str(change.get("sku") or "").strip()
             if sku:
                 changes_by_sku.setdefault(sku, []).append(change)
         overlaid_deltas: Dict[str, int] = {}
+        verified_skus: set[str] = set()
+        deferred_skus: set[str] = set()
 
         def conflict(sku: str, reason: str) -> None:
             raise RuntimeError(
@@ -1685,9 +1752,24 @@ class Connector:
                 )
                 continue
             if source_time == current_time:
-                conflict(sku, "equal timestamps report different quantities")
+                snapshot_time = parse_inventory_observation_timestamp(
+                    snapshot_item.get("inventory_level_updated_at")
+                )
+                # A queue version observed before the snapshot is older than
+                # the live read, even when their source timestamps tie.
+                if (change["id"], change["version"]) in versions_before_snapshot and snapshot_time == current_time:
+                    verified_skus.add(sku)
+                    self.logger.info(
+                        "inventory_webhook_verified sku=%s snapshot_quantity=%s webhook_quantity=%s",
+                        sku, current_quantity, change_quantity,
+                    )
+                else:
+                    deferred_skus.add(sku)
+                    remote_quantities.pop(sku, None)
+                    remote_updated_at.pop(sku, None)
+                    self.logger.info("inventory_webhook_verification_deferred sku=%s", sku)
 
-        return overlaid_deltas
+        return overlaid_deltas, verified_skus, deferred_skus
 
     def _repair_matrix_options(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
         summary = {"updated": 0, "already_correct": 0, "failed": 0}

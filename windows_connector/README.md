@@ -55,7 +55,9 @@ reaching the server. The Customers tab shows recent import outcomes by POS custo
    cannot write zero back to either system.
 7. Shopify sends inventory-level webhooks to Railway. Every cycle, the connector checks for those
    changed quantities. It downloads the location-specific Shopify inventory snapshot during a full
-   reconciliation.
+   reconciliation. A webhook with the same timestamp and quantity as an observation already used
+   by the connector is skipped. Different quantities with the same timestamp are checked against a
+   fresh Shopify snapshot. Changes for tracked SKUs stay queued if the live POS row cannot be read.
 8. Independent POS and online-sale deltas are combined so simultaneous sales on both channels are
    preserved.
 9. Shopify adjustments use idempotency keys and return the actual resulting quantity when available. If that result
@@ -291,10 +293,17 @@ Deploy the Railway/backend release before updating the Windows connector. The up
 requires inventory snapshot schema version 2 and will stop safely, without acknowledging queued
 inventory changes, if the older endpoint is still deployed.
 
-To update the Windows runtime, open `windows_connector\update_connector.bat` as Administrator. The
+To update the Windows runtime, run `windows_connector\update_connector.bat` as Administrator. The
 updater downloads and validates both `connector.py` and `jbarbaro_db\dbf_pos_sync.py`, plus the small
 supporting runtime files. It preserves `connector.env`, connector state, logs, Shopify order DBFs,
 native POS DBFs, and any legacy Shopify order SQLite database.
+
+For unattended updates, run the existing scheduled job with highest privileges. Install the updated
+batch file and PowerShell script once to enable reporting when the updater download itself fails.
+The Shopify app shows the latest 10 attempts under **Overview → Windows connector updates**.
+Each failure shows its stage, error code, and affected filename when available. If the dashboard is unreachable,
+the report queues under `updater-reports` in the connector data directory and uploads after the connector
+reconnects. The scheduled job's output contains the full PowerShell error.
 
 The updater preserves existing configuration. Set `SYNC_INTERVAL_SECONDS=30` in `connector.env`
 to replace the old 180-second interval, and restart the task after editing. The dashboard reports
