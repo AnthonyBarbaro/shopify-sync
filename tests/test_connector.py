@@ -820,6 +820,27 @@ class FullInventoryReconciliationTests(unittest.TestCase):
                 mock.call("sync1", "reconciling"),
             ])
 
+    def test_full_scan_logs_the_sku_and_counts_when_pos_writeback_is_only_a_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            connector, state = self._scheduled_connector(path)
+            state["quantities"]["22392"] = {"canonical": 3, "pos_seen": 11, "shop_seen": 3}
+            connector._fetch_inventory_snapshot.return_value["items"][0]["quantity"] = 3
+            connector._record_inventory_issue = mock.Mock()
+            save_state(path, state)
+            module = sys.modules["windows_connector.connector"]
+            products = [SimpleNamespace(payload={"sku": "22392", "quantity": 11})]
+            stats = SimpleNamespace(skipped_non_sellable=0)
+
+            with mock.patch.object(module.dbf_pos_sync, "load_products", return_value=(products, stats)):
+                connector.run_cycle(force_full=True)
+
+            connector._record_inventory_issue.assert_called_once_with(
+                "22392", "pos_writeback_preview", pos_quantity=11, shopify_quantity=3, target_quantity=3,
+            )
+            connector._apply_shopify_adjustments.assert_not_called()
+            connector._apply_pos_adjustments.assert_not_called()
+
     def test_automatic_reconcile_waits_for_quiet_and_keeps_a_deferred_file_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

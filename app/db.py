@@ -299,6 +299,18 @@ class DatabaseStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS recent_inventory_issues (
+                    shop_domain TEXT NOT NULL,
+                    sku TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    issue TEXT NOT NULL,
+                    PRIMARY KEY(shop_domain, sku, reason)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS recent_price_changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shop_domain TEXT NOT NULL,
@@ -1664,6 +1676,41 @@ class DatabaseStore:
             ).fetchall()
         return [json.loads(row["report"]) for row in rows]
 
+    def record_inventory_issues(self, *, shop_domain: str, issues: list[dict[str, Any]]) -> None:
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO recent_inventory_issues (shop_domain, sku, reason, observed_at, issue)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(shop_domain, sku, reason) DO UPDATE SET
+                    observed_at=excluded.observed_at, issue=excluded.issue
+                WHERE excluded.observed_at > recent_inventory_issues.observed_at
+                """,
+                [(shop_domain, issue.get("sku") or "", issue["reason"], issue["observed_at"], json.dumps(issue))
+                 for issue in issues],
+            )
+            connection.execute(
+                """
+                DELETE FROM recent_inventory_issues WHERE shop_domain = ? AND (sku, reason) IN (
+                    SELECT sku, reason FROM recent_inventory_issues WHERE shop_domain = ?
+                    ORDER BY observed_at DESC, sku, reason LIMIT -1 OFFSET 200
+                )
+                """,
+                (shop_domain, shop_domain),
+            )
+            connection.commit()
+
+    def list_recent_inventory_issues(self, *, shop_domain: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT issue FROM recent_inventory_issues WHERE shop_domain = ?
+                ORDER BY observed_at DESC, sku, reason LIMIT 20
+                """,
+                (shop_domain,),
+            ).fetchall()
+        return [json.loads(row["issue"]) for row in rows]
+
     def request_connector_sync(self, *, shop_domain: str) -> dict[str, Optional[str]]:
         with self._connect() as connection:
             connection.execute(
@@ -1995,6 +2042,7 @@ class DatabaseStore:
                 "DELETE FROM recent_inventory_changes WHERE shop_domain = ?",
                 (shop_domain,),
             )
+            connection.execute("DELETE FROM recent_inventory_issues WHERE shop_domain = ?", (shop_domain,))
             connection.execute(
                 "DELETE FROM order_changes WHERE shop_domain = ?",
                 (shop_domain,),

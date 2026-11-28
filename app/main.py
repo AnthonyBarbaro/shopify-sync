@@ -1917,6 +1917,7 @@ async def bridge_status(request: Request, order_limit: int = 12) -> JSONResponse
                 "last_poll_at": heartbeat["last_inventory_poll_at"],
                 "last_catalog_sync_at": heartbeat["last_catalog_sync_at"],
                 "queued_changes": db.inventory_change_count(shop_domain=shop.shop_domain),
+                "issues": db.list_recent_inventory_issues(shop_domain=shop.shop_domain),
                 "recent": [
                     {
                         "sku": row.sku,
@@ -2963,16 +2964,29 @@ def connector_heartbeat(
 ) -> JSONResponse:
     db.record_connector_heartbeat(
         shop_domain=shop.shop_domain, channel="connector",
-        metadata=payload.model_dump(exclude={"sync_progress"}, exclude_none=True),
+        metadata=payload.model_dump(exclude={"sync_progress", "inventory_issues"}, exclude_none=True),
     )
     if payload.sync_progress:
         db.record_connector_sync_progress(
             shop_domain=shop.shop_domain, **payload.sync_progress.model_dump(),
         )
+    inventory_issues_saved = False
+    if payload.inventory_issues:
+        issues = []
+        for issue in payload.inventory_issues:
+            row = issue.model_dump(mode="json", exclude_none=True)
+            row["observed_at"] = issue.observed_at.astimezone(timezone.utc).isoformat(timespec="microseconds")
+            issues.append(row)
+        try:
+            db.record_inventory_issues(shop_domain=shop.shop_domain, issues=issues)
+            inventory_issues_saved = True
+        except Exception:
+            logger.warning("inventory_issue_history_unavailable shop=%s", shop.shop_domain)
     sync_request = db.get_connector_sync_request(shop_domain=shop.shop_domain)
     return JSONResponse({
         "timestamp": utc_now_iso(),
         "sync_request_id": sync_request["request_id"] if not sync_request["completed_at"] else None,
+        "inventory_issues_saved": inventory_issues_saved,
     })
 
 
@@ -3686,6 +3700,7 @@ async def connector_inventory_adjustments(
                     "sku": sku,
                     "delta": raw_adjustment.get("delta"),
                     "success": False,
+                    "code": exc.code if isinstance(exc, AppError) else "inventory_adjustment_failed",
                     "message": str(exc),
                     "details": exc.details if isinstance(exc, AppError) else {},
                 }

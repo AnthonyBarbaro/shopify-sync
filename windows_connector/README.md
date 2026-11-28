@@ -305,6 +305,12 @@ Each failure shows its stage, error code, and affected filename when available. 
 the report queues under `updater-reports` in the connector data directory and uploads after the connector
 reconnects. The scheduled job's output contains the full PowerShell error.
 
+The Shopify app shows **Recent inventory issues** on the Overview. It records the affected SKU,
+reason, observed quantities, and planned quantity when available. Full Shopify snapshot failures
+appear in the same list. For more details, search `connector.log` for `inventory_quantity_issue`.
+Connector 1.4.7 reports interrupted requests and timeouts as single-line warnings and retries on
+its normal schedule.
+
 The updater preserves existing configuration. Set `SYNC_INTERVAL_SECONDS=30` in `connector.env`
 to replace the old 180-second interval, and restart the task after editing. The dashboard reports
 the configured interval after the upgraded connector's first heartbeat. Faster polling does not

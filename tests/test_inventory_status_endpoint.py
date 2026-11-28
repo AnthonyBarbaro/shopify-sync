@@ -172,7 +172,8 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.main.db.get_connector_heartbeat.side_effect = store.get_connector_heartbeat
             self.main.db.get_connector_sync_request.side_effect = store.get_connector_sync_request
             for name in ("list_recent_order_summaries", "list_recent_price_changes",
-                         "list_recent_inventory_changes", "list_recent_customer_sync_events"):
+                         "list_recent_inventory_changes", "list_recent_customer_sync_events",
+                         "list_recent_inventory_issues"):
                 getattr(self.main.db, name).return_value = []
             self.main.db.inventory_change_count.return_value = 0
             self.main.db.order_change_count.return_value = 0
@@ -191,6 +192,40 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
                 {**report, "occurred_at": "2026-11-28T19:53:00.123456+00:00"},
             ])
             self.assertEqual(store.list_connector_update_reports(shop_domain="other.myshopify.com"), [])
+
+    async def test_inventory_issue_history_accepts_retries_and_surfaces_counts_per_shop(self) -> None:
+        issue = {
+            "sku": "22270. 1 4", "reason": "pos_writeback_preview", "observed_at": "2026-11-28T20:30:00Z",
+            "pos_quantity": 2, "shopify_quantity": 0, "target_quantity": 0,
+        }
+        payload = {"version": "1.4.7", "sync_interval_seconds": 180, "inventory_issues": [issue]}
+        with tempfile.TemporaryDirectory() as directory:
+            store = DatabaseStore(str(Path(directory) / "issues.sqlite3"), "fake-encryption-key")
+            self.main.db.record_inventory_issues.side_effect = store.record_inventory_issues
+            self.main.db.list_recent_inventory_issues.side_effect = store.list_recent_inventory_issues
+            self.main.db.get_connector_heartbeat.side_effect = store.get_connector_heartbeat
+            self.main.db.get_connector_sync_request.side_effect = store.get_connector_sync_request
+            for name in ("list_connector_update_reports", "list_recent_order_summaries", "list_recent_price_changes",
+                         "list_recent_inventory_changes", "list_recent_customer_sync_events"):
+                getattr(self.main.db, name).return_value = []
+            self.main.db.inventory_change_count.return_value = 0
+            self.main.db.order_change_count.return_value = 0
+
+            for _ in range(2):
+                status, receipt = await self.post(payload, path="/sync/heartbeat")
+                self.assertEqual(status, 200)
+                self.assertTrue(receipt["inventory_issues_saved"])
+            self.assertNotIn("inventory_issues", self.main.db.record_connector_heartbeat.call_args.kwargs["metadata"])
+            with (
+                mock.patch.object(self.main, "_get_session_context", return_value=(self.shop, {})),
+                mock.patch.object(self.main, "get_granted_access_scopes", return_value=set()),
+            ):
+                status, dashboard = await self.post(None, path="/api/bridge-status", method="GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(dashboard["inventory"]["issues"], [
+                {**issue, "observed_at": "2026-11-28T20:30:00.000000+00:00"},
+            ])
+            self.assertEqual(store.list_recent_inventory_issues(shop_domain="other.myshopify.com"), [])
 
     async def test_customer_status_requires_credentials(self) -> None:
         status, _body = await self.post(None, path="/sync/customers/status", method="GET", authenticated=False)

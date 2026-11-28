@@ -1,4 +1,5 @@
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +91,43 @@ class ConnectorRuntimeTests(unittest.TestCase):
             "https://sync.example/sync/connector/update-report", json=report, timeout=5,
             allow_redirects=False,
         )
+
+    def test_heartbeat_replays_quantity_issues_until_the_dashboard_accepts_them(self) -> None:
+        self.connector._record_inventory_issue(
+            "22270. 1 4", "pos_writeback_preview", pos_quantity=2, shopify_quantity=0, target_quantity=0,
+        )
+        self.session.post.side_effect = None
+        self.session.post.return_value.json.return_value = {"inventory_issues_saved": False}
+        self.connector._send_heartbeat(self.session)
+        first = self.session.post.call_args.kwargs["json"]["inventory_issues"]
+        self.assertEqual(first[0]["sku"], "22270. 1 4")
+        self.assertEqual(first[0]["shopify_quantity"], 0)
+
+        self.session.post.return_value.json.return_value = {"inventory_issues_saved": True}
+        self.connector._send_heartbeat(self.session)
+        self.assertEqual(self.session.post.call_args.kwargs["json"]["inventory_issues"], first)
+        self.connector._send_heartbeat(self.session)
+        self.assertNotIn("inventory_issues", self.session.post.call_args.kwargs["json"])
+
+    def test_sales_board_connection_loss_logs_one_warning_and_retries(self) -> None:
+        self.connector.logger = logging.getLogger("connector.sales_board.retries")
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, False, True]
+        self.session.headers = {}
+        settings = mock.Mock()
+        settings.json.return_value = {"enabled": False}
+        self.session.get.side_effect = [requests.ConnectionError("peer closed\nresponse"), settings]
+        with (
+            mock.patch.object(connector_module.requests, "Session") as factory,
+            self.assertLogs(self.connector.logger, level="WARNING") as logs,
+        ):
+            factory.return_value.__enter__.return_value = self.session
+            self.connector._sales_board_loop(stop)
+
+        self.assertEqual(self.session.get.call_count, 2)
+        self.assertEqual(logs.output, [
+            "WARNING:connector.sales_board.retries:sales_board_sync_failed stage=settings reason=connection_interrupted",
+        ])
 
     def test_customers_import_once_then_only_changed_records_across_restarts(self) -> None:
         self.connector._sync_customers(self.session)

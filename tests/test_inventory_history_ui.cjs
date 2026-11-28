@@ -110,6 +110,22 @@ test('force sync bar animates only during a reported stage', () => {
   assert.doesNotMatch(retry, /role="progressbar"/)
 })
 
+test('overview shows the affected inventory SKU, the reason and the observed quantities', () => {
+  vm.runInContext(`state.bridge = { inventory: { issues: [{
+    sku: '22270. 1 4', reason: 'pos_writeback_preview', pos_quantity: 2, shopify_quantity: 0, target_quantity: 0,
+  }] } }`, context)
+  const html = context.renderOverview()
+  assert.match(html, /Recent inventory issues/)
+  assert.match(html, /SKU 22270\. 1 4/)
+  assert.match(html, /POS write-back is in dry-run mode/)
+  assert.match(html, /POS 2 · Shopify 0 · Target 0/)
+  const failedScan = context.renderInventoryIssueList([{
+    reason: 'shopify_snapshot_unavailable', code: 'ReadTimeout',
+  }])
+  assert.match(failedScan, /Full inventory scan/)
+  assert.match(failedScan, /could not read Shopify inventory · Request timed out/)
+})
+
 test('overview displays updater successes and failed stages without rendering filename markup', () => {
   vm.runInContext(`state.bridge = { connector_updates: [
     { status: 'failed', stage: 'validate_download', file: '<b>connector.py</b>', occurred_at: '2026-11-28T12:00:00Z' },

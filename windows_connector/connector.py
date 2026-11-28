@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.6"
+CONNECTOR_VERSION = "1.4.7"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -62,6 +62,8 @@ INVENTORY_SNAPSHOT_SCHEMA_VERSION = 2
 POS_EVENT_FILES = ("invdtl.dbf", "editvoid.dbf")
 POS_INVENTORY_QUIET_SECONDS = 300
 INVENTORY_MAINTENANCE_MAX_WAIT_SECONDS = 1800
+PENDING_INVENTORY_ISSUE_LIMIT = 200
+INVENTORY_ISSUE_BATCH_SIZE = 50
 MATRIX_VARIANT_SKU = re.compile(r"^(.+?)\.\s*\d+\s+\d+$")
 ACTIVE_MATRIX_STRUCTURE_STAGES = {"candidate", "verification"}
 
@@ -84,6 +86,43 @@ def env_bool(name: str, default: bool) -> bool:
 def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     value = int((os.getenv(name) or str(default)).strip())
     return max(minimum, min(maximum, value))
+
+
+def sync_failure_summary(error: Exception, *, include_detail: bool = True) -> tuple[int, str]:
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        status = error.response.status_code
+        level = logging.WARNING if status in {408, 429} or status >= 500 else logging.ERROR
+        return level, f"http_status={status}"
+    if isinstance(error, requests.exceptions.SSLError):
+        return logging.ERROR, "reason=tls_error"
+    if isinstance(error, (requests.Timeout, subprocess.TimeoutExpired)):
+        return logging.WARNING, "reason=timeout"
+    if isinstance(error, requests.ConnectionError):
+        return logging.WARNING, "reason=connection_interrupted"
+    if isinstance(error, OSError) and getattr(error, "winerror", None) in {32, 33}:
+        return logging.WARNING, "reason=file_in_use"
+
+    summary = f"error={type(error).__name__}"
+    if include_detail and not isinstance(error, requests.RequestException):
+        detail = " ".join(str(error).split())[:300]
+        if detail:
+            summary = f"{summary} detail={detail}"
+    return logging.ERROR, summary
+
+
+def inventory_failure_code(error: Exception) -> str:
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        return f"http_{error.response.status_code}"
+    return type(error).__name__
+
+
+def adjustment_result_for_sku(results: Any, index: int, sku: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(results, list) or index >= len(results):
+        return None
+    result = results[index]
+    if isinstance(result, dict) and result.get("sku") in (None, "", sku):
+        return result
+    return None
 
 
 def has_active_matrix_structure_repairs(state: Dict[str, Any]) -> bool:
@@ -170,6 +209,7 @@ class Connector:
         self._sync_request_lock = Lock()
         self._sync_request_id: Optional[str] = None
         self._sync_progress_stage: Optional[str] = None
+        self._pending_inventory_issues: dict[tuple[Optional[str], str], Dict[str, Any]] = {}
         self._sync_wakeup = Event()
         self._customer_wakeup = Event()
         self._customer_source_stamp: tuple[str, str | None] | None = None
@@ -252,6 +292,46 @@ class Connector:
             raise ValueError(f"Missing required connector setting: {name}")
         return value
 
+    def _log_sync_failure(self, event: str, error: Exception, *, include_detail: bool = True) -> None:
+        level, summary = sync_failure_summary(error, include_detail=include_detail)
+        self.logger.log(level, "%s %s", event, summary)
+
+    def _record_inventory_issue(
+        self,
+        sku: Optional[str],
+        reason: str,
+        *,
+        pos_quantity: Optional[int] = None,
+        shopify_quantity: Optional[int] = None,
+        target_quantity: Optional[int] = None,
+        code: Any = None,
+        detail: Any = None,
+    ) -> None:
+        fields: dict[str, int | str] = {
+            name: quantity for name, quantity in (
+                ("pos_quantity", pos_quantity), ("shopify_quantity", shopify_quantity),
+                ("target_quantity", target_quantity),
+            ) if isinstance(quantity, int)
+        }
+        if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code):
+            fields["code"] = code
+        local_detail = " ".join(str(detail or "").split())[:300]
+        self.logger.warning(
+            "inventory_quantity_issue sku=%r reason=%s%s%s", sku, reason,
+            "".join(f" {key}={value}" for key, value in fields.items()),
+            f" detail={local_detail}" if local_detail else "",
+        )
+        pending = getattr(self, "_pending_inventory_issues", None)
+        if pending is None or getattr(self, "dry_run", False) or (sku is not None and not 1 <= len(sku) <= 160):
+            return
+        issue = {"sku": sku, "reason": reason, "observed_at": datetime.now(timezone.utc).isoformat(), **fields}
+        key = (sku, reason)
+        with self._sync_request_lock:
+            pending.pop(key, None)
+            pending[key] = issue
+            if len(pending) > PENDING_INVENTORY_ISSUE_LIMIT:
+                pending.pop(next(iter(pending)))
+
     def run_forever(self, *, once: bool = False) -> int:
         self.logger.info(
             "connector_started version=%s dbf_dir=%s interval=%ss writeback=%s price_sync=%s dry_run=%s",
@@ -281,8 +361,8 @@ class Connector:
                 if once:
                     try:
                         self._send_heartbeat(self.session)
-                    except requests.RequestException:
-                        self.logger.warning("connector_heartbeat_failed")
+                    except requests.RequestException as exc:
+                        self._log_sync_failure("connector_heartbeat_failed", exc)
                     if self.order_sync_enabled:
                         self._sync_order_inbox()
                 failed = False
@@ -294,8 +374,8 @@ class Connector:
                         self._complete_sync_request(request_id)
                     else:
                         self.run_cycle(scheduled=not once)
-                except Exception:
-                    self.logger.exception("connector_cycle_failed")
+                except Exception as exc:
+                    self._log_sync_failure("connector_cycle_failed", exc)
                     if request_id:
                         self._set_sync_progress(request_id, "retrying")
                     failed = True
@@ -303,8 +383,8 @@ class Connector:
                     if self.customer_sync_enabled:
                         try:
                             self._sync_customers(self.session)
-                        except Exception:
-                            self.logger.warning("customer_sync_failed; check customer access and POS files")
+                        except Exception as exc:
+                            self._log_sync_failure("customer_sync_failed", exc, include_detail=False)
                             failed = True
                     return 1 if failed else 0
                 elapsed = time.monotonic() - started
@@ -324,18 +404,27 @@ class Connector:
             "customer_sync_interval_seconds": self.customer_sync_interval_seconds,
         }
         with self._sync_request_lock:
+            issues = list(self._pending_inventory_issues.items())[:INVENTORY_ISSUE_BATCH_SIZE]
             if self._sync_request_id and self._sync_progress_stage:
                 payload["sync_progress"] = {
                     "request_id": self._sync_request_id,
                     "stage": self._sync_progress_stage,
                 }
+        if issues:
+            payload["inventory_issues"] = [issue for _, issue in issues]
         response = session.post(
             f"{self.base_url}/sync/heartbeat",
             json=payload,
             timeout=10,
         )
         response.raise_for_status()
-        request_id = response.json().get("sync_request_id")
+        result = response.json()
+        if issues and result.get("inventory_issues_saved") is True:
+            with self._sync_request_lock:
+                for key, issue in issues:
+                    if self._pending_inventory_issues.get(key) is issue:
+                        self._pending_inventory_issues.pop(key)
+        request_id = result.get("sync_request_id")
         if isinstance(request_id, str) and request_id:
             with self._sync_request_lock:
                 if request_id != self._sync_request_id:
@@ -397,8 +486,8 @@ class Connector:
             while not stop.is_set():
                 try:
                     self._send_heartbeat(session)
-                except requests.RequestException:
-                    self.logger.warning("connector_heartbeat_failed")
+                except requests.RequestException as exc:
+                    self._log_sync_failure("connector_heartbeat_failed", exc)
                 stop.wait(30)
 
     def _customer_loop(self, stop: Event) -> None:
@@ -410,9 +499,9 @@ class Connector:
                     self._customer_wakeup.clear()
                 try:
                     self._sync_customers(session, force_scan=force_scan)
-                except Exception:
+                except Exception as exc:
                     # Responses can contain customer contact data; do not log them.
-                    self.logger.warning("customer_sync_failed; check customer access and POS files")
+                    self._log_sync_failure("customer_sync_failed", exc, include_detail=False)
                 self._customer_wakeup.wait(self.customer_sync_interval_seconds)
 
     def _order_loop(self, stop: Event) -> None:
@@ -433,6 +522,7 @@ class Connector:
             session.headers.update(self.session.headers)
             while not stop.is_set():
                 interval = 60
+                stage = "settings"
                 try:
                     config = session.get(f"{self.base_url}/sync/sales-board/settings", timeout=15)
                     config.raise_for_status()
@@ -443,6 +533,7 @@ class Connector:
                         continue
                     interval = min(900, max(30, int(remote["interval_seconds"])))
                     today = date.fromisoformat(remote["business_date"])
+                    stage = "read_pos"
                     paths = sales_paths(self.dbf_dir)
                     vendor_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "Vendor.dbf", recursive=True)
                     customers_path = dbf_pos_sync.find_dbf_file(self.dbf_dir, "Customer.dbf", recursive=True)
@@ -454,7 +545,9 @@ class Connector:
                             history_start=date.min if history_built_on != today else today.replace(day=1),
                         )
                         if sales_source_signature(sources) != current[1]:
-                            raise OSError("Sales DBFs changed while reporting; retrying next check.")
+                            self.logger.warning("sales_board_read_deferred reason=pos_files_changed")
+                            stop.wait(interval)
+                            continue
                         for month, lines in report.pop("history").items():
                             digest = hashlib.sha256(json.dumps(lines, separators=(",", ":")).encode()).hexdigest()
                             if sent_report_months.get(month) == digest:
@@ -466,6 +559,7 @@ class Connector:
                         signature = current
                         last_sent = None
                     if last_sent is None or time.monotonic() - last_sent >= 300:
+                        stage = "publish_summary"
                         snapshot["observed_at"] = datetime.now(timezone.utc).isoformat()
                         response = session.post(f"{self.base_url}/sync/sales-board", json=snapshot, timeout=30)
                         response.raise_for_status()
@@ -473,6 +567,7 @@ class Connector:
                             self.logger.info("sales_board_refreshed department_file=%s", paths[-1].name)
                         last_sent = time.monotonic()
                     while pending_report_months and not stop.is_set():
+                        stage = "publish_history"
                         months = sorted(pending_report_months, reverse=True)[:6]
                         response = session.post(
                             f"{self.base_url}/sync/sales-reports",
@@ -485,8 +580,8 @@ class Connector:
                             break
                         for month in months:
                             sent_report_months[month], _ = pending_report_months.pop(month)
-                except Exception:
-                    self.logger.exception("sales_board_sync_failed")
+                except Exception as exc:
+                    self._log_sync_failure(f"sales_board_sync_failed stage={stage}", exc)
                 stop.wait(interval)
 
     def _sync_customers(self, session: requests.Session, *, force_scan: bool = False) -> None:
@@ -932,7 +1027,11 @@ class Connector:
             versions_before_snapshot = {(change["id"], change["version"]) for change in inventory_changes}
             if sync_request_id:
                 self._set_sync_progress(sync_request_id, "reading_shopify")
-            inventory_snapshot = self._fetch_inventory_snapshot()
+            try:
+                inventory_snapshot = self._fetch_inventory_snapshot()
+            except Exception as exc:
+                self._record_inventory_issue(None, "shopify_snapshot_unavailable", code=inventory_failure_code(exc))
+                raise
             # Re-read the versioned queue after the snapshot. A Shopify sale can
             # arrive while the paginated snapshot is loading, and the later
             # observation must take precedence over an older snapshot row.
@@ -977,11 +1076,13 @@ class Connector:
                     key=str.casefold,
                 )
                 for sku in sorted(newly_ambiguous_skus, key=str.casefold):
-                    self.logger.error("inventory_webhook_duplicate_sku sku=%s", sku)
+                    self._record_inventory_issue(sku, "shopify_duplicate_sku", pos_quantity=local_quantities.get(sku))
             for sku in blocked_inventory_skus:
                 remote_quantities.pop(sku, None)
             for change in inventory_changes:
                 sku = str(change.get("sku") or "").strip()
+                if sku in waiting_for_pos_skus:
+                    self._record_inventory_issue(sku, "pos_row_unavailable", shopify_quantity=change.get("quantity"))
                 if not sku or sku in blocked_inventory_skus:
                     continue
                 if sku in verification_skus:
@@ -989,7 +1090,6 @@ class Connector:
                     remote_quantities.pop(sku, None)
                     continue
                 if sku in waiting_for_pos_skus:
-                    self.logger.debug("inventory_webhook_pos_row_unavailable sku=%s", sku)
                     continue
                 quantity = int(change.get("quantity") or 0)
                 source_updated_at = str(change.get("source_updated_at") or "").strip()
@@ -1004,7 +1104,10 @@ class Connector:
                         not inventory_observation_is_older(source_updated_at, previous_updated_at)
                         and quantity != remote_quantities.get(sku)
                     ):
-                        self.logger.info("inventory_webhook_verification_queued sku=%s", sku)
+                        self._record_inventory_issue(
+                            sku, "shopify_quantity_conflict", pos_quantity=local_quantities.get(sku),
+                            shopify_quantity=remote_quantities.get(sku),
+                        )
                         verification_skus.add(sku)
                         deferred_webhook_skus.add(sku)
                         remote_quantities.pop(sku, None)
@@ -1047,22 +1150,20 @@ class Connector:
                     blocked_snapshot_skus.add(sku)
                     remote_quantities.pop(sku, None)
                     remote_updated_at.pop(sku, None)
-                    self.logger.error(
-                        "inventory_snapshot_duplicate_sku sku=%s count=%s",
-                        sku,
-                        item.get("duplicate_sku_count"),
-                    )
+                    if sku in local_quantities:
+                        self._record_inventory_issue(sku, "shopify_duplicate_sku", pos_quantity=local_quantities[sku])
                     continue
                 if not item.get("available_at_location") or item.get("quantity") is None:
                     blocked_snapshot_skus.add(sku)
                     remote_quantities.pop(sku, None)
                     remote_updated_at.pop(sku, None)
-                    self.logger.error(
-                        "inventory_snapshot_location_unavailable sku=%s location_id=%s",
-                        sku,
-                        item.get("location_id"),
-                    )
+                    if sku in local_quantities:
+                        self._record_inventory_issue(
+                            sku, "shopify_location_unavailable", pos_quantity=local_quantities[sku],
+                        )
                     continue
+                if sku in entries and sku not in local_quantities:
+                    self._record_inventory_issue(sku, "pos_row_unavailable", shopify_quantity=int(item["quantity"]))
                 if sku in uploaded_inventory_skus:
                     continue
                 if sku not in blocked_snapshot_skus:
@@ -1091,6 +1192,12 @@ class Connector:
                     remote_quantities[sku] = int(item["quantity"])
                     if snapshot_updated_at:
                         remote_updated_at[sku] = snapshot_updated_at
+            missing_snapshot_skus = {
+                sku for sku in local_quantities.keys() - snapshot_skus
+                if sku_bases.get(sku, base_sku(sku)) in known_products
+            }
+            for sku in sorted(missing_snapshot_skus, key=str.casefold):
+                self._record_inventory_issue(sku, "shopify_sku_missing", pos_quantity=local_quantities[sku])
             (
                 snapshot_overlay_deltas, verified_webhook_skus, verification_skus,
             ) = self._overlay_inventory_changes_on_snapshot(
@@ -1108,15 +1215,7 @@ class Connector:
                 ),
             )
             deferred_webhook_skus.update(verification_skus)
-            expected_snapshot_skus = {
-                sku
-                for sku in local_quantities
-                if sku_bases.get(sku, base_sku(sku)) in known_products
-            }
-            missing_snapshot_skus = expected_snapshot_skus - snapshot_skus
             blocked_snapshot_skus.update(missing_snapshot_skus)
-            for sku in sorted(missing_snapshot_skus, key=str.casefold):
-                self.logger.error("inventory_snapshot_missing_sku sku=%s", sku)
             state["blocked_inventory_skus"] = sorted(
                 blocked_snapshot_skus,
                 key=str.casefold,
@@ -1139,6 +1238,13 @@ class Connector:
                 location_id=snapshot_location_id,
                 remote_quantities=remote_quantities,
             )
+            unverified_matrix_skus = (
+                pending_matrix_structure_skus(state) & local_quantities.keys()
+            ) - remote_quantities.keys()
+            for sku in sorted(unverified_matrix_skus - blocked_snapshot_skus, key=str.casefold):
+                self._record_inventory_issue(
+                    sku, "matrix_structure_unverified", pos_quantity=local_quantities[sku],
+                )
         initialized = 0
         verified_webhook_skus.intersection_update(local_quantities, remote_quantities)
         verified_webhook_skus.difference_update(structure_rebased_skus)
@@ -1289,11 +1395,13 @@ class Connector:
                 if current_pos_actions:
                     self._apply_pos_adjustments(state, current_pos_actions)
             elif planned_pos:
-                self.logger.warning(
-                    "pos_writeback_not_applied mode=%s adjustments=%s",
-                    self.writeback_mode,
-                    len(planned_pos),
-                )
+                reason = "pos_writeback_preview" if self.writeback_mode == "dry-run" else "pos_writeback_disabled"
+                for action in planned_pos:
+                    sku = action["sku"]
+                    self._record_inventory_issue(
+                        sku, reason, pos_quantity=local_quantities[sku],
+                        shopify_quantity=entries[sku].get("shop_seen"), target_quantity=action["target_quantity"],
+                    )
         if inventory_snapshot is not None and status_reconcile_due:
             if self._reconcile_zero_stock_product_statuses(
                 state,
@@ -2314,18 +2422,12 @@ class Connector:
                     json={"changes": chunk},
                     timeout=self.timeout,
                 )
-                if response.status_code >= 400:
-                    self.logger.error(
-                        "price_sync_http_error status=%s response=%s",
-                        response.status_code,
-                        response.text[:2000],
-                    )
                 response.raise_for_status()
                 results.extend(response.json().get("results") or [])
-            except Exception:
+            except Exception as exc:
                 # Price tracking must not interrupt inventory or order processing.
                 # Missing results retain the old baseline and retry next cycle.
-                self.logger.exception("price_sync_chunk_failed changes=%s", len(chunk))
+                self._log_sync_failure(f"price_sync_chunk_failed changes={len(chunk)}", exc)
 
         results_by_sku = {
             str(result.get("source_sku") or "").strip(): result
@@ -2406,8 +2508,8 @@ class Connector:
                         status.get("queued_orders"),
                         status.get("webhook_error"),
                     )
-                except Exception:
-                    self.logger.exception("order_bridge_status_failed")
+                except Exception as exc:
+                    self._log_sync_failure("order_bridge_status_failed", exc, include_detail=False)
                 finally:
                     self.order_bridge_status_checked = True
             response = session.get(f"{self.base_url}/sync/orders/changes?limit=250", timeout=self.timeout)
@@ -2474,9 +2576,9 @@ class Connector:
                 self.order_header_path,
                 self.order_detail_path,
             )
-        except Exception:
+        except Exception as exc:
             # Railway keeps unacknowledged changes for a later retry.
-            self.logger.exception("order_inbox_sync_failed")
+            self._log_sync_failure("order_inbox_sync_failed", exc)
 
     def _acknowledge_inventory_changes(self, changes: List[Dict[str, Any]]) -> None:
         payload = {
@@ -2532,16 +2634,23 @@ class Connector:
         entries = state["quantities"]
         blocked_pos_skus = {str(action["sku"]) for action in actions}
         for chunk in chunks(actions, min(self.batch_size, 250)):
-            response = self.session.post(endpoint, json={"adjustments": chunk}, timeout=self.timeout)
-            response.raise_for_status()
-            results = response.json().get("results") or []
-            for action, result in zip(chunk, results):
+            try:
+                response = self.session.post(endpoint, json={"adjustments": chunk}, timeout=self.timeout)
+                response.raise_for_status()
+                results = response.json().get("results") or []
+            except Exception as exc:
+                for action in chunk:
+                    self._record_adjustment_issue(entries, action, "shopify_adjustment_unconfirmed", code=inventory_failure_code(exc))
+                raise
+            for index, action in enumerate(chunk):
+                result = adjustment_result_for_sku(results, index, action["sku"])
+                if result is None:
+                    self._record_adjustment_issue(entries, action, "shopify_adjustment_unconfirmed")
+                    continue
                 if not result.get("success"):
-                    self.logger.error(
-                        "shopify_adjustment_failed sku=%s delta=%s message=%s",
-                        action["sku"],
-                        action["delta"],
-                        result.get("message"),
+                    self._record_adjustment_issue(
+                        entries, action, "shopify_adjustment_rejected",
+                        code=result.get("code"), detail=result.get("message"),
                     )
                     continue
                 entry = entries[action["sku"]]
@@ -2550,12 +2659,9 @@ class Connector:
                 if inventory_updated_at:
                     entry["shop_seen_at"] = inventory_updated_at
                 if quantity_after_change is None:
+                    self._record_adjustment_issue(entries, action, "shopify_quantity_unconfirmed")
                     entry["shop_seen"] = int(entry["shop_seen"]) + int(action["delta"])
                     entry.pop("pending_pos", None)
-                    self.logger.warning(
-                        "pos_adjustment_deferred_after_unconfirmed_shopify_result sku=%s",
-                        action["sku"],
-                    )
                 else:
                     actual_quantity = int(quantity_after_change)
                     entry["shop_seen"] = actual_quantity
@@ -2600,7 +2706,17 @@ class Connector:
             save_state(self.state_path, state)
         return blocked_pos_skus
 
-    def _apply_pos_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
+    def _record_adjustment_issue(
+        self, entries: Dict[str, Any], action: Dict[str, Any], reason: str, *, code: Any = None, detail: Any = None,
+    ) -> None:
+        sku = action["sku"]
+        entry = entries.get(sku) or {}
+        self._record_inventory_issue(
+            sku, reason, pos_quantity=entry.get("pos_seen"), shopify_quantity=entry.get("shop_seen"),
+            target_quantity=action.get("target_quantity"), code=code, detail=detail,
+        )
+
+    def _run_pos_writer(self, actions: List[Dict[str, Any]]) -> Any:
         if not self.writer_script.exists():
             raise FileNotFoundError(f"POS write-back script not found: {self.writer_script}")
         powershell = find_powershell()
@@ -2629,15 +2745,29 @@ class Connector:
         if isinstance(results, dict):
             # PowerShell's JSON pipeline emits a single object for one SKU.
             results = [results]
+        return results
+
+    def _apply_pos_adjustments(self, state: Dict[str, Any], actions: List[Dict[str, Any]]) -> None:
         entries = state["quantities"]
-        for action, result in zip(actions, results):
+        try:
+            results = self._run_pos_writer(actions)
+        except Exception as exc:
+            for action in actions:
+                self._record_adjustment_issue(entries, action, "pos_adjustment_unconfirmed", code=inventory_failure_code(exc))
+            raise
+        for index, action in enumerate(actions):
+            result = adjustment_result_for_sku(results, index, action["sku"])
+            if result is None:
+                self._record_adjustment_issue(entries, action, "pos_adjustment_unconfirmed")
+                continue
             if not result.get("success"):
-                self.logger.error(
-                    "pos_adjustment_failed sku=%s delta=%s message=%s",
-                    action["sku"],
-                    action["delta"],
-                    result.get("message"),
-                )
+                message = str(result.get("message") or "")
+                code = None
+                if message.startswith("POS quantity changed concurrently"):
+                    code = "pos_quantity_changed"
+                elif message.startswith("No POS quantity row found"):
+                    code = "pos_row_missing"
+                self._record_adjustment_issue(entries, action, "pos_adjustment_rejected", code=code, detail=message)
                 continue
             entry = entries[action["sku"]]
             entry["pos_seen"] = int(action["expected_quantity"]) + int(action["delta"])

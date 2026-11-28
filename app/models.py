@@ -88,6 +88,22 @@ class ConnectorSyncProgress(BaseModel):
     stage: Literal["reading_pos", "reading_shopify", "reconciling", "retrying"]
 
 
+class ConnectorInventoryIssue(BaseModel):
+    sku: str | None = Field(default=None, min_length=1, max_length=160)
+    reason: Literal[
+        "pos_writeback_preview", "pos_writeback_disabled", "pos_row_unavailable",
+        "shopify_sku_missing", "shopify_duplicate_sku", "shopify_location_unavailable",
+        "shopify_quantity_conflict", "matrix_structure_unverified",
+        "shopify_adjustment_rejected", "shopify_adjustment_unconfirmed", "shopify_quantity_unconfirmed",
+        "pos_adjustment_rejected", "pos_adjustment_unconfirmed", "shopify_snapshot_unavailable",
+    ]
+    observed_at: AwareDatetime
+    pos_quantity: int | None = None
+    shopify_quantity: int | None = None
+    target_quantity: int | None = None
+    code: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]{1,80}$")
+
+
 class ConnectorHeartbeatRequest(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     sync_interval_seconds: int = Field(ge=30, le=86400)
@@ -95,6 +111,7 @@ class ConnectorHeartbeatRequest(BaseModel):
     customer_sync_enabled: bool = False
     customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
     sync_progress: ConnectorSyncProgress | None = None
+    inventory_issues: list[ConnectorInventoryIssue] = Field(default_factory=list, max_length=50)
 
 
 class ConnectorUpdateReport(BaseModel):

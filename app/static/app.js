@@ -656,6 +656,11 @@ function renderOverview() {
         <div class="panel-footer">Latest 10 successful quantity updates <span>POS checks every ${syncIntervalLabel(connector.sync_interval_seconds)} · Display refreshes every 30 seconds</span></div>
       </section>
 
+      <section class="panel" aria-labelledby="inventory-issues-heading">
+        <div class="panel-head"><h2 id="inventory-issues-heading">Recent inventory issues</h2></div>
+        ${renderInventoryIssueList(inventory.issues || [])}
+      </section>
+
       <div class="activity-grid">
       <section class="panel">
         <div class="panel-head">
@@ -1139,6 +1144,52 @@ function renderInventoryChangeList(items) {
       `).join("")}
     </div>
   `
+}
+
+function renderInventoryIssueList(items) {
+  if (!items.length) return `<div class="empty"><p>No quantity issues reported yet.</p></div>`
+  const reasons = {
+    pos_writeback_preview: "POS write-back is in dry-run mode",
+    pos_writeback_disabled: "POS write-back is disabled",
+    pos_row_unavailable: "The POS quantity row could not be read",
+    shopify_sku_missing: "Shopify did not return this SKU",
+    shopify_duplicate_sku: "More than one Shopify variant uses this SKU",
+    shopify_location_unavailable: "Shopify inventory is unavailable at the sync location",
+    shopify_quantity_conflict: "Shopify reported different quantities at the same timestamp",
+    matrix_structure_unverified: "The POS and Shopify variant mappings could not be verified",
+    shopify_adjustment_rejected: "Shopify rejected the quantity update",
+    shopify_adjustment_unconfirmed: "The Shopify quantity update could not be confirmed",
+    shopify_quantity_unconfirmed: "Shopify accepted the update without returning the new quantity",
+    pos_adjustment_rejected: "The POS rejected the quantity update",
+    pos_adjustment_unconfirmed: "The POS quantity update could not be confirmed",
+    shopify_snapshot_unavailable: "The connector could not read Shopify inventory",
+  }
+  const codes = {
+    sku_not_found: "SKU not found",
+    duplicate_shopify_sku: "Duplicate SKU",
+    pos_quantity_changed: "POS quantity changed before the write",
+    pos_row_missing: "POS quantity row missing",
+    ConnectionError: "Connection interrupted",
+    Timeout: "Request timed out",
+    ConnectTimeout: "Connection timed out",
+    ReadTimeout: "Request timed out",
+  }
+
+  return `<div class="order-list compact inventory-issue-list">
+    ${items.map((issue) => {
+      const code = /^http_\d+$/.test(issue.code) ? `HTTP ${issue.code.slice(5)}` : codes[issue.code] || issue.code
+      const counts = [["POS", issue.pos_quantity], ["Shopify", issue.shopify_quantity], ["Target", issue.target_quantity]]
+        .filter(([, value]) => value != null).map(([label, value]) => `${label} ${value}`).join(" · ")
+      return `<article class="order-row">
+        <div class="order-main"><div>
+          <strong>${issue.sku ? `SKU ${escapeHtml(issue.sku)}` : "Full inventory scan"}</strong>
+          <small>${escapeHtml([reasons[issue.reason] || "Quantity update needs review", code].filter(Boolean).join(" · "))}</small>
+          ${counts ? `<small>${escapeHtml(counts)}</small>` : ""}
+        </div></div>
+        <small>${escapeHtml(formatDate(issue.observed_at))}</small>
+      </article>`
+    }).join("")}
+  </div>`
 }
 
 function renderConnectorUpdateList(items) {
