@@ -281,8 +281,12 @@ class ConnectorRuntimeTests(unittest.TestCase):
         self.assertTrue(self.connector._sync_wakeup.is_set())
         self.assertTrue(self.connector._customer_wakeup.is_set())
         self.connector._sync_wakeup.clear()
+        self.connector._set_sync_progress('request1', 'reading_shopify')
         self.connector._send_heartbeat(self.session)
         self.assertFalse(self.connector._sync_wakeup.is_set())
+        self.assertEqual(self.session.post.call_args.kwargs['json']['sync_progress'], {
+            'request_id': 'request1', 'stage': 'reading_shopify',
+        })
 
     def test_forced_scan_is_acknowledged_only_after_success_and_retries_on_failure(self) -> None:
         self.connector.customer_sync_enabled = False
@@ -294,6 +298,7 @@ class ConnectorRuntimeTests(unittest.TestCase):
         ):
             self.assertEqual(self.connector.run_forever(once=True), 1)
             complete.assert_not_called()
+        self.assertEqual(self.connector._sync_progress_stage, 'retrying')
         self.connector.session = self.session
         self.session.post.side_effect = None
         self.session.post.return_value.json.return_value = {'completed': True}
@@ -302,8 +307,9 @@ class ConnectorRuntimeTests(unittest.TestCase):
             mock.patch.object(self.connector, 'run_cycle') as scan,
         ):
             self.assertEqual(self.connector.run_forever(once=True), 0)
-        scan.assert_called_once_with(force_full=True)
+        scan.assert_called_once_with(force_full=True, sync_request_id='request1')
         self.assertIsNone(self.connector._sync_request_id)
+        self.assertIsNone(self.connector._sync_progress_stage)
 
 
 if __name__ == "__main__":

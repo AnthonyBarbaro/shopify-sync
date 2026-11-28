@@ -794,6 +794,32 @@ class FullInventoryReconciliationTests(unittest.TestCase):
             self.assertEqual(connector._apply_shopify_adjustments.call_args.args[1][0]["delta"], -1)
             self.assertEqual(json.loads(path.read_text())["deferred_pos_event_skus"], [])
 
+    def test_forced_scan_reports_its_stage_during_each_inventory_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            connector, state = self._scheduled_connector(path)
+            save_state(path, state)
+            connector._set_sync_progress = mock.Mock()
+            snapshot = connector._fetch_inventory_snapshot.return_value
+
+            def load_products(_args):
+                self.assertEqual(connector._set_sync_progress.call_args, mock.call("sync1", "reading_pos"))
+                return [SimpleNamespace(payload={"sku": "22392", "quantity": 5})], SimpleNamespace(skipped_non_sellable=0)
+
+            def fetch_snapshot():
+                self.assertEqual(connector._set_sync_progress.call_args, mock.call("sync1", "reading_shopify"))
+                return snapshot
+
+            connector._fetch_inventory_snapshot.side_effect = fetch_snapshot
+            module = sys.modules["windows_connector.connector"]
+            with mock.patch.object(module.dbf_pos_sync, "load_products", side_effect=load_products):
+                connector.run_cycle(force_full=True, sync_request_id="sync1")
+
+            self.assertEqual(connector._set_sync_progress.call_args_list, [
+                mock.call("sync1", "reading_pos"), mock.call("sync1", "reading_shopify"),
+                mock.call("sync1", "reconciling"),
+            ])
+
     def test_automatic_reconcile_waits_for_quiet_and_keeps_a_deferred_file_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

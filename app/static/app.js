@@ -464,7 +464,7 @@ async function forceSync() {
       method: "POST", headers: { "X-Requested-With": "pos-bridge" },
     })
     state.bridge = { ...state.bridge, force_sync: request }
-    showToast("Full inventory check queued. The connector will also check customers.", "success")
+    showToast("Full inventory sync requested.", "success")
   } catch (error) {
     showToast(error.message, "error")
   } finally {
@@ -589,7 +589,7 @@ function renderOverview() {
         <div class="welcome-actions">
           ${statusBadge(bridgeActive ? "Connected" : "No check-in", bridgeActive ? "success" : "danger", true)}
           <button class="button" type="button" data-force-sync ${state.forcing || forcePending ? "disabled" : ""}>
-            ${icon("refresh", state.forcing ? "is-spinning" : "")} ${state.forcing ? "Requesting…" : forcePending ? "Sync queued" : "Force sync"}
+            ${icon("refresh", state.forcing ? "is-spinning" : "")} ${state.forcing ? "Requesting…" : "Force sync"}
           </button>
           <button class="button secondary" type="button" data-refresh ${state.refreshing ? "disabled" : ""}>
             ${icon("refresh", state.refreshing ? "is-spinning" : "")} ${state.refreshing ? "Checking…" : "Refresh"}
@@ -599,7 +599,7 @@ function renderOverview() {
       </div>
 
       ${state.error ? `<div class="notice danger">Status could not be loaded. ${escapeHtml(state.error.message)}</div>` : ""}
-      ${forcePending ? `<div class="notice neutral">Full inventory check and customer scan requested. ${bridgeActive ? "Waiting for the connector’s next check-in; long-running jobs finish first." : "Queued until the Windows connector reconnects."}</div>` : forceRequest.completed_at ? `<div class="notice neutral">Last forced inventory scan finished ${escapeHtml(relativeTime(forceRequest.completed_at))}. Failed adjustments continue to retry.</div>` : ""}
+      ${renderForceSyncStatus(forceRequest, bridgeActive, !state.error)}
       ${setupNeeded ? `<div class="notice warning"><strong>Order access needs approval.</strong> Reopen or reinstall the Shopify app once so Shopify can approve the read_orders permission.</div>` : ""}
       ${customers.enabled && customers.authorized === false ? `<div class="notice warning"><strong>Customer access needs approval.</strong> Add read_customers and write_customers to APP_SCOPES and reopen the Shopify install flow to grant access.</div>` : ""}
 
@@ -688,6 +688,33 @@ function renderOverview() {
       </section>
     </section>
   `
+}
+
+function renderForceSyncStatus(request, connectorActive, statusAvailable) {
+  if (!request.request_id) return ""
+  if (request.completed_at) {
+    return `<div class="notice neutral" role="status">Last forced inventory scan finished ${escapeHtml(relativeTime(request.completed_at))}. Failed adjustments continue to retry.</div>`
+  }
+
+  const activeStages = {
+    reading_pos: "Reading inventory from the POS…",
+    reading_shopify: "Reading inventory from Shopify…",
+    reconciling: "Reconciling inventory quantities…",
+  }
+  const stage = statusAvailable && connectorActive ? activeStages[request.progress_stage] : null
+  const message = !statusAvailable ? "Waiting for a fresh status from the app."
+    : !connectorActive ? "Queued until the Windows connector reconnects."
+    : stage || (request.progress_stage === "retrying"
+      ? "The connector hit an error and will retry the scan."
+      : "Waiting for the Windows connector to start the scan.")
+
+  return `<div class="notice neutral force-sync-status">
+    <strong id="force-sync-title">Full inventory sync</strong>
+    <div class="force-sync-track${stage ? " is-running" : ""}" ${stage
+      ? `role="progressbar" aria-labelledby="force-sync-title" aria-describedby="force-sync-phase"`
+      : `aria-hidden="true"`}></div>
+    <span id="force-sync-phase" role="status">${escapeHtml(message)}</span>
+  </div>`
 }
 
 function renderStatusCard({ icon: iconName, title, active, activeText, inactiveText, detail, lastSeen }) {

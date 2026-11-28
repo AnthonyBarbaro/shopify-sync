@@ -279,6 +279,23 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .notice.warning { color: #76510c; background: var(--amber-soft); border-color: #ecd89e; }
 .notice.danger { color: var(--red); background: var(--red-soft); border-color: #f1c8c2; }
 .notice.neutral { color: var(--muted); background: #f1f5f1; border-color: var(--line); }
+.force-sync-status { display: grid; gap: 8px; }
+.force-sync-status strong { color: var(--ink); }
+.force-sync-track { height: 7px; overflow: hidden; border-radius: 999px; background: #dce7df; }
+.force-sync-track.is-running::after {
+  content: "";
+  display: block;
+  width: 30%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+  transform: translateX(115%);
+  animation: force-sync-progress 1.6s ease-in-out infinite;
+}
+@keyframes force-sync-progress {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(340%); }
+}
 .setting-list { border-top: 1px solid var(--line); }
 .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--line); }
 .setting-row div { min-width: 0; }

@@ -84,12 +84,30 @@ test('force sync shows queued work honestly when the connector is unavailable', 
   }`, context)
   const html = context.renderOverview()
   assert.match(html, /data-force-sync disabled/)
-  assert.match(html, /Sync queued/)
+  assert.match(html, /Full inventory sync/)
   assert.match(html, /Queued until the Windows connector reconnects/)
+  assert.doesNotMatch(html, /role="progressbar"/)
   vm.runInContext(`state.bridge.force_sync.completed_at = '2026-11-17T12:00:00Z'`, context)
   assert.match(context.renderOverview(), /Last forced inventory scan finished/)
   assert.match(context.renderOverview(), /Force sync\s*<\/button>/)
   assert.match(context.renderOverview(), /data-force-sync\s*>/)
+})
+
+test('force sync bar animates only during a reported stage', () => {
+  const request = { request_id: 'request1', completed_at: null }
+  assert.match(context.renderForceSyncStatus(request, true, true), /Waiting for the Windows connector to start/)
+
+  const running = { ...request, progress_stage: 'reading_shopify' }
+  const html = context.renderForceSyncStatus(running, true, true)
+  assert.match(html, /force-sync-track is-running/)
+  assert.match(html, /role="progressbar"/)
+  assert.match(html, /Reading inventory from Shopify/)
+  assert.doesNotMatch(html, /aria-valuenow/)
+  assert.doesNotMatch(context.renderForceSyncStatus(running, true, false), /role="progressbar"/)
+
+  const retry = context.renderForceSyncStatus({ ...request, progress_stage: 'retrying' }, true, true)
+  assert.match(retry, /will retry the scan/)
+  assert.doesNotMatch(retry, /role="progressbar"/)
 })
 
 test('overview displays updater successes and failed stages without rendering filename markup', () => {

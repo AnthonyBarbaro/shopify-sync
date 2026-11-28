@@ -52,7 +52,7 @@ else:
 
 
 STATE_VERSION = 1
-CONNECTOR_VERSION = "1.4.5"
+CONNECTOR_VERSION = "1.4.6"
 MATRIX_OPTION_SCHEMA_VERSION = 2
 NEW_PRODUCT_STABLE_OBSERVATIONS = 2
 CATALOG_STRUCTURE_SCHEMA_VERSION = 1
@@ -169,6 +169,7 @@ class Connector:
         )
         self._sync_request_lock = Lock()
         self._sync_request_id: Optional[str] = None
+        self._sync_progress_stage: Optional[str] = None
         self._sync_wakeup = Event()
         self._customer_wakeup = Event()
         self._customer_source_stamp: tuple[str, str | None] | None = None
@@ -289,12 +290,14 @@ class Connector:
                     request_id = self._sync_request_id
                 try:
                     if request_id:
-                        self.run_cycle(force_full=True)
+                        self.run_cycle(force_full=True, sync_request_id=request_id)
                         self._complete_sync_request(request_id)
                     else:
                         self.run_cycle(scheduled=not once)
                 except Exception:
                     self.logger.exception("connector_cycle_failed")
+                    if request_id:
+                        self._set_sync_progress(request_id, "retrying")
                     failed = True
                 if once:
                     if self.customer_sync_enabled:
@@ -313,15 +316,22 @@ class Connector:
                 worker.join(timeout=1)
 
     def _send_heartbeat(self, session: requests.Session) -> None:
+        payload: Dict[str, Any] = {
+            "version": CONNECTOR_VERSION,
+            "sync_interval_seconds": self.interval_seconds,
+            "order_sync_enabled": self.order_sync_enabled,
+            "customer_sync_enabled": self.customer_sync_enabled and not self.dry_run,
+            "customer_sync_interval_seconds": self.customer_sync_interval_seconds,
+        }
+        with self._sync_request_lock:
+            if self._sync_request_id and self._sync_progress_stage:
+                payload["sync_progress"] = {
+                    "request_id": self._sync_request_id,
+                    "stage": self._sync_progress_stage,
+                }
         response = session.post(
             f"{self.base_url}/sync/heartbeat",
-            json={
-                "version": CONNECTOR_VERSION,
-                "sync_interval_seconds": self.interval_seconds,
-                "order_sync_enabled": self.order_sync_enabled,
-                "customer_sync_enabled": self.customer_sync_enabled and not self.dry_run,
-                "customer_sync_interval_seconds": self.customer_sync_interval_seconds,
-            },
+            json=payload,
             timeout=10,
         )
         response.raise_for_status()
@@ -330,6 +340,7 @@ class Connector:
             with self._sync_request_lock:
                 if request_id != self._sync_request_id:
                     self._sync_request_id = request_id
+                    self._sync_progress_stage = None
                     self._sync_wakeup.set()
                     self._customer_wakeup.set()
         self._flush_updater_reports(session)
@@ -371,7 +382,13 @@ class Connector:
             with self._sync_request_lock:
                 if self._sync_request_id == request_id:
                     self._sync_request_id = None
+                    self._sync_progress_stage = None
             self.logger.info("forced_inventory_scan_completed")
+
+    def _set_sync_progress(self, request_id: str, stage: str) -> None:
+        with self._sync_request_lock:
+            if self._sync_request_id == request_id:
+                self._sync_progress_stage = stage
 
     def _heartbeat_loop(self, stop: Event) -> None:
         # Requests sessions are owned by one thread; long imports cannot delay check-ins.
@@ -560,7 +577,11 @@ class Connector:
         if failure_reasons:
             self.logger.warning("customer_sync_failures %s", dict(failure_reasons))
 
-    def run_cycle(self, *, force_full: bool = False, scheduled: bool = False) -> None:
+    def run_cycle(
+        self, *, force_full: bool = False, scheduled: bool = False, sync_request_id: Optional[str] = None,
+    ) -> None:
+        if sync_request_id:
+            self._set_sync_progress(sync_request_id, "reading_pos")
         state = load_state(self.state_path)
         now = datetime.now()
         now_epoch = int(time.time())
@@ -909,12 +930,16 @@ class Connector:
             and bool(state.get("catalog_complete"))
         ):
             versions_before_snapshot = {(change["id"], change["version"]) for change in inventory_changes}
+            if sync_request_id:
+                self._set_sync_progress(sync_request_id, "reading_shopify")
             inventory_snapshot = self._fetch_inventory_snapshot()
             # Re-read the versioned queue after the snapshot. A Shopify sale can
             # arrive while the paginated snapshot is loading, and the later
             # observation must take precedence over an older snapshot row.
             inventory_changes = self._fetch_inventory_changes()
 
+        if sync_request_id:
+            self._set_sync_progress(sync_request_id, "reconciling")
         entries: Dict[str, Dict[str, Any]] = state.setdefault("quantities", {})
         remote_quantities = (
             {}

@@ -83,12 +83,18 @@ class CustomerSyncRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ConnectorSyncProgress(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
+    stage: Literal["reading_pos", "reading_shopify", "reconciling", "retrying"]
+
+
 class ConnectorHeartbeatRequest(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     sync_interval_seconds: int = Field(ge=30, le=86400)
     order_sync_enabled: Optional[bool] = None
     customer_sync_enabled: bool = False
     customer_sync_interval_seconds: int = Field(default=60, ge=30, le=86400)
+    sync_progress: ConnectorSyncProgress | None = None
 
 
 class ConnectorUpdateReport(BaseModel):

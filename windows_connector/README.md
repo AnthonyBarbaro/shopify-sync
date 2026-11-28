@@ -320,7 +320,8 @@ connector for a full inventory comparison and a customer scan, without clearing 
 or resending unchanged customers. A running inventory cycle finishes first. Offline requests remain
 queued until the connector reconnects; the dashboard reports completion of the inventory scan only
 after acknowledgment. Individual failed adjustments continue through the existing retry mechanism.
-This requires the updated backend and Windows connector.
+Connector 1.4.6 or later reports the current inventory stage on each heartbeat. The Overview displays
+an animated bar during the scan and pauses it while the connector is waiting to start or retry.
 
 Start or pause the task (disable recovery before stopping for maintenance):
 

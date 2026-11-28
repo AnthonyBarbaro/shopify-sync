@@ -2962,8 +2962,13 @@ def connector_heartbeat(
     shop: ShopRecord = Depends(require_pos_shop),
 ) -> JSONResponse:
     db.record_connector_heartbeat(
-        shop_domain=shop.shop_domain, channel="connector", metadata=payload.model_dump(exclude_none=True),
+        shop_domain=shop.shop_domain, channel="connector",
+        metadata=payload.model_dump(exclude={"sync_progress"}, exclude_none=True),
     )
+    if payload.sync_progress:
+        db.record_connector_sync_progress(
+            shop_domain=shop.shop_domain, **payload.sync_progress.model_dump(),
+        )
     sync_request = db.get_connector_sync_request(shop_domain=shop.shop_domain)
     return JSONResponse({
         "timestamp": utc_now_iso(),

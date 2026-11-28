@@ -445,6 +445,7 @@ class DatabaseStore:
             self._prune_customer_address_reviews(connection)
             self._ensure_column(connection, "connector_heartbeats", "last_customer_poll_at", "TEXT")
             self._ensure_column(connection, "connector_heartbeats", "connector_settings", "TEXT")
+            self._ensure_column(connection, "connector_sync_requests", "progress_stage", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "product_title", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "variant_title", "TEXT")
             self._ensure_column(connection, "recent_inventory_changes", "details_checked_at", "TEXT")
@@ -1670,7 +1671,8 @@ class DatabaseStore:
                 INSERT INTO connector_sync_requests (shop_domain, request_id, requested_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(shop_domain) DO UPDATE SET
-                    request_id=excluded.request_id, requested_at=excluded.requested_at, completed_at=NULL
+                    request_id=excluded.request_id, requested_at=excluded.requested_at,
+                    completed_at=NULL, progress_stage=NULL
                 WHERE connector_sync_requests.completed_at IS NOT NULL
                 """,
                 (shop_domain, secrets.token_hex(16), utc_now_iso()),
@@ -1681,10 +1683,22 @@ class DatabaseStore:
     def get_connector_sync_request(self, *, shop_domain: str) -> dict[str, Optional[str]]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT request_id, requested_at, completed_at FROM connector_sync_requests WHERE shop_domain = ?",
+                "SELECT request_id, requested_at, completed_at, progress_stage "
+                "FROM connector_sync_requests WHERE shop_domain = ?",
                 (shop_domain,),
             ).fetchone()
-        return dict(row) if row else {"request_id": None, "requested_at": None, "completed_at": None}
+        return dict(row) if row else {
+            "request_id": None, "requested_at": None, "completed_at": None, "progress_stage": None,
+        }
+
+    def record_connector_sync_progress(self, *, shop_domain: str, request_id: str, stage: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE connector_sync_requests SET progress_stage = ? "
+                "WHERE shop_domain = ? AND request_id = ? AND completed_at IS NULL AND progress_stage IS NOT ?",
+                (stage, shop_domain, request_id, stage),
+            )
+            connection.commit()
 
     def complete_connector_sync(self, *, shop_domain: str, request_id: str) -> bool:
         with self._connect() as connection:

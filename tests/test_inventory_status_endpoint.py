@@ -136,6 +136,22 @@ class InventoryStatusEndpointTests(unittest.IsolatedAsyncioTestCase):
             metadata={**payload, "customer_sync_interval_seconds": 60},
         )
 
+    async def test_heartbeat_reports_force_sync_stage_to_its_shop(self) -> None:
+        payload = {
+            "version": "1.4.6", "sync_interval_seconds": 180,
+            "sync_progress": {"request_id": "request1", "stage": "reading_shopify"},
+        }
+        status, _ = await self.post(payload, path="/sync/heartbeat", authenticated=False)
+        self.assertEqual(status, 401)
+        self.main.db.record_connector_sync_progress.assert_not_called()
+
+        status, _ = await self.post(payload, path="/sync/heartbeat")
+        self.assertEqual(status, 200)
+        self.main.db.record_connector_sync_progress.assert_called_once_with(
+            shop_domain=self.shop.shop_domain, **payload["sync_progress"],
+        )
+        self.assertNotIn("sync_progress", self.main.db.record_connector_heartbeat.call_args.kwargs["metadata"])
+
     async def test_updater_report_is_authenticated_persisted_once_and_returned_to_the_shop(self) -> None:
         path = "/sync/connector/update-report"
         report = {
